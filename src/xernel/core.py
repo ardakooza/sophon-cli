@@ -161,6 +161,7 @@ def card(
                 badge_text = " " + " " * (inner - badge_width) + badge + " "
                 print(paint("  │", border_color) + paint(badge_text, text_color) + paint("│", border_color))
         else:
+            content_lines.insert(0, "")
             content_lines.insert(0, title)
     for line in content_lines:
         is_centered = (line == title and not top_right) or line in centered_lines

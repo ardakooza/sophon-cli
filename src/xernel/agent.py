@@ -11,7 +11,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from xernel.config import endpoint_for, read_config
-from xernel.core import BORDER, GREEN, MUTED, WHITE, card, display_width, paint, wrap_text
+from xernel.core import BORDER, MUTED, WHITE, card, display_width, paint, wrap_text
 
 SYSTEM_PROMPT = (
     "You are Xernel Agent, a concise and practical development assistant. "
@@ -117,7 +117,7 @@ def _input_bar() -> str:
         nonlocal previous_height
         if not previous_height:
             return
-        sys.stdout.write(f"\033[{cursor_row}A\r")
+        sys.stdout.write(f"\033[{cursor_row + 1}A\r")
         for index in range(previous_height):
             sys.stdout.write("\033[2K")
             if index < previous_height - 1:
@@ -137,7 +137,7 @@ def _input_bar() -> str:
             prefix_width = display_width(row)
             padding = " " * max(0, inner - prefix_width)
             if index == 0 and row.startswith("› "):
-                visible = paint("› ", GREEN) + paint(row[2:], MUTED if not characters else WHITE)
+                visible = paint("› ", WHITE) + paint(row[2:], MUTED if not characters else WHITE)
             else:
                 visible = paint(row, MUTED if not characters else WHITE)
             sys.stdout.write(
@@ -192,7 +192,7 @@ def _input_bar() -> str:
 
 def _render_user_message(message: str) -> None:
     terminal_width = max(28, shutil.get_terminal_size((80, 24)).columns - 8)
-    width = min(68, max(24, min(terminal_width, display_width(message) + 2)))
+    width = min(68, max(3, min(terminal_width, display_width(message) + 2)))
     card(None, [f"› {message}"], width=width)
 
 
@@ -204,12 +204,16 @@ def _render_agent_message(message: str) -> None:
         if not paragraph:
             print()
             continue
-        for line in wrap_text(paragraph, width - (2 if first else 0)):
+        text = paragraph
+        if first and text.lstrip().startswith(("• ", "- ", "* ")):
+            text = text.lstrip()[2:]
+        prefix = "    • " if first else "      "
+        for line in wrap_text(text, width - display_width(prefix)):
             if first:
-                print(paint("• ", GREEN) + line)
+                print(paint(prefix, MUTED) + line)
                 first = False
             else:
-                print("  " + line)
+                print("      " + line)
     print()
 
 

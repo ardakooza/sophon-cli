@@ -26,10 +26,26 @@ INSTALL_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/xernel"
 TARGET="$BIN_DIR/xernel"
 mkdir -p "$INSTALL_DIR"
 
+is_legacy_xernel_link() {
+    [ -L "$TARGET" ] || return 1
+    LEGACY_TARGET=$(readlink "$TARGET") || return 1
+    case "$LEGACY_TARGET" in
+        */xernel/xernel) ;;
+        *) return 1 ;;
+    esac
+    if [ -f "$LEGACY_TARGET" ]; then
+        grep -q 'Launch the shared Xernel CLI directly from a source checkout' "$LEGACY_TARGET"
+        return $?
+    fi
+    [ ! -e "$LEGACY_TARGET" ]
+}
+
 if [ -e "$TARGET" ] || [ -L "$TARGET" ]; then
     if [ -L "$TARGET" ] && [ "$(readlink "$TARGET")" = "$INSTALL_DIR/venv/bin/xernel" ]; then
         :
     elif [ -f "$TARGET" ] && grep -q 'Xernel managed launcher' "$TARGET"; then
+        :
+    elif is_legacy_xernel_link; then
         :
     else
         echo "Refusing to replace an existing command: $TARGET" >&2

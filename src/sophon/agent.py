@@ -5,12 +5,16 @@ from __future__ import annotations
 import codecs
 import datetime as dt
 import json
+import math
 import os
+import queue
 import shutil
 import sys
 import tempfile
+import threading
 import uuid
 from pathlib import Path
+from typing import Callable, Iterator
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -20,23 +24,220 @@ from sophon.core import BORDER, MUTED, NOTICE_BORDER, NOTICE_TEXT, WHITE, card, 
 
 SESSION_FILE = Path.home() / ".sophon" / "sessions" / "sessions.json"
 LEGACY_SESSION_FILE = Path.home() / ".xernel" / "sessions" / "sessions.json"
+WORKSPACE_ROOT = Path.home() / ".sophon" / "workspace"
+PROJECT_DIR = WORKSPACE_ROOT / "my-project"
 INPUT_PLACEHOLDER = "Create something with sophon"
 
 SYSTEM_PROMPT = (
     "You are Sophon, a concise and practical development assistant. "
-    "You can discuss code, but you cannot access or modify the user's local files. "
-    "Never claim to have run commands or changed files."
+    "Use the provided file tools to inspect and edit project files in the active workspace. "
+    "Never access paths outside that workspace or claim to have run commands. "
+    "Keep all project files inside the active project folder."
 )
 
+WORKSPACE_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "list_files",
+            "description": "List files and folders in the active project workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string", "description": "Project-relative folder path; defaults to ."}},
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read a UTF-8 text file inside the active project workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string", "description": "Project-relative file path"}},
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Create or replace a UTF-8 text file inside the active project workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Project-relative file path"},
+                    "content": {"type": "string", "description": "Complete file contents"},
+                },
+                "required": ["path", "content"],
+                "additionalProperties": False,
+            },
+        },
+    },
+]
 
-def _request(config: dict[str, object], messages: list[dict[str, str]]) -> str:
+
+def _ensure_workspace() -> Path:
+    WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
+    PROJECT_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    guide = WORKSPACE_ROOT / "AGENT.md"
+    if not guide.exists():
+        content = (
+            "# Sophon Workspace\n\n"
+            "This folder keeps project work organized. Give each project its own subfolder and keep "
+            "that project's files together there. The empty `my-project/` folder is the starter "
+            "project. Keep unrelated projects separate and do not store API keys or other secrets here.\n"
+        )
+        try:
+            descriptor = os.open(guide, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            pass
+        else:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                stream.write(content)
+    return PROJECT_DIR
+
+
+def _system_message() -> str:
+    guide = WORKSPACE_ROOT / "AGENT.md"
+    try:
+        instructions = guide.read_text(encoding="utf-8").strip()
+    except OSError:
+        instructions = "Keep project files inside the active project directory."
+    return (
+        f"{SYSTEM_PROMPT}\n\n"
+        f"Active project directory: {PROJECT_DIR}\n"
+        f"Workspace guidance:\n{instructions}"
+    )
+
+
+def _event_data(response) -> Iterator[str]:
+    fields: list[str] = []
+    for raw_line in response:
+        line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+        if not line:
+            if fields:
+                yield "\n".join(fields)
+                fields.clear()
+        elif line.startswith(":"):
+            continue
+        elif line.startswith("data:"):
+            fields.append(line[5:].lstrip())
+    if fields:
+        yield "\n".join(fields)
+
+
+def _response_content(result: object, provider: str) -> str | None:
+    if not isinstance(result, dict):
+        raise RuntimeError("The provider returned an unexpected response.")
+    if provider == "openrouter":
+        if result.get("error"):
+            error = result["error"]
+            detail = error.get("message", error) if isinstance(error, dict) else error
+            raise RuntimeError(str(detail))
+        choices = result.get("choices")
+        if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+            return None
+        delta = choices[0].get("delta") or choices[0].get("message") or {}
+        content = delta.get("content") if isinstance(delta, dict) else None
+    else:
+        if result.get("success") is False:
+            errors = result.get("errors") or []
+            message = next(
+                (item.get("message") for item in errors if isinstance(item, dict) and item.get("message")),
+                "Cloudflare request failed",
+            )
+            raise RuntimeError(str(message))
+        content = result.get("response")
+        if content is None and isinstance(result.get("result"), dict):
+            content = result["result"].get("response")
+    if isinstance(content, list):
+        return "".join(
+            str(part.get("text", "")) for part in content if isinstance(part, dict)
+        )
+    return content if isinstance(content, str) else None
+
+
+def _workspace_file(relative_path: str, *, allow_root: bool = False) -> Path:
+    root = PROJECT_DIR.resolve()
+    requested = Path(relative_path or ".")
+    if requested.is_absolute():
+        raise RuntimeError("Workspace tool paths must be project-relative.")
+    candidate = (root / requested).resolve()
+    if candidate != root and root not in candidate.parents:
+        raise RuntimeError("Workspace tool paths must stay inside the active project.")
+    if candidate == root and not allow_root:
+        raise RuntimeError("Choose a file path inside the active project.")
+    return candidate
+
+
+def _execute_workspace_tool(name: str, arguments: object) -> str:
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except json.JSONDecodeError:
+            raise RuntimeError("The workspace tool arguments were not valid JSON.") from None
+    if not isinstance(arguments, dict):
+        raise RuntimeError("The workspace tool arguments must be an object.")
+    if name == "list_files":
+        folder = _workspace_file(str(arguments.get("path") or "."), allow_root=True)
+        if not folder.is_dir():
+            raise RuntimeError("The requested workspace path is not a folder.")
+        entries = sorted(folder.iterdir(), key=lambda item: (not item.is_dir(), item.name.casefold()))
+        if not entries:
+            return "This folder is empty."
+        return "\n".join(
+            (item.name + ("/" if item.is_dir() else ""))
+            for item in entries[:200]
+        )
+    if name == "read_file":
+        path = _workspace_file(str(arguments.get("path", "")))
+        if not path.is_file():
+            raise RuntimeError("The requested workspace file does not exist.")
+        if path.stat().st_size > 500_000:
+            raise RuntimeError("Workspace files must be smaller than 500 KB to read.")
+        try:
+            return path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as error:
+            raise RuntimeError(f"Could not read workspace file: {error}") from None
+    if name == "write_file":
+        path = _workspace_file(str(arguments.get("path", "")))
+        content = arguments.get("content")
+        if not isinstance(content, str):
+            raise RuntimeError("File content must be text.")
+        if len(content.encode("utf-8")) > 1_000_000:
+            raise RuntimeError("Workspace files must be smaller than 1 MB to write.")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            path.write_text(content, encoding="utf-8")
+        except OSError as error:
+            raise RuntimeError(f"Could not write workspace file: {error}") from None
+        return f"Wrote {path.relative_to(PROJECT_DIR.resolve())}."
+    raise RuntimeError(f"Unknown workspace tool: {name}")
+
+
+def _request(
+    config: dict[str, object],
+    messages: list[dict[str, object]],
+    on_chunk: Callable[[str], None] | None = None,
+    tool_calls_out: list[dict[str, object]] | None = None,
+    *,
+    tools_enabled: bool = True,
+) -> str:
     provider = str(config["provider"])
     payload: dict[str, object] = {"messages": messages}
     if provider == "openrouter":
         payload["model"] = config["model"]
-        payload["stream"] = False
     else:
         payload["max_tokens"] = 2048
+    payload["stream"] = True
+    if tools_enabled:
+        payload["tools"] = WORKSPACE_TOOLS if provider == "openrouter" else [
+            tool["function"] for tool in WORKSPACE_TOOLS
+        ]
 
     request = Request(
         endpoint_for(config),
@@ -47,41 +248,107 @@ def _request(config: dict[str, object], messages: list[dict[str, str]]) -> str:
         },
         method="POST",
     )
+    chunks: list[str] = []
+    openrouter_tools: dict[int, dict[str, str]] = {}
+    cloudflare_tools: list[dict[str, object]] = []
+
+    def collect_tool_calls(result: object) -> None:
+        if not isinstance(result, dict):
+            return
+        if provider == "openrouter":
+            choices = result.get("choices")
+            choice = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
+            delta = choice.get("delta") or choice.get("message") or {}
+            calls = delta.get("tool_calls", []) if isinstance(delta, dict) else []
+            if isinstance(calls, list):
+                for call in calls:
+                    if not isinstance(call, dict):
+                        continue
+                    index = call.get("index", len(openrouter_tools))
+                    if not isinstance(index, int):
+                        index = len(openrouter_tools)
+                    state = openrouter_tools.setdefault(index, {"id": "", "name": "", "arguments": ""})
+                    if isinstance(call.get("id"), str):
+                        state["id"] += call["id"]
+                    function = call.get("function")
+                    if isinstance(function, dict):
+                        if isinstance(function.get("name"), str):
+                            state["name"] += function["name"]
+                        if isinstance(function.get("arguments"), str):
+                            state["arguments"] += function["arguments"]
+        else:
+            calls = result.get("tool_calls")
+            if calls is None and isinstance(result.get("result"), dict):
+                calls = result["result"].get("tool_calls")
+            if isinstance(calls, list):
+                cloudflare_tools[:] = [call for call in calls if isinstance(call, dict)]
+
+    def append_content(content: str | None) -> None:
+        if content:
+            chunks.append(content)
+            if on_chunk is not None:
+                on_chunk(content)
+
     try:
         with urlopen(request, timeout=120) as response:
-            result = json.loads(response.read().decode("utf-8"))
+            content_type = response.headers.get("Content-Type", "").casefold()
+            if "text/event-stream" not in content_type:
+                result = json.loads(response.read().decode("utf-8"))
+                collect_tool_calls(result)
+                append_content(_response_content(result, provider))
+            else:
+                for data in _event_data(response):
+                    if data != "[DONE]":
+                        try:
+                            result = json.loads(data)
+                        except json.JSONDecodeError:
+                            continue
+                        collect_tool_calls(result)
+                        append_content(_response_content(result, provider))
+                    else:
+                        break
     except HTTPError as error:
         detail = error.read(2048).decode("utf-8", errors="replace").strip()
+        if tools_enabled and ("tool" in detail.casefold() or "function" in detail.casefold()):
+            return _request(
+                config,
+                messages,
+                on_chunk=on_chunk,
+                tool_calls_out=tool_calls_out,
+                tools_enabled=False,
+            )
         raise RuntimeError(f"Provider returned HTTP {error.code}: {detail or error.reason}") from None
     except (OSError, TimeoutError, URLError, UnicodeError, json.JSONDecodeError) as error:
         raise RuntimeError(f"Could not reach the configured provider: {error}") from None
-
-    if not isinstance(result, dict):
-        raise RuntimeError("The provider returned an unexpected response.")
-    if provider == "openrouter":
-        try:
-            content = result["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError):
-            raise RuntimeError("The provider returned an unexpected response.") from None
-        if isinstance(content, list):
-            content = "\n".join(
-                str(part.get("text", "")) for part in content if isinstance(part, dict)
-            )
-    else:
-        if not result.get("success", True):
-            errors = result.get("errors") or []
-            message = next(
-                (item.get("message") for item in errors if isinstance(item, dict) and item.get("message")),
-                "Cloudflare request failed",
-            )
-            raise RuntimeError(str(message))
-        cloudflare_result = result.get("result")
-        if not isinstance(cloudflare_result, dict):
-            raise RuntimeError("The provider returned an unexpected response.")
-        content = cloudflare_result.get("response")
-    if not isinstance(content, str) or not content.strip():
+    if tool_calls_out is not None:
+        if provider == "openrouter":
+            for index, call in sorted(openrouter_tools.items()):
+                if call["name"]:
+                    tool_calls_out.append({
+                        "id": call["id"] or f"call-{index}",
+                        "type": "function",
+                        "function": {
+                            "name": call["name"],
+                            "arguments": call["arguments"] or "{}",
+                        },
+                    })
+        else:
+            for index, call in enumerate(cloudflare_tools):
+                name = call.get("name")
+                if isinstance(name, str):
+                    arguments = call.get("arguments", {})
+                    tool_calls_out.append({
+                        "id": str(call.get("id") or f"cloudflare-call-{index}"),
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": arguments if isinstance(arguments, str) else json.dumps(arguments),
+                        },
+                    })
+    content = "".join(chunks).strip()
+    if not content and not tool_calls_out:
         raise RuntimeError("The provider returned an empty response.")
-    return content.strip()
+    return content
 
 
 def _load_config() -> dict[str, object] | None:
@@ -97,13 +364,47 @@ def _load_config() -> dict[str, object] | None:
         return {}
 
 
-def _ask(config: dict[str, object], history: list[dict[str, str]], prompt: str) -> str:
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+def _complete_turn(
+    config: dict[str, object],
+    history: list[dict[str, str]],
+    on_chunk: Callable[[str], None] | None = None,
+) -> str:
+    messages: list[dict[str, object]] = [
+        {"role": "system", "content": _system_message()},
         *(message for message in history if message.get("role") in {"user", "assistant"}),
     ]
-    messages.append({"role": "user", "content": prompt})
-    answer = _request(config, messages)
+    for _ in range(8):
+        tool_calls: list[dict[str, object]] = []
+        answer = _request(config, messages, on_chunk=on_chunk, tool_calls_out=tool_calls)
+        if not tool_calls:
+            return answer
+        messages.append({"role": "assistant", "content": answer or None, "tool_calls": tool_calls})
+        for call in tool_calls:
+            function = call.get("function")
+            if not isinstance(function, dict):
+                continue
+            name = str(function.get("name", ""))
+            try:
+                result = _execute_workspace_tool(name, function.get("arguments", "{}"))
+            except RuntimeError as error:
+                result = f"Tool error: {error}"
+            messages.append({
+                "role": "tool",
+                "tool_call_id": str(call.get("id", "")),
+                "name": name,
+                "content": result,
+            })
+    raise RuntimeError("The agent reached the workspace tool-call limit for this turn.")
+
+
+def _ask(
+    config: dict[str, object],
+    history: list[dict[str, str]],
+    prompt: str,
+    on_chunk: Callable[[str], None] | None = None,
+) -> str:
+    messages = [*history, {"role": "user", "content": prompt}]
+    answer = _complete_turn(config, messages, on_chunk=on_chunk)
     history.extend([{"role": "user", "content": prompt}, {"role": "assistant", "content": answer}])
     return answer
 
@@ -198,6 +499,7 @@ def _card_rows(
     *,
     columns: int,
     width: int | None = None,
+    top_left: str | None = None,
     top_right: str | None = None,
     border_color: str = BORDER,
     text_color: str = WHITE,
@@ -207,7 +509,34 @@ def _card_rows(
     bottom = "  ╰" + "─" * (inner + 2) + "╯"
     rows = [paint(top, border_color)]
     content = list(lines)
-    if title is not None and top_right is not None:
+    if title is None and top_left is not None and top_right is not None:
+        left = _truncate_display(top_left, inner)
+        badge = _truncate_display(top_right, inner)
+        if display_width(left) + display_width(badge) + 1 <= inner:
+            heading = left + " " * (inner - display_width(left) - display_width(badge)) + badge
+        else:
+            heading = _truncate_display(left, max(1, inner - display_width(badge) - 1))
+            heading += " " * max(1, inner - display_width(heading) - display_width(badge)) + badge
+        rows.append(paint("  │", border_color) + paint(" " + heading + " ", text_color) + paint("│", border_color))
+    elif title is not None and top_left is not None and top_right is not None:
+        left = _truncate_display(top_left, inner)
+        heading = _truncate_display(title, inner)
+        badge = _truncate_display(top_right, inner)
+        left_start = 0
+        title_start = max(0, (inner - display_width(heading)) // 2)
+        right_start = inner - display_width(badge)
+        if left_start + display_width(left) < title_start and title_start + display_width(heading) < right_start:
+            row = left + " " * (title_start - display_width(left)) + heading
+            row += " " * max(0, right_start - display_width(row)) + badge
+            rows.append(paint("  │", border_color) + paint(" " + row + " ", text_color) + paint("│", border_color))
+        else:
+            title_row = centered(_truncate_display(heading, inner), inner)
+            left_row = left + " " * max(0, inner - display_width(left))
+            right_row = " " * max(0, inner - display_width(badge)) + badge
+            for text in (title_row, left_row, right_row):
+                rows.append(paint("  │", border_color) + paint(" " + text + " ", text_color) + paint("│", border_color))
+        content.insert(0, "")
+    elif title is not None and top_right is not None:
         badge = _truncate_display(top_right, inner)
         title_width, badge_width = display_width(title), display_width(badge)
         left_pad = max(0, (inner - title_width) // 2)
@@ -344,11 +673,15 @@ def _draw_screen(
     text: str,
     cursor: int,
     *,
+    model: str,
     placeholder: str = INPUT_PLACEHOLDER,
     panel_rows: list[str] | None = None,
     notice_rows: list[str] | None = None,
     suggestion: str = "",
-    status_message: str | None = None,
+    answering: bool = False,
+    animation_frame: int = 0,
+    streaming_text: str = "",
+    context_window: int | None = None,
 ) -> tuple[int, int]:
     size = shutil.get_terminal_size((80, 24))
     columns, height = size.columns, max(8, size.lines)
@@ -358,8 +691,9 @@ def _draw_screen(
         ["Ask about code, debugging, and development."],
         columns=columns,
     )
+    footer = _footer_rows(model, session["messages"], context_window, columns)
     editor_lines, cursor_row, cursor_col = _editor_layout(text, cursor, width, placeholder, suggestion)
-    max_editor_lines = max(1, min(5, height - len(header) - 3))
+    max_editor_lines = max(1, min(5, height - len(header) - len(footer) - 3))
     visible_start = max(0, min(cursor_row, len(editor_lines) - max_editor_lines))
     visible_lines = editor_lines[visible_start : visible_start + max_editor_lines]
     box = _input_box_rows(visible_lines, width, placeholder=not text, text_length=len(text))
@@ -368,18 +702,20 @@ def _draw_screen(
         feed = panel_rows
     else:
         feed = list(notice_rows or []) + _message_rows(session["messages"], columns)
-        if status_message:
-            feed.extend(_card_rows(None, [status_message], columns=columns, width=display_width(status_message)))
-    room = max(0, height - len(header) - len(box))
+        if answering:
+            feed.extend(_answering_rows(animation_frame))
+            if streaming_text:
+                feed.extend(_agent_rows(streaming_text, columns))
+    room = max(0, height - len(header) - len(box) - len(footer))
     visible_feed = feed[-room:] if room else []
     if panel_rows is not None and room >= 2 and len(panel_rows) > room:
         visible_feed = [panel_rows[0], *panel_rows[1 : room - 1], panel_rows[-1]]
-    screen = header + visible_feed + [""] * max(0, room - len(visible_feed)) + box
+    screen = header + visible_feed + [""] * max(0, room - len(visible_feed)) + box + footer
     screen = screen[-height:]
     if len(screen) < height:
         screen = [""] * (height - len(screen)) + screen
     output = "\033[2J\033[H" + "\r\n".join(screen)
-    absolute_row = height - len(box) + 1 + cursor_row - visible_start
+    absolute_row = height - len(box) - len(footer) + 1 + cursor_row - visible_start
     absolute_col = 4 + cursor_col
     output += f"\033[{max(1, absolute_row + 1)};{max(1, absolute_col + 1)}H"
     sys.stdout.write(output)
@@ -497,10 +833,10 @@ def _input_bar(draw, placeholder: str = INPUT_PLACEHOLDER) -> str:
         termios.tcsetattr(fd, termios.TCSADRAIN, previous)
 
 
-def _model_request(url: str, token: str) -> dict[str, object]:
+def _model_request(url: str, token: str, *, timeout: float = 30) -> dict[str, object]:
     request = Request(url, headers={"Authorization": f"Bearer {token}"})
     try:
-        with urlopen(request, timeout=30) as response:
+        with urlopen(request, timeout=timeout) as response:
             result = json.loads(response.read().decode("utf-8"))
     except HTTPError as error:
         detail = error.read(2048).decode("utf-8", errors="replace").strip()
@@ -516,16 +852,36 @@ def _model_request(url: str, token: str) -> dict[str, object]:
     return result
 
 
-def _list_models(config: dict[str, object], search: str = "") -> list[dict[str, str]]:
+def _context_window(item: dict[str, object]) -> int | None:
+    for key in ("context_length", "context_window", "max_context_length", "max_context_tokens"):
+        value = item.get(key)
+        if isinstance(value, int) and value > 0:
+            return value
+    properties = item.get("properties")
+    if isinstance(properties, dict):
+        for key in ("context_length", "context_window", "max_context_length", "max_context_tokens"):
+            value = properties.get(key)
+            if isinstance(value, int) and value > 0:
+                return value
+    return None
+
+
+def _list_models(
+    config: dict[str, object], search: str = "", *, timeout: float = 30
+) -> list[dict[str, object]]:
     provider = str(config["provider"])
     token = str(config["api_key"])
     if provider == "openrouter":
-        result = _model_request("https://openrouter.ai/api/v1/models", token)
+        result = _model_request("https://openrouter.ai/api/v1/models", token, timeout=timeout)
         data = result.get("data")
         if not isinstance(data, list):
             raise RuntimeError("OpenRouter returned an invalid model list.")
         all_models = [
-            {"id": str(item["id"]), "name": str(item.get("name") or item["id"])}
+            {
+                "id": str(item["id"]),
+                "name": str(item.get("name") or item["id"]),
+                "context_window": _context_window(item),
+            }
             for item in data
             if isinstance(item, dict) and isinstance(item.get("id"), str)
         ]
@@ -540,7 +896,7 @@ def _list_models(config: dict[str, object], search: str = "") -> list[dict[str, 
         params = {"per_page": "100", "page": str(page)}
         if search:
             params["search"] = search
-        result = _model_request(base + "?" + urlencode(params), token)
+        result = _model_request(base + "?" + urlencode(params), token, timeout=timeout)
         data = result.get("result")
         if not isinstance(data, list):
             raise RuntimeError("Cloudflare returned an invalid model list.")
@@ -550,12 +906,91 @@ def _list_models(config: dict[str, object], search: str = "") -> list[dict[str, 
                 continue
             model_id = item.get("name") or item.get("id") or item.get("model")
             if model_id:
-                batch.append({"id": str(model_id), "name": str(item.get("display_name") or item.get("description") or model_id)})
+                batch.append(
+                    {
+                        "id": str(model_id),
+                        "name": str(item.get("display_name") or item.get("description") or model_id),
+                        "context_window": _context_window(item),
+                    }
+                )
         all_models.extend(batch)
         info = result.get("result_info")
         if len(data) < 100 or (isinstance(info, dict) and page >= int(info.get("total_pages", page))):
             break
     return sorted(all_models, key=lambda model: model["id"].casefold())
+
+
+def _discover_context_window(config: dict[str, object], state: dict[str, object]) -> None:
+    model_id = str(config["model"])
+    try:
+        models = _list_models(config, model_id, timeout=6)
+    except (OSError, RuntimeError, ValueError):
+        return
+    match = next((model for model in models if model.get("id") == model_id), None)
+    window = _context_window(match) if isinstance(match, dict) else None
+    if window and state.get("model") == model_id:
+        state["window"] = window
+
+
+def _estimated_context_tokens(messages: list[dict[str, str]]) -> int:
+    content = [message.get("content", "") for message in messages if message.get("role") in {"user", "assistant"}]
+    return sum(max(1, math.ceil(len(text) / 3)) + 4 for text in content) + math.ceil(len(SYSTEM_PROMPT) / 3)
+
+
+def _tail_truncate(text: str, width: int) -> str:
+    if display_width(text) <= width:
+        return text
+    if width <= 1:
+        return "…"
+    return "…" + text[-(width - 1):]
+
+
+def _footer_rows(
+    model: str,
+    messages: list[dict[str, str]],
+    context_window: int | None,
+    columns: int,
+) -> list[str]:
+    inner = min(68, max(20, columns - 8))
+    context = "—"
+    if context_window:
+        percent = min(100, round(_estimated_context_tokens(messages) * 100 / context_window))
+        context = f"~{percent}%"
+    context_label = f"Context: {context}"
+    separators = " · "
+    model_prefix, dir_prefix = "Model: ", "Dir: "
+    model_width = max(1, inner - display_width(model_prefix + context_label + separators * 2 + dir_prefix))
+    model_width = min(model_width, max(8, (inner - display_width(context_label) - 11) * 2 // 3))
+    dir_width = max(1, inner - display_width(model_prefix) - model_width - display_width(context_label) - display_width(dir_prefix) - 6)
+    model_text = model_prefix + _truncate_display(model, model_width)
+    try:
+        directory = "~/" + PROJECT_DIR.relative_to(Path.home()).as_posix()
+    except ValueError:
+        directory = str(PROJECT_DIR)
+    first = f"{model_text}{separators}{dir_prefix}{_tail_truncate(directory, dir_width)}{separators}{context_label}"
+    second = f"Project workspace · {directory}"
+    # Keep the current path readable while preserving the compact footer at normal widths.
+    if inner >= 56:
+        body = [first, _truncate_display(second, inner)]
+    else:
+        body = [
+            _truncate_display(model_prefix + model, inner),
+            _truncate_display("Directory: " + directory, inner),
+            _truncate_display(context_label, inner),
+        ]
+    return _card_rows(None, body, columns=columns, width=inner, text_color=MUTED)
+
+
+def _answering_rows(frame: int) -> list[str]:
+    label = "Answering"
+    center = frame % (len(label) + 8) - 4
+    shimmer = ""
+    for index, character in enumerate(label):
+        distance = abs(index - center)
+        brightness = max(0.0, 1.0 - distance / 2.2)
+        color = 240 + round(15 * brightness**2)
+        shimmer += paint(character, f"\033[38;5;{color}m")
+    return [paint("  • ", MUTED) + shimmer]
 
 
 def _pick_item(
@@ -576,9 +1011,9 @@ def _pick_item(
     while True:
         size = shutil.get_terminal_size((80, 24))
         header_count = 0 if session.get("messages") else len(_card_rows("Sophon Agent", ["Ask about code, debugging, and development."], columns=size.columns))
-        input_count = 3
+        input_count = 3 + 4
         room = max(1, size.lines - header_count - input_count)
-        compact = room < 13
+        compact = room < 20
         if compact:
             visible_count = max(1, min(8, room - 6))
         else:
@@ -626,7 +1061,13 @@ def _pick_item(
             body.append(_truncate_display(footer, inner_width))
             range_label = f"{start + 1 if shown else 0}–{start + len(shown)} of {len(filtered)}"
             if title == "Available Models":
-                range_label += f" · {len(filtered)} models"
+                return _card_rows(
+                    None,
+                    body,
+                    columns=size.columns,
+                    top_left=f"{len(filtered)} models",
+                    top_right=range_label,
+                ), completion
             return _card_rows(title, body, columns=size.columns, top_right=range_label), completion
 
         panel, completion = render(query, len(query))
@@ -695,7 +1136,18 @@ def _interactive(config: dict[str, object]) -> int:
         return 1
     session = _new_session()
     notice_rows: list[str] = []
-    waiting = {"message": None}
+    context_window = config.get("context_window")
+    context_state: dict[str, object] = {
+        "model": str(config["model"]),
+        "window": context_window if isinstance(context_window, int) and context_window > 0 else None,
+    }
+    if context_state["window"] is None:
+        threading.Thread(
+            target=_discover_context_window,
+            args=(config.copy(), context_state),
+            daemon=True,
+        ).start()
+    answering = {"active": False, "frame": 0, "text": ""}
 
     def draw(
         text: str,
@@ -709,11 +1161,15 @@ def _interactive(config: dict[str, object]) -> int:
             session,
             text,
             cursor,
+            model=str(config["model"]),
             placeholder=placeholder,
             panel_rows=panel_rows,
             notice_rows=notice_rows,
             suggestion=suggestion,
-            status_message=waiting["message"],
+            answering=bool(answering["active"]),
+            animation_frame=int(answering["frame"]),
+            streaming_text=str(answering["text"]),
+            context_window=context_state["window"] if isinstance(context_state["window"], int) else None,
         )
 
     def notice(title: str, message: str, *, error: bool = False) -> None:
@@ -771,7 +1227,7 @@ def _interactive(config: dict[str, object]) -> int:
                 )
             elif command in {"new", "clear"}:
                 session = _new_session()
-                notice_plain("New session")
+                notice_plain("New session created.")
             elif command == "rename":
                 title = argument or _input_bar(draw, "Enter a session title")
                 if title.strip():
@@ -800,19 +1256,38 @@ def _interactive(config: dict[str, object]) -> int:
                     notice("No models found", f"No models match {argument!r}." if argument else "The provider returned no available models.", error=True)
                     continue
                 items = [
-                    {"id": model["id"], "label": f"{model['id']} · {model['name']}"}
+                    {
+                        "id": model["id"],
+                        "label": f"{model['id']} · {model['name']}",
+                        "context_window": model.get("context_window"),
+                    }
                     for model in models
                 ]
                 selected = _pick_item(session, draw, items, title="Available Models", current_id=str(config["model"]))
                 if selected:
-                    config["model"] = str(selected["id"])
-                    if config["provider"] == "cloudflare":
-                        config["endpoint"] = endpoint_for(config)
+                    updated_config = config.copy()
+                    updated_config["model"] = str(selected["id"])
+                    selected_window = selected.get("context_window")
+                    if isinstance(selected_window, int) and selected_window > 0:
+                        updated_config["context_window"] = selected_window
+                    else:
+                        updated_config.pop("context_window", None)
+                    if updated_config["provider"] == "cloudflare":
+                        updated_config["endpoint"] = endpoint_for(updated_config)
                     try:
-                        write_config(config)
+                        write_config(updated_config)
                     except (OSError, ValueError) as error:
                         notice("Model not changed", str(error), error=True)
                     else:
+                        config.update(updated_config)
+                        context_state["model"] = str(updated_config["model"])
+                        context_state["window"] = selected_window if isinstance(selected_window, int) else None
+                        if context_state["window"] is None:
+                            threading.Thread(
+                                target=_discover_context_window,
+                                args=(updated_config.copy(), context_state),
+                                daemon=True,
+                            ).start()
                         notice("Model changed", str(config["model"]))
                 else:
                     notice("Model selection cancelled", "The current model is unchanged.")
@@ -828,16 +1303,65 @@ def _interactive(config: dict[str, object]) -> int:
         if not save_current():
             messages.pop()
             continue
-        waiting["message"] = "Sophon is thinking…"
+        answering["active"] = True
+        answering["frame"] = 0
+        answering["text"] = ""
         draw("", 0)
-        try:
-            answer = _request(config, [{"role": "system", "content": SYSTEM_PROMPT}, *(item for item in messages if item["role"] in {"user", "assistant"})])
-        except RuntimeError as error:
-            waiting["message"] = None
-            messages.append({"role": "error", "content": str(error)})
+        events: queue.Queue[tuple[str, object]] = queue.Queue()
+        request_messages = [
+            item for item in messages if item["role"] in {"user", "assistant"}
+        ]
+
+        def request_answer() -> None:
+            try:
+                result = _complete_turn(
+                    config.copy(),
+                    request_messages,
+                    on_chunk=lambda chunk: events.put(("chunk", chunk)),
+                )
+            except Exception as error:
+                events.put(("error", error))
+            else:
+                events.put(("done", result))
+
+        threading.Thread(target=request_answer, daemon=True).start()
+        parts: list[str] = []
+        answer: str | None = None
+        request_error: Exception | None = None
+        while answer is None and request_error is None:
+            try:
+                batch = [events.get(timeout=0.15)]
+            except queue.Empty:
+                answering["frame"] = int(answering["frame"]) + 1
+                draw("", 0)
+                continue
+            while True:
+                try:
+                    batch.append(events.get_nowait())
+                except queue.Empty:
+                    break
+            for kind, value in batch:
+                if kind == "chunk":
+                    parts.append(str(value))
+                elif kind == "done":
+                    answer = str(value)
+                elif kind == "error":
+                    request_error = value if isinstance(value, Exception) else RuntimeError(str(value))
+            if answer is None and request_error is None:
+                answering["frame"] = int(answering["frame"]) + 1
+                answering["text"] = "".join(parts)
+                draw("", 0)
+
+        answering["active"] = False
+        answering["text"] = ""
+        if request_error is not None:
+            partial = "".join(parts).strip()
+            if partial:
+                messages.append({"role": "assistant", "content": partial})
+            messages.append({"role": "error", "content": str(request_error)})
             save_current()
             continue
-        waiting["message"] = None
+        assert answer is not None
         messages.append({"role": "assistant", "content": answer})
         if not save_current():
             notice("Session storage error", "The reply is visible but could not be saved.", error=True)
@@ -867,6 +1391,11 @@ def main(args: list[str]) -> int:
         return 1
     if not config:
         return 1
+    try:
+        _ensure_workspace()
+    except OSError as error:
+        card("Workspace unavailable", [str(error)], border_color=NOTICE_BORDER, text_color=NOTICE_TEXT)
+        return 1
     if one_shot is None:
         return _interactive(config)
     if not one_shot.strip():
@@ -877,9 +1406,8 @@ def main(args: list[str]) -> int:
             text_color=NOTICE_TEXT,
         )
         return 2
-    card(None, ["Sophon is thinking…"], width=display_width("Sophon is thinking…"))
     try:
-        _render_agent_message(_ask(config, [], one_shot))
+        _run_one_shot_stream(config, one_shot)
     except RuntimeError as error:
         card(
             "Agent request failed",
@@ -889,6 +1417,63 @@ def main(args: list[str]) -> int:
         )
         return 1
     return 0
+
+
+def _run_one_shot_stream(config: dict[str, object], prompt: str) -> None:
+    events: queue.Queue[tuple[str, object]] = queue.Queue()
+
+    def request_answer() -> None:
+        try:
+            answer = _ask(config.copy(), [], prompt, on_chunk=lambda chunk: events.put(("chunk", chunk)))
+        except Exception as error:
+            events.put(("error", error))
+        else:
+            events.put(("done", answer))
+
+    threading.Thread(target=request_answer, daemon=True).start()
+    tty = sys.stdout.isatty()
+    frame = 0
+    started = False
+    finished = False
+    while not finished:
+        try:
+            batch = [events.get(timeout=0.15)]
+        except queue.Empty:
+            if tty and not started:
+                sys.stdout.write("\r\033[2K" + _answering_rows(frame)[0])
+                sys.stdout.flush()
+                frame += 1
+            continue
+        while True:
+            try:
+                batch.append(events.get_nowait())
+            except queue.Empty:
+                break
+        for kind, value in batch:
+            if kind == "chunk":
+                if not started:
+                    if tty:
+                        sys.stdout.write("\r\033[2K")
+                    sys.stdout.write(paint("  • ", MUTED))
+                    started = True
+                sys.stdout.write(str(value))
+                sys.stdout.flush()
+            elif kind == "error":
+                if tty and not started:
+                    sys.stdout.write("\r\033[2K")
+                if started:
+                    sys.stdout.write("\n")
+                error = value if isinstance(value, Exception) else RuntimeError(str(value))
+                raise RuntimeError(str(error)) from None
+            elif kind == "done":
+                if started:
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
+                elif not str(value).strip():
+                    raise RuntimeError("The provider returned an empty response.")
+                else:
+                    _render_agent_message(str(value))
+                finished = True
 
 
 def _render_agent_message(message: str) -> None:

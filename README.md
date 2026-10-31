@@ -32,10 +32,12 @@ Run `sophon setup` to choose OpenRouter or Cloudflare Workers AI and save the co
 - `sophon config` — show saved provider settings
 - `sophon doctor` — check runtime, provider configuration, and local storage health
 - `sophon agent` — start an interactive AI chat using the configured provider
-- `sophon agent -p "message"` — send one message and print the response
+- `sophon agent -p "message"` — send one message and stream the response
 - `sophon init` — create a starter project configuration
 - `sophon update` — safely update a source checkout or refresh an installed package
 - `sophon --help` — show command help
+
+Agent project files live in `~/.sophon/workspace/my-project` by default. Each project has its own folder under `~/.sophon/workspace/`; the workspace `AGENT.md` explains the layout. The agent can list, read, and write files in the active project folder.
 
 ## Development
 

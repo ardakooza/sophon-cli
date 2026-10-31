@@ -7,8 +7,8 @@ import os
 import select
 import sys
 
-from sophon.config import PROVIDERS, config_display_path, mask_secret, read_config, write_config
-from sophon.core import card, clear_terminal
+from sophon.config import PROVIDERS, config_display_path, read_config, write_config
+from sophon.core import MUTED, card, clear_terminal
 
 
 def _read_key() -> str:
@@ -227,12 +227,18 @@ def run_setup_wizard() -> int:
     summary = [
         f"Provider: {spec['label']}",
         f"Model: {model}",
-        "Credential: hidden; file is restricted to this user",
+        "Credential: hidden",
     ]
     if provider == "cloudflare":
         summary.append(f"Account ID: {data['account_id']}")
     summary.extend([f"Config: {config_display_path()}", "", "Press Enter to save, or Q to cancel."])
-    card("Review Setup", summary, top_right="4 OF 4")
+    card(
+        "Review Setup",
+        summary,
+        top_right="4 OF 4",
+        text_color=MUTED,
+        highlight_terms=("Model:", "Credential:", "Config:"),
+    )
     if sys.stdin.isatty():
         key = _read_key()
         if key not in {"ENTER", "SPACE"}:
@@ -254,7 +260,9 @@ def run_setup_wizard() -> int:
             f"Provider: {spec['label']}",
             f"Model: {model}",
             f"Saved: {config_display_path()}",
-            f"{'API key' if provider == 'openrouter' else 'API token'}: {mask_secret(api_key)}",
+            f"{'API key' if provider == 'openrouter' else 'API token'}: hidden",
         ],
+        text_color=MUTED,
+        highlight_terms=("Model:", "Saved:", "API key:", "API token:"),
     )
     return 0

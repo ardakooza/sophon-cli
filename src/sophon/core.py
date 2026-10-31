@@ -131,6 +131,25 @@ def centered(text: str, width: int) -> str:
     return " " * (spare // 2) + text + " " * (spare - spare // 2)
 
 
+def _paint_highlight_terms(text: str, terms: tuple[str, ...], base_color: str, highlight_color: str) -> str:
+    if not terms:
+        return paint(text, base_color)
+    output: list[str] = []
+    cursor = 0
+    while cursor < len(text):
+        matches = [(text.find(term, cursor), term) for term in terms]
+        matches = [(index, term) for index, term in matches if index >= 0]
+        if not matches:
+            output.append(paint(text[cursor:], base_color))
+            break
+        index, term = min(matches, key=lambda item: item[0])
+        if index > cursor:
+            output.append(paint(text[cursor:index], base_color))
+        output.append(paint(term, highlight_color))
+        cursor = index + len(term)
+    return "".join(output)
+
+
 def card(
     title: str | None,
     lines: list[str],
@@ -140,6 +159,7 @@ def card(
     top_right: str | None = None,
     border_color: str = BORDER,
     text_color: str = WHITE,
+    highlight_terms: tuple[str, ...] = (),
 ) -> None:
     terminal_width = shutil.get_terminal_size((80, 24)).columns
     inner = min(width or 68, max(20, terminal_width - 8))
@@ -174,7 +194,8 @@ def card(
         for chunk in chunks:
             text = centered(chunk, inner) if is_centered else chunk
             content = " " + text + " " * (inner - display_width(text) + 1)
-            print(paint("  │", border_color) + paint(content, text_color) + paint("│", border_color))
+            colored_content = _paint_highlight_terms(content, highlight_terms, text_color, WHITE)
+            print(paint("  │", border_color) + colored_content + paint("│", border_color))
     print(paint("  ╰" + "─" * (inner + 2) + "╯", border_color))
 
 

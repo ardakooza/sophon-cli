@@ -27,6 +27,7 @@ LEGACY_SESSION_FILE = Path.home() / ".xernel" / "sessions" / "sessions.json"
 WORKSPACE_ROOT = Path.home() / ".sophon" / "workspace"
 PROJECT_DIR = WORKSPACE_ROOT / "my-project"
 INPUT_PLACEHOLDER = "Create something with sophon"
+ANIMATION_TICK = 0.075
 
 SYSTEM_PROMPT = (
     "You are Sophon, a concise and practical development assistant. "
@@ -493,6 +494,25 @@ def _save_session(sessions: list[dict[str, object]], session: dict[str, object])
     _write_sessions(sessions)
 
 
+def _paint_highlight_terms(text: str, terms: tuple[str, ...], base_color: str, highlight_color: str) -> str:
+    if not terms:
+        return paint(text, base_color)
+    pieces: list[str] = []
+    cursor = 0
+    while cursor < len(text):
+        found = [(text.find(term, cursor), term) for term in terms]
+        found = [(position, term) for position, term in found if position >= 0]
+        if not found:
+            pieces.append(paint(text[cursor:], base_color))
+            break
+        position, term = min(found, key=lambda item: item[0])
+        if position > cursor:
+            pieces.append(paint(text[cursor:position], base_color))
+        pieces.append(paint(term, highlight_color))
+        cursor = position + len(term)
+    return "".join(pieces)
+
+
 def _card_rows(
     title: str | None,
     lines: list[str],
@@ -503,6 +523,7 @@ def _card_rows(
     top_right: str | None = None,
     border_color: str = BORDER,
     text_color: str = WHITE,
+    highlight_terms: tuple[str, ...] = (),
 ) -> list[str]:
     inner = min(width, max(3, columns - 8)) if width is not None else min(68, max(20, columns - 8))
     top = "  ╭" + "─" * (inner + 2) + "╮"
@@ -559,7 +580,8 @@ def _card_rows(
             text = " " * ((inner - display_width(wrapped)) // 2) + wrapped if is_title else wrapped
             padding = max(0, inner - display_width(text))
             row = " " + text + " " * (padding + 1)
-            rows.append(paint("  │", border_color) + paint(row, text_color) + paint("│", border_color))
+            colored_row = _paint_highlight_terms(row, highlight_terms, text_color, WHITE)
+            rows.append(paint("  │", border_color) + colored_row + paint("│", border_color))
     rows.append(paint(bottom, border_color))
     return rows
 
@@ -655,7 +677,12 @@ def _input_box_rows(lines: list[str], width: int, *, placeholder: bool, text_len
             actual_count = min(len(content_text), remaining)
             content = paint("› ", WHITE) + paint(content_text[:actual_count], WHITE if not placeholder else MUTED)
             if actual_count < len(content_text):
-                content += paint(content_text[actual_count:], MUTED)
+                tail = content_text[actual_count:]
+                if placeholder and tail.endswith("sophon"):
+                    prefix = tail[:-len("sophon")]
+                    content += paint(prefix, MUTED) + paint("sophon", WHITE)
+                else:
+                    content += paint(tail, MUTED)
             remaining -= actual_count
         else:
             actual_count = min(len(line), remaining)
@@ -702,10 +729,10 @@ def _draw_screen(
         feed = panel_rows
     else:
         feed = list(notice_rows or []) + _message_rows(session["messages"], columns)
-        if answering:
+        if answering and not streaming_text.strip():
             feed.extend(_answering_rows(animation_frame))
-            if streaming_text:
-                feed.extend(_agent_rows(streaming_text, columns))
+        if streaming_text:
+            feed.extend(_agent_rows(streaming_text, columns))
     room = max(0, height - len(header) - len(box) - len(footer))
     visible_feed = feed[-room:] if room else []
     if panel_rows is not None and room >= 2 and len(panel_rows) > room:
@@ -958,7 +985,7 @@ def _footer_rows(
         context = f"~{percent}%"
     context_label = f"Context: {context}"
     separators = " · "
-    model_prefix, dir_prefix = "Model: ", "Dir: "
+    model_prefix, dir_prefix = "Model: ", "Directory: "
     model_width = max(1, inner - display_width(model_prefix + context_label + separators * 2 + dir_prefix))
     model_width = min(model_width, max(8, (inner - display_width(context_label) - 11) * 2 // 3))
     dir_width = max(1, inner - display_width(model_prefix) - model_width - display_width(context_label) - display_width(dir_prefix) - 6)
@@ -978,19 +1005,27 @@ def _footer_rows(
             _truncate_display("Directory: " + directory, inner),
             _truncate_display(context_label, inner),
         ]
-    return _card_rows(None, body, columns=columns, width=inner, text_color=MUTED)
+    return _card_rows(
+        None,
+        body,
+        columns=columns,
+        width=inner,
+        text_color=MUTED,
+        highlight_terms=("Model:", "Directory:", "Context:"),
+    )
 
 
 def _answering_rows(frame: int) -> list[str]:
     label = "Answering"
-    center = frame % (len(label) + 8) - 4
+    center = frame % (len(label) + 6) - 3
     shimmer = ""
     for index, character in enumerate(label):
         distance = abs(index - center)
-        brightness = max(0.0, 1.0 - distance / 2.2)
+        brightness = max(0.0, 1.0 - distance / 2.0)
         color = 240 + round(15 * brightness**2)
         shimmer += paint(character, f"\033[38;5;{color}m")
-    return [paint("  • ", MUTED) + shimmer]
+    dot_color = WHITE if frame % 2 == 0 else MUTED
+    return ["  " + paint("•", dot_color) + " " + shimmer]
 
 
 def _pick_item(
@@ -1330,7 +1365,7 @@ def _interactive(config: dict[str, object]) -> int:
         request_error: Exception | None = None
         while answer is None and request_error is None:
             try:
-                batch = [events.get(timeout=0.15)]
+                batch = [events.get(timeout=ANIMATION_TICK)]
             except queue.Empty:
                 answering["frame"] = int(answering["frame"]) + 1
                 draw("", 0)
@@ -1435,9 +1470,29 @@ def _run_one_shot_stream(config: dict[str, object], prompt: str) -> None:
     frame = 0
     started = False
     finished = False
+    columns = shutil.get_terminal_size((80, 24)).columns
+    line_width = max(20, columns - 4)
+    line_column = 0
+
+    def write_wrapped(chunk: str) -> None:
+        nonlocal line_column
+        for character in chunk:
+            if character == "\r":
+                continue
+            if character == "\n":
+                sys.stdout.write("\n    ")
+                line_column = 4
+                continue
+            character_width = display_width(character)
+            if line_column + character_width > line_width:
+                sys.stdout.write("\n    ")
+                line_column = 4
+            sys.stdout.write(character)
+            line_column += character_width
+
     while not finished:
         try:
-            batch = [events.get(timeout=0.15)]
+            batch = [events.get(timeout=ANIMATION_TICK)]
         except queue.Empty:
             if tty and not started:
                 sys.stdout.write("\r\033[2K" + _answering_rows(frame)[0])
@@ -1456,7 +1511,8 @@ def _run_one_shot_stream(config: dict[str, object], prompt: str) -> None:
                         sys.stdout.write("\r\033[2K")
                     sys.stdout.write(paint("  • ", MUTED))
                     started = True
-                sys.stdout.write(str(value))
+                    line_column = 4
+                write_wrapped(str(value))
                 sys.stdout.flush()
             elif kind == "error":
                 if tty and not started:

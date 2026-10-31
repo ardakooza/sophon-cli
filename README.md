@@ -23,7 +23,7 @@ The installer will not overwrite an unrelated existing `xernel` command. Remove 
 
 ## Configure a provider
 
-Run `xernel setup` to choose OpenRouter or Cloudflare Workers AI and save the connection settings. Run `xernel config` to see the saved provider and model. API credentials are stored in the user configuration file with restricted file permissions; they are not encrypted.
+Run `xernel setup` to choose OpenRouter or Cloudflare Workers AI and save the connection settings. Run `xernel config` to see the saved provider and model. Settings default to `~/.xernel/config/config.json` (or `$XDG_CONFIG_HOME/xernel/config/config.json` when set); an existing config is moved to the new path on first read. API credentials are stored with restricted file permissions; they are not encrypted.
 
 ## Commands
 

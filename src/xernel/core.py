@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import codecs
+import os
+import select
 import shutil
 import subprocess
 import sys
@@ -10,7 +13,7 @@ from pathlib import Path
 from urllib.error import URLError
 from urllib.request import urlopen
 
-from xernel.config import PROVIDERS, config_path, endpoint_for, mask_secret, read_config
+from xernel.config import PROVIDERS, config_display_path, endpoint_for, mask_secret, read_config
 from xernel import __version__ as VERSION
 
 RESET = "\033[0m"
@@ -129,27 +132,25 @@ def card(
     *,
     width: int | None = None,
     centered_lines: set[str] | None = None,
-    right_aligned_lines: dict[str, str] | None = None,
+    top_right: str | None = None,
     border_color: str = BORDER,
     text_color: str = WHITE,
 ) -> None:
     terminal_width = shutil.get_terminal_size((80, 24)).columns
     inner = min(width or 68, max(20, terminal_width - 8))
     centered_lines = centered_lines or set()
-    right_aligned_lines = right_aligned_lines or {}
-    print(paint("  ╭" + "─" * (inner + 2) + "╮", border_color))
+    if top_right:
+        border_inner = inner + 2
+        badge_width = display_width(top_right)
+        left_border = max(0, border_inner - badge_width - 1)
+        top_border = "  ╭" + "─" * left_border + " " + top_right + "╮"
+    else:
+        top_border = "  ╭" + "─" * (inner + 2) + "╮"
+    print(paint(top_border, border_color))
     content_lines = ([title] if title is not None else []) + lines
     for line in content_lines:
         is_centered = line == title or line in centered_lines
-        if line in right_aligned_lines:
-            right = right_aligned_lines[line]
-            left = line
-            if display_width(left) + display_width(right) + 1 > inner:
-                left = line.rsplit(" / ", 1)[-1]
-            gap = max(1, inner - display_width(left) - display_width(right))
-            chunks = [left + " " * gap + right]
-        else:
-            chunks = wrap_text(line, inner)
+        chunks = wrap_text(line, inner)
         for chunk in chunks:
             text = centered(chunk, inner) if is_centered else chunk
             content = " " + text + " " * (inner - display_width(text) + 1)
@@ -160,6 +161,62 @@ def card(
 def clear_terminal() -> None:
     if sys.stdout.isatty():
         print("\033[2J\033[H", end="", flush=True)
+
+
+def read_prompt(prompt: str) -> str:
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        return input(prompt)
+
+    import termios
+    import tty
+
+    fd = sys.stdin.fileno()
+    previous = termios.tcgetattr(fd)
+    decoder = codecs.getincrementaldecoder(sys.stdin.encoding or "utf-8")()
+    characters: list[str] = []
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+    try:
+        tty.setraw(fd)
+        while True:
+            raw = os.read(fd, 1)
+            if not raw:
+                raise EOFError
+            if raw == b"\x1b":
+                if not select.select([fd], [], [], 0.08)[0]:
+                    raise EOFError
+                prefix = os.read(fd, 1)
+                if prefix in {b"[", b"O"}:
+                    while select.select([fd], [], [], 0.01)[0]:
+                        suffix = os.read(fd, 1)
+                        if suffix and 0x40 <= suffix[0] <= 0x7E:
+                            break
+                continue
+            if raw in {b"\r", b"\n"}:
+                sys.stdout.write("\r\n")
+                sys.stdout.flush()
+                return "".join(characters)
+            if raw == b"\x03":
+                raise KeyboardInterrupt
+            if raw == b"\x04":
+                if not characters:
+                    raise EOFError
+                continue
+            if raw in {b"\x08", b"\x7f"}:
+                if characters:
+                    width = display_width(characters.pop())
+                    if width:
+                        sys.stdout.write("\b \b" * width)
+                        sys.stdout.flush()
+                continue
+
+            character = decoder.decode(raw)
+            if character and (character.isprintable() or character == "\t"):
+                characters.append(character)
+                sys.stdout.write(character)
+                sys.stdout.flush()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, previous)
 
 
 def show_welcome() -> None:
@@ -297,7 +354,7 @@ def run_session() -> int:
     show_welcome()
     while True:
         try:
-            value = input(paint("  › ", GREEN)).strip()
+            value = read_prompt(paint("  › ", GREEN)).strip()
         except (EOFError, KeyboardInterrupt):
             print()
             break
@@ -355,7 +412,7 @@ def show_config() -> int:
     try:
         data = read_config()
     except (OSError, ValueError):
-        card(None, ["Configuration is invalid or unreadable.", f"Path: {config_path()}"])
+        card(None, ["Configuration is invalid or unreadable.", f"Path: {config_display_path()}"])
         return 1
     if data is None:
         card(None, ["No provider is configured.", "Run xernel setup to connect one."])
@@ -369,7 +426,7 @@ def show_config() -> int:
     ]
     if provider == "cloudflare":
         lines.append(f"Account ID: {data['account_id']}")
-    lines.extend([f"Endpoint: {endpoint_for(data)}", f"Config file: {config_path()}"])
+    lines.extend([f"Endpoint: {endpoint_for(data)}", f"Config file: {config_display_path()}"])
     card(None, lines)
     return 0
 

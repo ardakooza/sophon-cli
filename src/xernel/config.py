@@ -24,15 +24,33 @@ PROVIDERS: dict[str, dict[str, str]] = {
 
 def config_path() -> Path:
     xdg_home = os.environ.get("XDG_CONFIG_HOME")
+    base = Path(xdg_home) / "xernel" if xdg_home else Path.home() / ".xernel"
+    return base / "config" / "config.json"
+
+
+def config_display_path() -> str:
+    path = config_path()
+    try:
+        return "~/" + path.relative_to(Path.home()).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def legacy_config_path() -> Path:
+    xdg_home = os.environ.get("XDG_CONFIG_HOME")
     base = Path(xdg_home) if xdg_home else Path.home() / ".config"
     return base / "xernel" / "config.json"
 
 
 def read_config() -> dict[str, Any] | None:
     path = config_path()
-    if not path.exists():
-        return None
-    with path.open(encoding="utf-8") as stream:
+    source = path
+    if not source.exists():
+        legacy_path = legacy_config_path()
+        if legacy_path == path or not legacy_path.exists():
+            return None
+        source = legacy_path
+    with source.open(encoding="utf-8") as stream:
         data = json.load(stream)
     if not isinstance(data, dict) or data.get("provider") not in PROVIDERS:
         raise ValueError("Unsupported or malformed provider configuration")
@@ -46,6 +64,9 @@ def read_config() -> dict[str, Any] | None:
             char not in "0123456789abcdefABCDEF" for char in account_id
         ):
             raise ValueError("Configuration has an invalid Cloudflare Account ID")
+    if source != path:
+        write_config(data)
+        source.unlink()
     return data
 
 
@@ -60,6 +81,7 @@ def write_config(data: dict[str, Any]) -> Path:
 
     path = config_path()
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path.parent.parent, 0o700)
     os.chmod(path.parent, 0o700)
     fd, temp_name = tempfile.mkstemp(prefix=".config-", suffix=".tmp", dir=path.parent)
     try:

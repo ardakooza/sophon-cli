@@ -2,6 +2,7 @@
 set -eu
 
 ARCHIVE="https://github.com/ardakooza/xernel/archive/refs/heads/main.tar.gz"
+VERSION_URL="https://raw.githubusercontent.com/ardakooza/xernel/main/src/xernel/VERSION"
 
 if ! command -v python3 >/dev/null 2>&1; then
     echo "Python 3.10+ is required. On Termux, run: pkg install python" >&2
@@ -64,7 +65,25 @@ fi
 
 TEMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TEMP_DIR"' EXIT HUP INT TERM
-echo "Downloading Xernel from GitHub..."
+echo "Checking Xernel version..."
+REMOTE_VERSION=$(curl -fsSL --max-time 10 "$VERSION_URL" 2>/dev/null || true)
+MANAGED_INSTALL=0
+if [ -x "$INSTALL_DIR/venv/bin/python" ]; then
+    if [ -L "$TARGET" ] && [ "$(readlink "$TARGET")" = "$INSTALL_DIR/venv/bin/xernel" ]; then
+        MANAGED_INSTALL=1
+    elif [ -f "$TARGET" ] && grep -q 'Xernel managed launcher' "$TARGET"; then
+        MANAGED_INSTALL=1
+    fi
+fi
+if [ "$MANAGED_INSTALL" -eq 1 ] && [ -n "$REMOTE_VERSION" ]; then
+    INSTALLED_VERSION=$("$INSTALL_DIR/venv/bin/python" -c 'from xernel import __version__; print(__version__)' 2>/dev/null || true)
+    if [ "$INSTALLED_VERSION" = "$REMOTE_VERSION" ]; then
+        echo "Xernel is already up to date ($REMOTE_VERSION)."
+        exit 0
+    fi
+fi
+
+echo "Downloading latest Xernel..."
 curl -fsSL "$ARCHIVE" -o "$TEMP_DIR/xernel.tar.gz"
 tar -xzf "$TEMP_DIR/xernel.tar.gz" -C "$TEMP_DIR"
 SOURCE_DIR="$TEMP_DIR/xernel-main"
@@ -72,7 +91,47 @@ SOURCE_DIR="$TEMP_DIR/xernel-main"
 if [ ! -x "$INSTALL_DIR/venv/bin/python" ]; then
     python3 -m venv "$INSTALL_DIR/venv"
 fi
-"$INSTALL_DIR/venv/bin/python" -m pip install --disable-pip-version-check --upgrade --force-reinstall "$SOURCE_DIR"
+PIP_LOG="$TEMP_DIR/pip.log"
+PIP_STATUS_FILE="$TEMP_DIR/pip.status"
+if [ -t 1 ]; then
+    echo "Installing Xernel..."
+    (
+        if "$INSTALL_DIR/venv/bin/python" -m pip install --disable-pip-version-check --quiet --upgrade --force-reinstall "$SOURCE_DIR" >"$PIP_LOG" 2>&1; then
+            status=0
+        else
+            status=$?
+        fi
+        printf '%s\n' "$status" > "$PIP_STATUS_FILE"
+    ) &
+    PIP_PID=$!
+    SPIN=0
+    while [ ! -f "$PIP_STATUS_FILE" ]; do
+        case $((SPIN % 4)) in
+            0) FRAME='|' ;;
+            1) FRAME='/' ;;
+            2) FRAME='-' ;;
+            3) FRAME='\\' ;;
+        esac
+        printf '\r  %s Working...' "$FRAME"
+        SPIN=$((SPIN + 1))
+        sleep 0.12
+    done
+    wait "$PIP_PID" || true
+    PIP_STATUS=$(cat "$PIP_STATUS_FILE")
+    printf '\r\033[2K'
+else
+    echo "Installing Xernel..."
+    if "$INSTALL_DIR/venv/bin/python" -m pip install --disable-pip-version-check --quiet --upgrade --force-reinstall "$SOURCE_DIR" >"$PIP_LOG" 2>&1; then
+        PIP_STATUS=0
+    else
+        PIP_STATUS=$?
+    fi
+fi
+if [ "$PIP_STATUS" -ne 0 ]; then
+    echo "Xernel installation failed. Details:" >&2
+    cat "$PIP_LOG" >&2
+    exit "$PIP_STATUS"
+fi
 
 if [ -L "$TARGET" ]; then
     ln -sfn "$INSTALL_DIR/venv/bin/xernel" "$TARGET.new"
@@ -88,7 +147,11 @@ EOF
     mv "$WRAPPER" "$TARGET"
 fi
 
-echo "Xernel installed at $TARGET"
+if [ -n "$REMOTE_VERSION" ]; then
+    echo "Xernel $REMOTE_VERSION installed. Run 'xernel' to start."
+else
+    echo "Xernel installed. Run 'xernel' to start."
+fi
 case ":$PATH:" in
     *":$BIN_DIR:"*) echo "Run it with: xernel" ;;
     *) echo "Add $BIN_DIR to PATH, then run: xernel" ;;

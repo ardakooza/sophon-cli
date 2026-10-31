@@ -9,6 +9,7 @@ import math
 import os
 import queue
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -76,6 +77,49 @@ WORKSPACE_TOOLS = [
                 "required": ["path", "content"],
                 "additionalProperties": False,
             },
+        },
+    },
+]
+
+BUILTIN_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_version",
+            "description": "Get the installed Sophon CLI version.",
+            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "is_update",
+            "description": "Check whether a newer Sophon CLI version is available.",
+            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update",
+            "description": "Update Sophon CLI to the latest version. Sophon will restart after the current agent response.",
+            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "system_health",
+            "description": "Run Sophon doctor and return the system health report.",
+            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "workspace_list",
+            "description": "List project folders in the Sophon workspace.",
+            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
         },
     },
 ]
@@ -220,6 +264,60 @@ def _execute_workspace_tool(name: str, arguments: object) -> str:
     raise RuntimeError(f"Unknown workspace tool: {name}")
 
 
+def _execute_builtin_tool(name: str, arguments: object) -> str:
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except json.JSONDecodeError:
+            raise RuntimeError("The built-in tool arguments were not valid JSON.") from None
+    if not isinstance(arguments, dict) or arguments:
+        raise RuntimeError("This built-in tool does not accept arguments.")
+
+    from sophon import __version__
+    from sophon import core
+
+    if name == "get_version":
+        return f"Sophon CLI version: {__version__}"
+    if name == "is_update":
+        latest = core.latest_version(timeout=5)
+        if latest is None:
+            return "Could not check for updates because GitHub is unavailable."
+        available = latest != __version__
+        return f"Current version: {__version__}\nLatest version: {latest}\nUpdate available: {'yes' if available else 'no'}"
+    if name == "update":
+        status = core.update(quiet=True, restart_after=False)
+        if status != 0:
+            return f"Update failed with exit status {status}."
+        if core.RESTART_REQUESTED:
+            core.RESTART_ARGS = ["agent"]
+            return "Update installed. Sophon will restart after this agent response."
+        return f"Sophon is already current ({__version__})."
+    if name == "system_health":
+        try:
+            package_root = str(Path(__file__).resolve().parents[1])
+            python_path = os.pathsep.join(filter(None, (package_root, os.environ.get("PYTHONPATH", ""))))
+            result = subprocess.run(
+                [sys.executable, "-m", "sophon.cli", "doctor"],
+                capture_output=True,
+                text=True,
+                env={**os.environ, "PYTHONPATH": python_path},
+                timeout=30,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            return f"Sophon doctor could not run: {error}"
+        output = (result.stdout or result.stderr).strip()
+        return output or f"Sophon doctor exited with status {result.returncode}."
+    if name == "workspace_list":
+        WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
+        projects = sorted(
+            (path.name for path in WORKSPACE_ROOT.iterdir() if path.is_dir()),
+            key=str.casefold,
+        )
+        return "\n".join(projects) if projects else "No project folders are in the workspace yet."
+    raise RuntimeError(f"Unknown Sophon built-in tool: {name}")
+
+
 def _request(
     config: dict[str, object],
     messages: list[dict[str, object]],
@@ -236,8 +334,9 @@ def _request(
         payload["max_tokens"] = 2048
     payload["stream"] = True
     if tools_enabled:
-        payload["tools"] = WORKSPACE_TOOLS if provider == "openrouter" else [
-            tool["function"] for tool in WORKSPACE_TOOLS
+        all_tools = [*BUILTIN_TOOLS, *WORKSPACE_TOOLS]
+        payload["tools"] = all_tools if provider == "openrouter" else [
+            tool["function"] for tool in all_tools
         ]
 
     request = Request(
@@ -386,8 +485,11 @@ def _complete_turn(
                 continue
             name = str(function.get("name", ""))
             try:
-                result = _execute_workspace_tool(name, function.get("arguments", "{}"))
-            except RuntimeError as error:
+                if name in {tool["function"]["name"] for tool in BUILTIN_TOOLS}:
+                    result = _execute_builtin_tool(name, function.get("arguments", "{}"))
+                else:
+                    result = _execute_workspace_tool(name, function.get("arguments", "{}"))
+            except (RuntimeError, OSError, ValueError) as error:
                 result = f"Tool error: {error}"
             messages.append({
                 "role": "tool",
@@ -395,6 +497,10 @@ def _complete_turn(
                 "name": name,
                 "content": result,
             })
+            from sophon import core
+
+            if core.RESTART_REQUESTED:
+                return "Sophon has been updated and will restart now."
     raise RuntimeError("The agent reached the workspace tool-call limit for this turn.")
 
 
@@ -417,6 +523,13 @@ def _timestamp() -> str:
 def _new_session() -> dict[str, object]:
     now = _timestamp()
     return {"id": uuid.uuid4().hex[:10], "title": "New session", "created_at": now, "updated_at": now, "messages": []}
+
+
+def _workspace_location(command: str) -> tuple[str, str, bool]:
+    if command == "cwd":
+        return "Current directory", str(Path.cwd().resolve()), False
+    workspace = PROJECT_DIR.resolve()
+    return "Project workspace", str(workspace), False
 
 
 def _load_sessions() -> list[dict[str, object]]:
@@ -1024,7 +1137,7 @@ def _answering_rows(frame: int) -> list[str]:
         brightness = max(0.0, 1.0 - distance / 2.0)
         color = 240 + round(15 * brightness**2)
         shimmer += paint(character, f"\033[38;5;{color}m")
-    dot_color = WHITE if frame % 2 == 0 else MUTED
+    dot_color = WHITE if (frame // 6) % 2 == 0 else MUTED
     return ["  " + paint("•", dot_color) + " " + shimmer]
 
 
@@ -1257,9 +1370,15 @@ def _interactive(config: dict[str, object]) -> int:
             if command == "help":
                 notice_rows = _card_rows(
                     "Sophon Commands",
-                    ["/model [search]  Choose a provider model", "/new  Start a fresh saved session", "/rename [title]  Rename this session", "/resume  Load a saved session", "/clear  Start a new session", "/exit or Q  Close Sophon Agent"],
+                    ["/model [search]  Choose a provider model", "/new  Start a fresh saved session", "/rename [title]  Rename this session", "/resume  Load a saved session", "/cwd  Show the current directory", "/pwd  Show the project workspace path", "/clear  Start a new session", "/exit or Q  Close Sophon Agent"],
                     columns=shutil.get_terminal_size((80, 24)).columns,
                 )
+            elif command == "cwd":
+                title, message, error = _workspace_location(command)
+                notice(title, message, error=error)
+            elif command == "pwd":
+                title, message, error = _workspace_location(command)
+                notice(title, message, error=error)
             elif command in {"new", "clear"}:
                 session = _new_session()
                 notice_plain("New session created.")
@@ -1400,6 +1519,10 @@ def _interactive(config: dict[str, object]) -> int:
         messages.append({"role": "assistant", "content": answer})
         if not save_current():
             notice("Session storage error", "The reply is visible but could not be saved.", error=True)
+        from sophon import core
+
+        if core.RESTART_REQUESTED:
+            return 0
 
 
 def main(args: list[str]) -> int:

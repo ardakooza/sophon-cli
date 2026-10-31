@@ -33,11 +33,11 @@ Run `sophon setup` to choose OpenRouter or Cloudflare Workers AI and save the co
 - `sophon doctor` — check runtime, provider configuration, and local storage health
 - `sophon agent` — start an interactive AI chat using the configured provider
 - `sophon agent -p "message"` — send one message and stream the response
-- `/cwd` — show the current working directory inside the terminal interface
-- `/pwd` — show the project workspace path when inside a workspace
 - `sophon init` — create a starter project configuration
 - `sophon update` — safely update a source checkout or refresh an installed package
 - `sophon --help` — show command help
+
+In the terminal interface, `/restart` restarts Sophon and `/auto-update on|off` controls update checks at startup (off by default). A successful manual update restarts Sophon automatically. In Agent mode, `/cwd` shows the current directory and `/pwd` shows the active project workspace path. Agent mode always has built-in `get_version`, `is_update`, `update`, `system_health`, and `workspace_list` tools, in addition to its project file tools.
 
 Agent project files live in `~/.sophon/workspace/my-project` by default. Each project has its own folder under `~/.sophon/workspace/`; the workspace `AGENT.md` explains the layout. The agent can list, read, and write files in the active project folder.
 

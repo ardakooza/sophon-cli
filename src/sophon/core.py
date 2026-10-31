@@ -29,6 +29,8 @@ UPDATE_BORDER = "\033[38;5;179m"
 UPDATE_TEXT = "\033[38;5;221m"
 LATEST_VERSION_URL = "https://raw.githubusercontent.com/ardakooza/sophon-cli/main/src/sophon/VERSION"
 LATEST_VERSION_API_URL = "https://api.github.com/repos/ardakooza/sophon-cli/contents/src/sophon/VERSION"
+RESTART_REQUESTED = False
+RESTART_ARGS: list[str] | None = None
 
 
 def paint(text: str, color: str) -> str:
@@ -312,7 +314,7 @@ def update_card(lines: list[str], *, initial: bool = False, final: bool = False)
         sys.stdout.flush()
 
 
-def run_git_animated(args: list[str], lines: list[str], active_line: int, message: str):
+def run_git_animated(args: list[str], lines: list[str], active_line: int, message: str, *, animate: bool = True):
     try:
         process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     except OSError:
@@ -323,7 +325,7 @@ def run_git_animated(args: list[str], lines: list[str], active_line: int, messag
             stdout, stderr = process.communicate(timeout=0.25)
             return stdout, stderr, process.returncode
         except subprocess.TimeoutExpired:
-            if sys.stdout.isatty():
+            if animate and sys.stdout.isatty():
                 dots = dots % 3 + 1
                 lines[active_line] = message + "." * dots
                 update_card(lines)
@@ -346,22 +348,71 @@ def latest_version(timeout: float = 10) -> str | None:
     return None
 
 
-def update() -> int:
+def settings_path() -> Path:
+    return config_path().parent.parent / "settings.json"
+
+
+def auto_update_enabled() -> bool:
+    try:
+        value = json.loads(settings_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+    return isinstance(value, dict) and value.get("auto_update") is True
+
+
+def set_auto_update(enabled: bool) -> None:
+    path = settings_path()
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path.parent, 0o700)
+    temporary = path.with_suffix(".tmp")
+    try:
+        temporary.write_text(json.dumps({"auto_update": enabled}, indent=2) + "\n", encoding="utf-8")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def restart_sophon(arguments: list[str] | None = None) -> None:
+    """Replace this process with the same Sophon invocation."""
+    restart_args = sys.argv[1:] if arguments is None else arguments
+    os.execv(sys.executable, [sys.executable, sys.argv[0], *restart_args])
+
+
+def update(*, quiet: bool = False, restart_after: bool = True, known_version: str | None = None) -> int:
+    global RESTART_ARGS, RESTART_REQUESTED
+    RESTART_REQUESTED = False
+    RESTART_ARGS = None
+
+    def show(lines: list[str], *, initial: bool = False, final: bool = False) -> None:
+        if not quiet:
+            update_card(lines, initial=initial, final=final)
+
+    def finish_update(version: str) -> None:
+        global RESTART_REQUESTED
+        show(["Update complete", f"sophon {version}", "Restarting Sophon"], final=True)
+        if restart_after:
+            restart_sophon()
+        RESTART_REQUESTED = True
+
     repo = Path(__file__).resolve().parents[2]
     lines = ["Checking status", "Waiting for updates", "Fast-forward only"]
     if not (repo / ".git").exists():
         lines[:] = ["Checking installed version", "Contacting GitHub", ""]
-        update_card(lines, initial=True)
-        remote_version = latest_version()
+        show(lines, initial=True)
+        remote_version = known_version or latest_version()
         if remote_version is None:
-            update_card(["Version check failed", "Could not reach GitHub", "Retry later"], final=True)
+            show(["Version check failed", "Could not reach GitHub", "Retry later"], final=True)
             return 1
         if remote_version == VERSION:
-            update_card(["! Version already current.", "", f"sophon {VERSION}"], final=True)
+            show(["! Version already current.", "", f"sophon {VERSION}"], final=True)
             return 0
 
         lines[:] = ["Update available", f"{VERSION} → {remote_version}", "Installing with pip"]
-        update_card(lines)
+        show(lines)
         _, _, status_code = run_git_animated(
             [
                 sys.executable,
@@ -376,41 +427,50 @@ def update() -> int:
             lines,
             1,
             "Installing latest version",
+            animate=not quiet,
         )
         if status_code != 0:
-            update_card(["Update failed", "Check network or pip", "Retry later"], final=True)
+            show(["Update failed", "Check network or pip", "Retry later"], final=True)
             return status_code
-        update_card(["Update complete", f"sophon {remote_version}", "Restart Sophon"], final=True)
+        finish_update(remote_version)
         return 0
 
-    update_card(lines, initial=True)
+    show(lines, initial=True)
     stdout, _, status_code = run_git_animated(
-        ["git", "-C", str(repo), "status", "--porcelain"], lines, 0, "Checking status"
+        ["git", "-C", str(repo), "status", "--porcelain"], lines, 0, "Checking status", animate=not quiet
     )
     if status_code != 0:
-        update_card(["Git status failed", "Install Git first", ""], final=True)
+        show(["Git status failed", "Install Git first", ""], final=True)
         return status_code
     if stdout and stdout.strip():
-        update_card(["Local changes found", "Nothing was changed", "Commit or stash first"], final=True)
+        show(["Local changes found", "Nothing was changed", "Commit or stash first"], final=True)
         return 1
 
     lines[:] = ["Repository clean", "Fetching updates", "Fast-forward only"]
-    update_card(lines)
+    show(lines)
     stdout, _, pull_code = run_git_animated(
-        ["git", "-C", str(repo), "pull", "--ff-only"], lines, 1, "Fetching updates"
+        ["git", "-C", str(repo), "pull", "--ff-only"], lines, 1, "Fetching updates", animate=not quiet
     )
     if pull_code != 0:
-        update_card(["Update failed", "Check network or Git", "Retry later"], final=True)
+        show(["Update failed", "Check network or Git", "Retry later"], final=True)
         return pull_code
-    if stdout and "Already up to date" in stdout:
-        update_card(["! Version already current.", "", f"sophon {VERSION}"], final=True)
+    try:
+        updated_version = (repo / "src" / "sophon" / "VERSION").read_text(encoding="utf-8").strip()
+    except OSError:
+        updated_version = "latest"
+    if updated_version == VERSION:
+        show(["! Version already current.", "", f"sophon {VERSION}"], final=True)
     else:
-        try:
-            updated_version = (repo / "src" / "sophon" / "VERSION").read_text(encoding="utf-8").strip()
-        except OSError:
-            updated_version = "latest"
-        update_card(["Update complete", f"sophon {updated_version}", "Restart Sophon"], final=True)
+        finish_update(updated_version)
     return 0
+
+
+def auto_update_on_start() -> None:
+    if not auto_update_enabled():
+        return
+    remote_version = latest_version(timeout=4)
+    if remote_version and remote_version != VERSION:
+        update(known_version=remote_version, restart_after=True)
 
 
 def run_session() -> int:
@@ -432,7 +492,7 @@ def run_session() -> int:
             if command == "/update":
                 update()
             elif command == "/help":
-                card("Sophon commands", ["/help — Show available commands", "/setup — Configure a provider", "/config — Show saved settings", "/cwd — Show the current directory", "/pwd — Show the project workspace", "/clear — Redraw the welcome screen", "/version — Print the current version", "/update — Pull latest code safely", "/exit — Close Sophon"])
+                card("Sophon commands", ["/help — Show available commands", "/setup — Configure a provider", "/config — Show saved settings", "/auto-update on|off — Automatic updates at startup", "/clear — Redraw the welcome screen", "/version — Print the current version", "/update — Update and restart if changed", "/restart — Restart Sophon", "/exit — Close Sophon"])
             elif command == "/setup":
                 from sophon.setup_wizard import run_setup_wizard
 
@@ -440,14 +500,20 @@ def run_session() -> int:
                     show_welcome()
             elif command == "/config":
                 show_config()
-            elif command == "/cwd":
-                card("Current directory", [str(Path.cwd().resolve())])
-            elif command == "/pwd":
-                workspace = project_workspace()
-                if workspace is None:
-                    card("Project workspace", ["No project workspace found."])
+            elif command.startswith("/auto-update"):
+                _, _, value = command.partition(" ")
+                value = value.strip()
+                if value in {"on", "off"}:
+                    set_auto_update(value == "on")
+                    card("Automatic updates", [f"Auto-update is {value}."])
+                elif not value:
+                    status = "on" if auto_update_enabled() else "off"
+                    card("Automatic updates", [f"Auto-update is {status}.", "Use /auto-update on or /auto-update off."])
                 else:
-                    card("Project workspace", [str(workspace)])
+                    card("Automatic updates", ["Use /auto-update on or /auto-update off."], border_color=NOTICE_BORDER, text_color=NOTICE_TEXT)
+            elif command == "/restart":
+                card(None, ["Restarting Sophon..."])
+                restart_sophon()
             elif command == "/version":
                 card(None, [f"sophon {VERSION}"])
             elif command == "/clear":
@@ -631,6 +697,8 @@ def main() -> int:
     if args in (["--help"], ["-h"]):
         print_help()
         return 0
+    if args != ["update"] and auto_update_enabled():
+        auto_update_on_start()
     if args == ["update"]:
         return update()
     if args == ["init"]:
@@ -646,7 +714,10 @@ def main() -> int:
     if args and args[0] == "agent":
         from sophon.agent import main as agent_main
 
-        return agent_main(args[1:])
+        result = agent_main(args[1:])
+        if RESTART_REQUESTED:
+            restart_sophon(RESTART_ARGS)
+        return result
     if not args or args == ["run"]:
         return run_session()
     print(f"Unknown command: {' '.join(args)}", file=sys.stderr)

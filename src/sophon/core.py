@@ -6,6 +6,7 @@ import base64
 import codecs
 import json
 import os
+import re
 import select
 import shutil
 import subprocess
@@ -35,6 +36,15 @@ RESTART_ARGS: list[str] | None = None
 
 def paint(text: str, color: str) -> str:
     return f"{color}{text}{RESET}" if sys.stdout.isatty() else text
+
+
+def display_home_paths(value: str | Path) -> str:
+    text = str(value)
+    home = Path.home().as_posix().rstrip("/")
+    if not home:
+        return text
+    pattern = rf"(?<![A-Za-z0-9_.-]){re.escape(home)}(?=$|[/\\\s:])"
+    return re.sub(pattern, "~", text)
 
 
 def character_width(char: str) -> int:
@@ -164,6 +174,8 @@ def card(
     title_color: str | None = None,
     highlight_terms: tuple[str, ...] = (),
 ) -> None:
+    title = display_home_paths(title) if title is not None else None
+    lines = [display_home_paths(line) for line in lines]
     terminal_width = shutil.get_terminal_size((80, 24)).columns
     inner = min(width or 68, max(20, terminal_width - 8))
     centered_lines = centered_lines or set()
@@ -350,6 +362,27 @@ def latest_version(timeout: float = 10) -> str | None:
 
 def settings_path() -> Path:
     return config_path().parent.parent / "settings.json"
+
+
+def auto_compression_settings(data: dict[str, object] | None = None) -> tuple[bool, int]:
+    if data is None:
+        try:
+            data = read_config()
+        except (OSError, ValueError):
+            data = None
+    if data is None:
+        try:
+            candidate = json.loads(config_path().read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            candidate = None
+        data = candidate if isinstance(candidate, dict) else {}
+    enabled = data.get("auto_compression")
+    if not isinstance(enabled, bool):
+        enabled = True
+    threshold = data.get("auto_compression_threshold")
+    if not isinstance(threshold, int) or isinstance(threshold, bool) or not 50 <= threshold <= 95:
+        threshold = 80
+    return enabled, threshold
 
 
 def auto_update_enabled() -> bool:
@@ -607,9 +640,13 @@ def show_config() -> int:
         f"Auto-update: {'on' if data.get('auto_update') is True else 'off'}",
     ]
     reasoning = data.get("reasoning") if isinstance(data.get("reasoning"), dict) else {}
-    support = "supported" if reasoning.get("is_support") is True else "not supported"
-    state = "on" if reasoning.get("enabled") is True else "off"
-    lines.append(f"Reasoning: {support}, {state}, effort {reasoning.get('effort', 'medium')}")
+    if reasoning.get("is_support") is not True:
+        lines.append("Reasoning: not supported")
+    else:
+        state = "on" if reasoning.get("enabled") is True else "off"
+        lines.append(f"Reasoning: {state}")
+        if state == "on":
+            lines.append(f"Reasoning effort: {reasoning.get('effort', 'medium')}")
     instructions = str(data.get("agent_instructions_path", ""))
     if instructions:
         lines.append(f"Agent instructions: {instructions}")
@@ -651,6 +688,11 @@ def doctor() -> int:
         record("PASS", f"Python {sys.version_info.major}.{sys.version_info.minor}")
     else:
         record("FAIL", "Python 3.10 or newer is required")
+    interpreter = Path(sys.executable)
+    if interpreter.is_file() and os.access(interpreter, os.X_OK):
+        record("PASS", "Python executable")
+    else:
+        record("FAIL", "Python executable is missing or not executable")
     record("PASS", f"Sophon CLI · {VERSION}")
 
     try:
@@ -663,16 +705,17 @@ def doctor() -> int:
     elif data is not None:
         record("PASS", f"Provider · {PROVIDERS[data['provider']]['label']}")
         record("PASS", f"Model · {data['model']}")
-        path = config_path()
+    config_file = config_path()
+    if config_file.exists():
         try:
-            mode = path.stat().st_mode
+            mode = config_file.stat().st_mode
         except OSError:
-            record("FAIL", "Credential file could not be inspected")
+            record("WARN", "Configuration file permissions could not be inspected")
         else:
             if os.name != "nt" and mode & 0o077:
-                record("WARN", "Credential file permissions are broader than 600")
+                record("WARN", "Configuration file permissions are broader than 600")
             else:
-                record("PASS", "Credential file permissions")
+                record("PASS", "Configuration file permissions")
 
     def check_writable(label: str, path: Path) -> None:
         candidate = path
@@ -684,8 +727,13 @@ def doctor() -> int:
             record("FAIL", f"{label} storage is not writable · {path}")
 
     check_writable("Configuration", config_path().parent)
+    workspace_root = Path.home() / ".sophon" / "workspace"
+    project_dir = workspace_root / "my-project"
+    session_file = Path.home() / ".sophon" / "sessions" / "sessions.json"
+    from sophon.config import agent_instructions_path
+
     try:
-        from sophon.agent import SESSION_FILE, _load_sessions
+        from sophon.agent import PROJECT_DIR as project_dir, SESSION_FILE as session_file, WORKSPACE_ROOT as workspace_root, _load_sessions
 
         sessions = _load_sessions()
     except (OSError, RuntimeError) as error:
@@ -694,10 +742,20 @@ def doctor() -> int:
     else:
         detail = f"Session history · {len(sessions)} saved" if sessions else "Session history · none yet"
         record("PASS", detail)
-    check_writable("Session", SESSION_FILE.parent)
-    if SESSION_FILE.exists() and os.name != "nt":
+    check_writable("Session", session_file.parent)
+    check_writable("Workspace", workspace_root)
+    instructions_path = Path((data or {}).get("agent_instructions_path") or agent_instructions_path())
+    if instructions_path.is_file() and os.access(instructions_path, os.R_OK):
+        record("PASS", "Agent instructions file")
+    else:
+        record("WARN", "Agent instructions file is missing · start sophon agent or run setup")
+    if project_dir.is_dir():
+        record("PASS", "Project workspace exists")
+    else:
+        record("WARN", "Project workspace has not been initialized")
+    if session_file.exists() and os.name != "nt":
         try:
-            mode = SESSION_FILE.stat().st_mode
+            mode = session_file.stat().st_mode
         except OSError:
             record("WARN", "Session file permissions could not be inspected")
         else:
@@ -715,7 +773,13 @@ def doctor() -> int:
         border_color, text_color = UPDATE_BORDER, UPDATE_TEXT
     else:
         border_color, text_color = GREEN, GREEN
-    card("Sophon Doctor", checks, border_color=border_color, text_color=text_color)
+    card(
+        "Sophon Doctor",
+        checks,
+        border_color=border_color,
+        text_color=text_color,
+        top_right=f"{counts['PASS']} of {sum(counts.values())}",
+    )
     return int(bool(counts["WARN"] or counts["FAIL"]))
 
 
@@ -723,17 +787,18 @@ def print_help() -> None:
     card(
         "sophon --help",
         [
-            "Usage: sophon [run|update|init|setup|config|doctor|agent|--version|--help]",
+            "Usage: sophon [COMMAND] [OPTIONS]",
             "",
             "Commands:",
-            "run — Start the Sophon terminal interface",
-            "update — Safely fetch the latest version",
-            "init — Create a starter configuration",
-            "setup — Configure an AI provider",
-            "config — Show saved provider settings",
-            "doctor — Check Sophon system and configuration health",
-            "agent — Start an AI chat session (agent -p MESSAGE for one-shot)",
-            "--version — Show the current version",
+            "run — Start terminal UI",
+            "update — Install latest version",
+            "init — Create starter config",
+            "setup — Configure a provider",
+            "config — Show provider settings",
+            "doctor — Check system health",
+            "agent — Chat (-m MESSAGE, -t TASK)",
+            "agent -p SYSTEM_PROMPT -m MESSAGE — Custom system prompt",
+            "--version — Show installed version",
             "--help — Show this help",
         ],
     )

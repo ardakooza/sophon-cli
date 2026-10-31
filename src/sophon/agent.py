@@ -28,7 +28,21 @@ from sophon.config import (
     read_config,
     write_config,
 )
-from sophon.core import BORDER, MUTED, NOTICE_BORDER, NOTICE_TEXT, WHITE, card, centered, display_width, paint, wrap_text
+from sophon.core import (
+    BORDER,
+    MUTED,
+    NOTICE_BORDER,
+    NOTICE_TEXT,
+    VERSION,
+    WHITE,
+    auto_compression_settings,
+    card,
+    centered,
+    display_home_paths,
+    display_width,
+    paint,
+    wrap_text,
+)
 
 SESSION_FILE = Path.home() / ".sophon" / "sessions" / "sessions.json"
 LEGACY_SESSION_FILE = Path.home() / ".xernel" / "sessions" / "sessions.json"
@@ -220,7 +234,10 @@ def _ensure_agent_instructions(config: dict[str, object]) -> Path:
     return path
 
 
-def _system_message(config: dict[str, object] | None = None) -> str:
+def _system_message(
+    config: dict[str, object] | None = None,
+    custom_system_prompt: str | None = None,
+) -> str:
     instructions_path = _instructions_file(config)
     try:
         instructions = instructions_path.read_text(encoding="utf-8").strip()
@@ -231,8 +248,11 @@ def _system_message(config: dict[str, object] | None = None) -> str:
         workspace_guidance = guide.read_text(encoding="utf-8").strip()
     except OSError:
         workspace_guidance = "Create one top-level folder per project and keep project files inside it."
+    system_prompt = SYSTEM_PROMPT
+    if custom_system_prompt and custom_system_prompt.strip():
+        system_prompt += "\n\nUser-provided system prompt:\n" + custom_system_prompt.strip()
     return (
-        f"{SYSTEM_PROMPT}\n\n"
+        f"{system_prompt}\n\n"
         f"Agent instructions (AGENT.md):\n{instructions}\n\n"
         f"Active project directory: {PROJECT_DIR}\n"
         f"Workspace guidance (WORKSPACE.md):\n{workspace_guidance}"
@@ -622,9 +642,10 @@ def _complete_turn(
     history: list[dict[str, str]],
     on_chunk: Callable[[str], None] | None = None,
     on_reasoning: Callable[[str], None] | None = None,
+    custom_system_prompt: str | None = None,
 ) -> str:
     messages: list[dict[str, object]] = [
-        {"role": "system", "content": _system_message(config)},
+        {"role": "system", "content": _system_message(config, custom_system_prompt)},
         *(
             {"role": message["role"], "content": message["content"]}
             for message in history
@@ -674,9 +695,16 @@ def _ask(
     prompt: str,
     on_chunk: Callable[[str], None] | None = None,
     on_reasoning: Callable[[str], None] | None = None,
+    custom_system_prompt: str | None = None,
 ) -> str:
     messages = [*history, {"role": "user", "content": prompt}]
-    answer = _complete_turn(config, messages, on_chunk=on_chunk, on_reasoning=on_reasoning)
+    answer = _complete_turn(
+        config,
+        messages,
+        on_chunk=on_chunk,
+        on_reasoning=on_reasoning,
+        custom_system_prompt=custom_system_prompt,
+    )
     history.extend([{"role": "user", "content": prompt}, {"role": "assistant", "content": answer}])
     return answer
 
@@ -704,9 +732,9 @@ def _fork_session(source: dict[str, object]) -> dict[str, object]:
 
 def _workspace_location(command: str) -> tuple[str, str, bool]:
     if command == "cwd":
-        return "Current directory", str(Path.cwd().resolve()), False
+        return "Current directory", display_home_paths(Path.cwd().resolve()), False
     workspace = PROJECT_DIR.resolve()
-    return "Project workspace", str(workspace), False
+    return "Project workspace", display_home_paths(workspace), False
 
 
 def _load_sessions() -> list[dict[str, object]]:
@@ -784,6 +812,72 @@ def _save_session(sessions: list[dict[str, object]], session: dict[str, object])
     _write_sessions(sessions)
 
 
+def _delete_session(sessions: list[dict[str, object]], session_id: str) -> bool:
+    updated = [item for item in sessions if item.get("id") != session_id]
+    if len(updated) == len(sessions):
+        return False
+    _write_sessions(updated)
+    sessions[:] = updated
+    return True
+
+
+def _compact_history(
+    config: dict[str, object],
+    messages: list[dict[str, object]],
+    context_window: int,
+) -> tuple[list[dict[str, object]], str]:
+    if len(messages) < 2:
+        raise RuntimeError("There is not enough conversation to compact yet.")
+    if len(messages) < 4:
+        recent_start = 0
+    else:
+        recent_start = max(2, len(messages) - 6)
+        max_recent_start = len(messages) - 2
+        while recent_start < max_recent_start and messages[recent_start].get("role") != "user":
+            recent_start += 1
+        if recent_start >= len(messages):
+            recent_start = max_recent_start
+    earlier = messages[:recent_start]
+    recent = messages[recent_start:]
+    transcript = "\n\n".join(
+        f"{str(message.get('role', 'assistant')).upper()}: {message.get('content', '')}"
+        for message in earlier
+        if message.get("role") in {"user", "assistant", "error"}
+    )
+    if not transcript.strip():
+        raise RuntimeError("There is no earlier conversation to compact.")
+    max_chars = max(2000, context_window * 2)
+    if len(transcript) > max_chars:
+        transcript = "[Some oldest turns omitted to fit the summary request.]\n\n" + transcript[-max_chars:]
+    summary_config = config.copy()
+    reasoning = _reasoning_settings(summary_config)
+    reasoning["enabled"] = False
+    summary_config["reasoning"] = reasoning
+    summary = _request(
+        summary_config,
+        [
+            {
+                "role": "system",
+                "content": (
+                    "Summarize this earlier Sophon Agent conversation for continuation. Preserve the user's goal, "
+                    "important decisions, constraints, file names, completed work, unresolved issues, and next steps. "
+                    "Be concise and factual; do not invent details or answer the original request."
+                ),
+            },
+            {"role": "user", "content": transcript},
+        ],
+        tools_enabled=False,
+    ).strip()
+    if not summary:
+        raise RuntimeError("The provider returned an empty context summary.")
+    summary_message: dict[str, object] = {
+        "role": "assistant",
+        "content": "Earlier conversation summary:\n" + summary,
+        "summary": True,
+    }
+    return [summary_message, *(dict(message) for message in recent)], summary
+
+
 def _paint_highlight_terms(text: str, terms: tuple[str, ...], base_color: str, highlight_color: str) -> str:
     if not terms:
         return paint(text, base_color)
@@ -815,6 +909,10 @@ def _card_rows(
     text_color: str = WHITE,
     highlight_terms: tuple[str, ...] = (),
 ) -> list[str]:
+    title = display_home_paths(title) if title is not None else None
+    lines = [display_home_paths(line) for line in lines]
+    top_left = display_home_paths(top_left) if top_left is not None else None
+    top_right = display_home_paths(top_right) if top_right is not None else None
     inner = min(width, max(3, columns - 8)) if width is not None else min(68, max(20, columns - 8))
     top = "  ╭" + "─" * (inner + 2) + "╮"
     bottom = "  ╰" + "─" * (inner + 2) + "╯"
@@ -894,6 +992,7 @@ def _truncate_display(text: str, width: int) -> str:
 
 
 def _agent_rows(message: str, columns: int) -> list[str]:
+    message = display_home_paths(message)
     width = max(20, columns - 4)
     rows: list[str] = []
     first = True
@@ -912,17 +1011,28 @@ def _agent_rows(message: str, columns: int) -> list[str]:
     return rows
 
 
-def _message_rows(messages: list[dict[str, str]], columns: int) -> list[str]:
+def _message_rows(messages: list[dict[str, object]], columns: int) -> list[str]:
     rows: list[str] = []
     for message in messages:
-        role, content = message["role"], message["content"]
+        role, content = str(message["role"]), str(message["content"])
         if role == "user":
             rows.extend(_user_rows(content, columns))
         elif role == "assistant":
-            reasoning_text = message.get("reasoning")
-            if isinstance(reasoning_text, str) and reasoning_text.strip():
-                rows.extend(_reasoning_rows(reasoning_text, columns))
-            rows.extend(_agent_rows(content, columns))
+            if message.get("summary") is True:
+                rows.extend(
+                    _card_rows(
+                        "Context Summary",
+                        [content],
+                        columns=columns,
+                        border_color=MUTED,
+                        text_color=MUTED,
+                    )
+                )
+            else:
+                reasoning_text = message.get("reasoning")
+                if isinstance(reasoning_text, str) and reasoning_text.strip():
+                    rows.extend(_reasoning_rows(reasoning_text, columns))
+                rows.extend(_agent_rows(content, columns))
         else:
             rows.extend(
                 _card_rows(
@@ -1310,16 +1420,33 @@ def _discover_context_window(config: dict[str, object], state: dict[str, object]
     try:
         models = _list_models(config, model_id, timeout=6)
     except (OSError, RuntimeError, ValueError):
+        if state.get("model") == model_id:
+            state["discovery_attempted"] = True
         return
     match = next((model for model in models if model.get("id") == model_id), None)
     window = _context_window(match) if isinstance(match, dict) else None
-    if window and state.get("model") == model_id:
-        state["window"] = window
+    if state.get("model") == model_id:
+        if window:
+            state["window"] = window
+        state["discovery_attempted"] = True
 
 
-def _estimated_context_tokens(messages: list[dict[str, str]]) -> int:
-    content = [message.get("content", "") for message in messages if message.get("role") in {"user", "assistant"}]
-    return sum(max(1, math.ceil(len(text) / 3)) + 4 for text in content) + math.ceil(len(SYSTEM_PROMPT) / 3)
+def _estimated_context_tokens(messages: list[dict[str, object]]) -> int:
+    content = [
+        str(message.get("content", ""))
+        for message in messages
+        if message.get("role") in {"user", "assistant"}
+    ]
+    tool_schema = json.dumps([*BUILTIN_TOOLS, *WORKSPACE_TOOLS], ensure_ascii=False)
+    return (
+        sum(max(1, math.ceil(len(text) / 3)) + 4 for text in content)
+        + math.ceil(len(_system_message()) / 3)
+        + math.ceil(len(tool_schema) / 3)
+    )
+
+
+def _context_percentage(messages: list[dict[str, object]], context_window: int) -> int:
+    return min(100, round(_estimated_context_tokens(messages) * 100 / context_window))
 
 
 def _tail_truncate(text: str, width: int) -> str:
@@ -1332,7 +1459,7 @@ def _tail_truncate(text: str, width: int) -> str:
 
 def _footer_rows(
     model: str,
-    messages: list[dict[str, str]],
+    messages: list[dict[str, object]],
     context_window: int | None,
     columns: int,
 ) -> list[str]:
@@ -1351,7 +1478,7 @@ def _footer_rows(
     try:
         directory = "~/" + PROJECT_DIR.relative_to(Path.home()).as_posix()
     except ValueError:
-        directory = str(PROJECT_DIR)
+        directory = display_home_paths(PROJECT_DIR)
     first = f"{model_text}{separators}{dir_prefix}{_tail_truncate(directory, dir_width)}{separators}{context_label}"
     second = f"Project workspace · {directory}"
     # Keep the current path readable while preserving the compact footer at normal widths.
@@ -1386,6 +1513,7 @@ def _answering_rows(frame: int, label: str = "Answering") -> list[str]:
 
 
 def _reasoning_rows(text: str, columns: int, *, frame: int | None = None) -> list[str]:
+    text = display_home_paths(text)
     rows = _answering_rows(frame, "Reasoning") if frame is not None else [paint("  • Reasoning", MUTED)]
     width = max(20, columns - 8)
     for paragraph in text.splitlines() or [text]:
@@ -1543,6 +1671,7 @@ def _interactive(config: dict[str, object]) -> int:
     context_state: dict[str, object] = {
         "model": str(config["model"]),
         "window": context_window if isinstance(context_window, int) and context_window > 0 else None,
+        "discovery_attempted": isinstance(context_window, int) and context_window > 0,
     }
     if context_state["window"] is None:
         threading.Thread(
@@ -1623,6 +1752,34 @@ def _interactive(config: dict[str, object]) -> int:
         write_config(updated_config)
         config.update(updated_config)
 
+    def known_context_window(*, discover: bool = False) -> int | None:
+        window = context_state.get("window")
+        if not isinstance(window, int) and discover and context_state.get("discovery_attempted") is not True:
+            _discover_context_window(config.copy(), context_state)
+            window = context_state.get("window")
+        return window if isinstance(window, int) and window > 0 else None
+
+    def maybe_auto_compress() -> None:
+        enabled, threshold = auto_compression_settings(config)
+        messages = session["messages"]
+        if len(messages) < 2 or not enabled:
+            return
+        window = known_context_window(discover=True)
+        if window is None or _context_percentage(messages, window) < threshold:
+            return
+        before = _context_percentage(messages, window)
+        notice("Auto-compression", "Summarizing earlier conversation…")
+        draw("", 0)
+        try:
+            compressed, _ = _compact_history(config, messages, window)
+        except (RuntimeError, OSError, ValueError) as error:
+            notice("Auto-compression failed", str(error), error=True)
+            return
+        messages[:] = compressed
+        if save_current():
+            after = _context_percentage(messages, window)
+            notice_plain(f"Context auto-compressed · ~{before}% to ~{after}%")
+
     while True:
         try:
             prompt = _input_bar(draw)
@@ -1646,7 +1803,39 @@ def _interactive(config: dict[str, object]) -> int:
             if command == "help":
                 notice_rows = _card_rows(
                     "Sophon Commands",
-                    ["/model [search]  Choose a provider model", "/new  Start a fresh saved session", "/rename [title]  Rename this session", "/resume  Load a saved session", "/fork  Fork a saved session", "/reasoning on|off  Toggle supported model reasoning", "/reasoning-effort low|medium|high  Set reasoning effort", "/cwd  Show the current directory", "/pwd  Show the project workspace path", "/clear  Start a new session", "/exit or Q  Close Sophon Agent"],
+                    [
+                        "/model [search]  Choose a model",
+                        "/new  Start a new session",
+                        "/rename [title]  Rename this session",
+                        "/resume  Load a saved session",
+                        "/fork  Fork a saved session",
+                        "/delete  Delete a saved session",
+                        "/compact  Summarize earlier context",
+                        "/auto-compression on|off  Toggle auto mode",
+                        "/auto-compression 50–95  Set compression threshold",
+                        "/changelog  Show latest changes",
+                        "/reasoning on|off  Toggle model reasoning",
+                        "/reasoning-effort low|medium|high  Set effort",
+                        "/cwd  Show current directory",
+                        "/pwd  Show project workspace",
+                        "/clear  Start a new session",
+                        "/exit or Q  Close Sophon Agent",
+                    ],
+                    columns=shutil.get_terminal_size((80, 24)).columns,
+                )
+            elif command == "changelog":
+                updated = VERSION.split(" – ", 1)[0]
+                notice_rows = _card_rows(
+                    "Sophon Changelog",
+                    [
+                        f"Version: {VERSION}",
+                        f"Last updated: {updated}",
+                        "",
+                        "Added: /delete, /compact and /changelog.",
+                        "Added: automatic context compression (default 80%; range 50–95%).",
+                        "Added: -m MESSAGE, -p SYSTEM_PROMPT -m MESSAGE, and -t TASK.",
+                        "Improved: Doctor checks, compact help, and ~/ path display.",
+                    ],
                     columns=shutil.get_terminal_size((80, 24)).columns,
                 )
             elif command == "cwd":
@@ -1690,6 +1879,85 @@ def _interactive(config: dict[str, object]) -> int:
                         notice_plain(f"Forked session {source['title']} into a new session.")
                 else:
                     notice("Fork cancelled", "The current session is still open.")
+            elif command == "delete":
+                if not save_current():
+                    continue
+                selected = _pick_item(
+                    session,
+                    draw,
+                    [_session_item(item) for item in sessions],
+                    title="Delete Session",
+                    current_id=str(session["id"]),
+                )
+                if selected is None:
+                    notice("Delete cancelled", "No session was removed.")
+                    continue
+                notice(
+                    "Confirm session deletion",
+                    f'Type DELETE to remove "{selected["title"]}" permanently.',
+                    error=True,
+                )
+                confirmation = _input_bar(draw, "Type DELETE to confirm")
+                if confirmation != "DELETE":
+                    notice("Delete cancelled", "No session was removed.")
+                    continue
+                selected_id = str(selected["id"])
+                try:
+                    deleted = _delete_session(sessions, selected_id)
+                except OSError as error:
+                    notice("Session not deleted", str(error), error=True)
+                    continue
+                if not deleted:
+                    notice("Session not found", "The selected session no longer exists.", error=True)
+                    continue
+                if str(session.get("id")) == selected_id:
+                    session = _new_session()
+                notice_plain(f'Deleted session "{selected["title"]}".')
+            elif command == "auto-compression":
+                enabled, threshold = auto_compression_settings(config)
+                value = argument.casefold()
+                updated_config = config.copy()
+                if value in {"on", "off"}:
+                    updated_config["auto_compression"] = value == "on"
+                    status = f"Auto-compression is {value} at {threshold}%."
+                elif value.isdecimal() and 50 <= int(value) <= 95:
+                    threshold = int(value)
+                    updated_config["auto_compression_threshold"] = threshold
+                    status = f"Auto-compression threshold set to {threshold}% (range: 50–95%)."
+                else:
+                    notice(
+                        "Auto-compression",
+                        f"Currently {'on' if enabled else 'off'} at {threshold}%. Use /auto-compression on|off or a threshold from 50 to 95.",
+                    )
+                    continue
+                try:
+                    write_config(updated_config)
+                except (OSError, ValueError) as error:
+                    notice("Preference not saved", str(error), error=True)
+                else:
+                    config.update(updated_config)
+                    notice("Auto-compression", status)
+            elif command == "compact":
+                window = known_context_window(discover=True)
+                if window is None:
+                    notice("Context window unavailable", "The selected model did not report its context size.", error=True)
+                    continue
+                _, threshold = auto_compression_settings(config)
+                before = _context_percentage(session["messages"], window)
+                if before < threshold:
+                    notice("Context is below the limit", f"Current usage is ~{before}%; /compact is available at {threshold}% or above.")
+                    continue
+                notice("Context compression", "Summarizing earlier conversation…")
+                draw("", 0)
+                try:
+                    compacted, _ = _compact_history(config, session["messages"], window)
+                except (RuntimeError, OSError, ValueError) as error:
+                    notice("Context not compacted", str(error), error=True)
+                    continue
+                session["messages"][:] = compacted
+                if save_current():
+                    after = _context_percentage(session["messages"], window)
+                    notice_plain(f"Context compacted · ~{before}% to ~{after}%")
             elif command == "reasoning":
                 argument = argument.casefold()
                 preferences = _reasoning_settings(config)
@@ -1782,6 +2050,7 @@ def _interactive(config: dict[str, object]) -> int:
                         config.update(updated_config)
                         context_state["model"] = str(updated_config["model"])
                         context_state["window"] = selected_window if isinstance(selected_window, int) else None
+                        context_state["discovery_attempted"] = isinstance(selected_window, int)
                         if context_state["window"] is None:
                             threading.Thread(
                                 target=_discover_context_window,
@@ -1803,6 +2072,7 @@ def _interactive(config: dict[str, object]) -> int:
         if not save_current():
             messages.pop()
             continue
+        maybe_auto_compress()
         answering["active"] = True
         answering["frame"] = 0
         answering["text"] = ""
@@ -1881,21 +2151,55 @@ def _interactive(config: dict[str, object]) -> int:
 
         if core.RESTART_REQUESTED:
             return 0
+        maybe_auto_compress()
+
+
+def _parse_agent_args(args: list[str]) -> tuple[str | None, str | None, str | None]:
+    if not args:
+        return None, None, None
+    values: dict[str, str] = {}
+    aliases = {
+        "-p": "system",
+        "--system-prompt": "system",
+        "-m": "message",
+        "--message": "message",
+        "--prompt": "legacy_prompt",
+        "-t": "task",
+        "--task": "task",
+    }
+    index = 0
+    while index < len(args):
+        name = aliases.get(args[index])
+        if name is None or index + 1 >= len(args) or name in values:
+            return None, None, 'Usage: sophon agent [-p SYSTEM_PROMPT -m MESSAGE] | [-m MESSAGE] | [-t TASK]'
+        values[name] = args[index + 1]
+        index += 2
+    if "task" in values and ("system" in values or "message" in values or "legacy_prompt" in values):
+        return None, None, 'Usage: sophon agent [-p SYSTEM_PROMPT -m MESSAGE] | [-m MESSAGE] | [-t TASK]'
+    if "legacy_prompt" in values:
+        if "system" in values or "message" in values or "task" in values:
+            return None, None, 'Usage: sophon agent [-p SYSTEM_PROMPT -m MESSAGE] | [-m MESSAGE] | [-t TASK]'
+        return values["legacy_prompt"], None, None
+    if "task" in values:
+        return values["task"], None, None
+    if "message" in values:
+        return values["message"], values.get("system"), None
+    if "system" in values:
+        # Preserve the pre-existing `sophon agent -p MESSAGE` one-shot form.
+        return values["system"], None, None
+    return None, None, 'Usage: sophon agent [-p SYSTEM_PROMPT -m MESSAGE] | [-m MESSAGE] | [-t TASK]'
 
 
 def main(args: list[str]) -> int:
-    one_shot: str | None = None
-    if args:
-        if len(args) == 2 and args[0] in {"-p", "--prompt"}:
-            one_shot = args[1]
-        else:
-            card(
-                "Agent request failed",
-                ['Usage: sophon agent [-p "message"]'],
-                border_color=NOTICE_BORDER,
-                text_color=NOTICE_TEXT,
-            )
-            return 2
+    one_shot, system_prompt, parse_error = _parse_agent_args(args)
+    if parse_error:
+        card(
+            "Agent request failed",
+            [parse_error],
+            border_color=NOTICE_BORDER,
+            text_color=NOTICE_TEXT,
+        )
+        return 2
     config = _load_config()
     if config is None:
         card(
@@ -1924,7 +2228,7 @@ def main(args: list[str]) -> int:
         )
         return 2
     try:
-        _run_one_shot_stream(config, one_shot)
+        _run_one_shot_stream(config, one_shot, system_prompt)
     except RuntimeError as error:
         card(
             "Agent request failed",
@@ -1936,12 +2240,22 @@ def main(args: list[str]) -> int:
     return 0
 
 
-def _run_one_shot_stream(config: dict[str, object], prompt: str) -> None:
+def _run_one_shot_stream(
+    config: dict[str, object],
+    prompt: str,
+    custom_system_prompt: str | None = None,
+) -> None:
     events: queue.Queue[tuple[str, object]] = queue.Queue()
 
     def request_answer() -> None:
         try:
-            answer = _ask(config.copy(), [], prompt, on_chunk=lambda chunk: events.put(("chunk", chunk)))
+            answer = _ask(
+                config.copy(),
+                [],
+                prompt,
+                on_chunk=lambda chunk: events.put(("chunk", chunk)),
+                custom_system_prompt=custom_system_prompt,
+            )
         except Exception as error:
             events.put(("error", error))
         else:
@@ -1955,6 +2269,8 @@ def _run_one_shot_stream(config: dict[str, object], prompt: str) -> None:
     columns = shutil.get_terminal_size((80, 24)).columns
     line_width = max(20, columns - 4)
     line_column = 0
+    home_prefix = Path.home().as_posix()
+    pending_display = ""
 
     def write_wrapped(chunk: str) -> None:
         nonlocal line_column
@@ -1971,6 +2287,21 @@ def _run_one_shot_stream(config: dict[str, object], prompt: str) -> None:
                 line_column = 4
             sys.stdout.write(character)
             line_column += character_width
+
+    def write_display_chunk(chunk: str, *, final: bool = False) -> None:
+        nonlocal pending_display
+        combined = pending_display + chunk
+        pending_display = ""
+        if not final and home_prefix:
+            keep = 0
+            for length in range(min(len(combined), len(home_prefix)), 0, -1):
+                if home_prefix.startswith(combined[-length:]):
+                    keep = length
+                    break
+            if keep:
+                pending_display = combined[-keep:]
+                combined = combined[:-keep]
+        write_wrapped(display_home_paths(combined))
 
     while not finished:
         try:
@@ -1994,7 +2325,7 @@ def _run_one_shot_stream(config: dict[str, object], prompt: str) -> None:
                     sys.stdout.write(paint("  • ", MUTED))
                     started = True
                     line_column = 4
-                write_wrapped(str(value))
+                write_display_chunk(str(value))
                 sys.stdout.flush()
             elif kind == "error":
                 if tty and not started:
@@ -2005,6 +2336,7 @@ def _run_one_shot_stream(config: dict[str, object], prompt: str) -> None:
                 raise RuntimeError(str(error)) from None
             elif kind == "done":
                 if started:
+                    write_display_chunk("", final=True)
                     sys.stdout.write("\n")
                     sys.stdout.flush()
                 elif not str(value).strip():

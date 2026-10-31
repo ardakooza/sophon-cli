@@ -15,7 +15,14 @@ from sophon.config import (
     read_config,
     write_config,
 )
-from sophon.core import MUTED, WHITE, auto_update_enabled, card, clear_terminal
+from sophon.core import (
+    MUTED,
+    WHITE,
+    auto_compression_settings,
+    auto_update_enabled,
+    card,
+    clear_terminal,
+)
 
 
 def _read_key() -> str:
@@ -202,14 +209,24 @@ def run_setup_wizard() -> int:
     old_key = (existing or {}).get("api_key", "") if same_provider else ""
     key_hint = "leave blank to keep saved key" if old_key else "required"
     credential_label = "API key" if provider == "openrouter" else "API token (Workers AI Read + Edit)"
-    card("Setup of Credentials", [f"Enter {credential_label}."], top_right="3 of 4")
-    api_key = getpass.getpass(f"{credential_label} (hidden; {key_hint}): ").strip()
+    card(
+        "Setup of Credentials",
+        [
+            f"Provider: {spec['label']}",
+            f"Model: {model}",
+            "",
+            f"{credential_label}: [hidden input]",
+        ],
+        top_right="3 of 4",
+    )
+    api_key = getpass.getpass(f"Credential input (hidden; {key_hint}): ").strip()
     if not api_key:
         api_key = old_key
     if not api_key:
         card("Sophon", ["An API key/token is required.", "No configuration was saved."])
         return 1
 
+    auto_compression, auto_compression_threshold = auto_compression_settings(existing)
     data = {
         "schema_version": 1,
         "provider": provider,
@@ -217,6 +234,8 @@ def run_setup_wizard() -> int:
         "api_key": api_key,
         "agent_instructions_path": str(agent_instructions_path()),
         "auto_update": auto_update_enabled(),
+        "auto_compression": auto_compression,
+        "auto_compression_threshold": auto_compression_threshold,
     }
     if provider == "openrouter":
         data["endpoint"] = spec["endpoint"]

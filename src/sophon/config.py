@@ -99,7 +99,10 @@ def read_config() -> dict[str, Any] | None:
     if not isinstance(data, dict):
         raise ValueError("Unsupported or malformed provider configuration")
     if data.get("provider") is None:
-        allowed_preferences = {"schema_version", "auto_update", "agent_instructions_path", "reasoning"}
+        allowed_preferences = {
+            "schema_version", "auto_update", "agent_instructions_path", "reasoning",
+            "auto_compression", "auto_compression_threshold",
+        }
         if set(data) <= allowed_preferences:
             return None
         raise ValueError("Unsupported or malformed provider configuration")
@@ -141,6 +144,18 @@ def read_config() -> dict[str, Any] | None:
     if reasoning != normalized_reasoning:
         data["reasoning"] = normalized_reasoning
         changed = True
+    auto_compression = data.get("auto_compression")
+    if not isinstance(auto_compression, bool):
+        auto_compression = True
+    threshold = data.get("auto_compression_threshold")
+    if not isinstance(threshold, int) or isinstance(threshold, bool) or not 50 <= threshold <= 95:
+        threshold = 80
+    if data.get("auto_compression") is not auto_compression:
+        data["auto_compression"] = auto_compression
+        changed = True
+    if data.get("auto_compression_threshold") != threshold:
+        data["auto_compression_threshold"] = threshold
+        changed = True
     if source != path or changed:
         write_config(data)
     if migrated_auto_update:
@@ -156,11 +171,21 @@ def read_config() -> dict[str, Any] | None:
 def write_config(data: dict[str, Any]) -> Path:
     provider = data.get("provider")
     if provider is None:
-        allowed_preferences = {"schema_version", "auto_update", "agent_instructions_path", "reasoning"}
+        allowed_preferences = {
+            "schema_version", "auto_update", "agent_instructions_path", "reasoning",
+            "auto_compression", "auto_compression_threshold",
+        }
         if set(data) - allowed_preferences:
             raise ValueError("Preferences-only config contains unsupported fields")
         if "auto_update" in data and not isinstance(data["auto_update"], bool):
             raise ValueError("Auto-update preference must be a boolean")
+        if "auto_compression" in data and not isinstance(data["auto_compression"], bool):
+            raise ValueError("Auto-compression preference must be a boolean")
+        threshold = data.get("auto_compression_threshold")
+        if threshold is not None and (
+            not isinstance(threshold, int) or isinstance(threshold, bool) or not 50 <= threshold <= 95
+        ):
+            raise ValueError("Auto-compression threshold must be between 50 and 95")
     else:
         if provider not in PROVIDERS:
             raise ValueError("Unsupported provider")

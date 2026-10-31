@@ -31,7 +31,7 @@ Run `xernel setup` to choose OpenRouter or Cloudflare Workers AI and save the co
 - `xernel setup` — configure a provider
 - `xernel config` — show saved provider settings
 - `xernel init` — create a starter project configuration
-- `xernel update` — safely update a source checkout
+- `xernel update` — safely update a source checkout or refresh an installed package
 - `xernel --help` — show command help
 
 ## Development

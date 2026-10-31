@@ -207,8 +207,28 @@ def update() -> int:
     repo = Path(__file__).resolve().parents[2]
     lines = ["Checking status", "Waiting for updates", "Fast-forward only"]
     if not (repo / ".git").exists():
-        update_card(["No Git repository", "Cannot update", ""], final=True)
-        return 1
+        lines[:] = ["Installed package", "Checking for updates", "Using pip safely"]
+        update_card(lines, initial=True)
+        _, _, status_code = run_git_animated(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--disable-pip-version-check",
+                "--upgrade",
+                "--force-reinstall",
+                "https://github.com/ardakooza/xernel/archive/refs/heads/main.tar.gz",
+            ],
+            lines,
+            1,
+            "Installing latest version",
+        )
+        if status_code != 0:
+            update_card(["Update failed", "Check network or pip", "Retry later"], final=True)
+            return status_code
+        update_card(["Update complete", "Restart Xernel", "Latest version ready"], final=True)
+        return 0
 
     update_card(lines, initial=True)
     stdout, _, status_code = run_git_animated(

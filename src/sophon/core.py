@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import base64
 import codecs
+import json
 import os
 import select
 import shutil
@@ -11,7 +13,7 @@ import sys
 import unicodedata
 from pathlib import Path
 from urllib.error import URLError
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 from sophon.config import PROVIDERS, config_display_path, endpoint_for, mask_secret, read_config
 from sophon import __version__ as VERSION
@@ -26,6 +28,7 @@ GREEN = "\033[38;5;114m"
 UPDATE_BORDER = "\033[38;5;179m"
 UPDATE_TEXT = "\033[38;5;221m"
 LATEST_VERSION_URL = "https://raw.githubusercontent.com/ardakooza/sophon-cli/main/src/sophon/VERSION"
+LATEST_VERSION_API_URL = "https://api.github.com/repos/ardakooza/sophon-cli/contents/src/sophon/VERSION"
 
 
 def paint(text: str, color: str) -> str:
@@ -300,12 +303,20 @@ def run_git_animated(args: list[str], lines: list[str], active_line: int, messag
 
 
 def latest_version(timeout: float = 10) -> str | None:
-    try:
-        with urlopen(LATEST_VERSION_URL, timeout=timeout) as response:
-            version = response.read().decode("utf-8").strip()
-    except (OSError, TimeoutError, URLError, UnicodeError):
-        return None
-    return version or None
+    request_headers = {"User-Agent": "Sophon-CLI", "Accept": "application/vnd.github+json"}
+    for url in (LATEST_VERSION_URL, LATEST_VERSION_API_URL):
+        try:
+            request = Request(url, headers=request_headers)
+            with urlopen(request, timeout=timeout) as response:
+                payload = response.read().decode("utf-8").strip()
+            if url == LATEST_VERSION_API_URL:
+                content = json.loads(payload).get("content", "")
+                payload = base64.b64decode(content).decode("utf-8").strip()
+            if payload:
+                return payload
+        except (OSError, TimeoutError, URLError, UnicodeError, ValueError, KeyError, TypeError):
+            continue
+    return None
 
 
 def update() -> int:

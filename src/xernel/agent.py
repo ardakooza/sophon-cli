@@ -11,7 +11,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from xernel.config import endpoint_for, read_config
-from xernel.core import BORDER, MUTED, WHITE, card, display_width, paint, wrap_text
+from xernel.core import BORDER, MUTED, NOTICE_BORDER, NOTICE_TEXT, WHITE, card, display_width, paint, wrap_text
 
 SYSTEM_PROMPT = (
     "You are Xernel Agent, a concise and practical development assistant. "
@@ -47,6 +47,8 @@ def _request(config: dict[str, object], messages: list[dict[str, str]]) -> str:
     except (OSError, TimeoutError, URLError, UnicodeError, json.JSONDecodeError) as error:
         raise RuntimeError(f"Could not reach the configured provider: {error}") from None
 
+    if not isinstance(result, dict):
+        raise RuntimeError("The provider returned an unexpected response.")
     if provider == "openrouter":
         try:
             content = result["choices"][0]["message"]["content"]
@@ -59,8 +61,15 @@ def _request(config: dict[str, object], messages: list[dict[str, str]]) -> str:
     else:
         if not result.get("success", True):
             errors = result.get("errors") or []
-            raise RuntimeError(str(errors[0].get("message", "Cloudflare request failed")) if errors else "Cloudflare request failed")
-        content = (result.get("result") or {}).get("response")
+            message = next(
+                (item.get("message") for item in errors if isinstance(item, dict) and item.get("message")),
+                "Cloudflare request failed",
+            )
+            raise RuntimeError(str(message))
+        cloudflare_result = result.get("result")
+        if not isinstance(cloudflare_result, dict):
+            raise RuntimeError("The provider returned an unexpected response.")
+        content = cloudflare_result.get("response")
     if not isinstance(content, str) or not content.strip():
         raise RuntimeError("The provider returned an empty response.")
     return content.strip()
@@ -70,7 +79,12 @@ def _load_config() -> dict[str, object] | None:
     try:
         return read_config()
     except (OSError, ValueError, json.JSONDecodeError) as error:
-        card(None, [f"Provider configuration is invalid: {error}"])
+        card(
+            "Configuration error",
+            [f"Provider configuration is invalid: {error}"],
+            border_color=NOTICE_BORDER,
+            text_color=NOTICE_TEXT,
+        )
         return {}
 
 
@@ -117,7 +131,7 @@ def _input_bar() -> str:
         nonlocal previous_height
         if not previous_height:
             return
-        sys.stdout.write(f"\033[{cursor_row + 1}A\r")
+        sys.stdout.write("\033[u\r")
         for index in range(previous_height):
             sys.stdout.write("\033[2K")
             if index < previous_height - 1:
@@ -155,6 +169,7 @@ def _input_bar() -> str:
 
     try:
         tty.setraw(fd)
+        sys.stdout.write("\033[s")
         redraw()
         while True:
             raw = os.read(fd, 1)
@@ -239,7 +254,12 @@ def _interactive(config: dict[str, object]) -> int:
         try:
             answer = _ask(config, history, prompt)
         except RuntimeError as error:
-            _render_agent_message(f"Request failed: {error}")
+            card(
+                "Agent request failed",
+                [str(error)],
+                border_color=NOTICE_BORDER,
+                text_color=NOTICE_TEXT,
+            )
             continue
         _render_agent_message(answer)
 
@@ -250,22 +270,42 @@ def main(args: list[str]) -> int:
         if len(args) == 2 and args[0] in {"-p", "--prompt"}:
             one_shot = args[1]
         else:
-            print('Usage: xernel agent [-p "message"]', file=sys.stderr)
+            card(
+                "Agent request failed",
+                ['Usage: xernel agent [-p "message"]'],
+                border_color=NOTICE_BORDER,
+                text_color=NOTICE_TEXT,
+            )
             return 2
     config = _load_config()
     if config is None:
-        card(None, ["No provider is configured.", "Run xernel setup first."])
+        card(
+            "Provider required",
+            ["No provider is configured.", "Run xernel setup first."],
+            border_color=NOTICE_BORDER,
+            text_color=NOTICE_TEXT,
+        )
         return 1
     if not config:
         return 1
     if one_shot is None:
         return _interactive(config)
     if not one_shot.strip():
-        print("Message cannot be empty.", file=sys.stderr)
+        card(
+            "Agent request failed",
+            ["Message cannot be empty."],
+            border_color=NOTICE_BORDER,
+            text_color=NOTICE_TEXT,
+        )
         return 2
     try:
-        print(_ask(config, [], one_shot))
+        _render_agent_message(_ask(config, [], one_shot))
     except RuntimeError as error:
-        card("Agent request failed", [str(error)])
+        card(
+            "Agent request failed",
+            [str(error)],
+            border_color=NOTICE_BORDER,
+            text_color=NOTICE_TEXT,
+        )
         return 1
     return 0

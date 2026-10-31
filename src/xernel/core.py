@@ -7,6 +7,8 @@ import subprocess
 import sys
 import unicodedata
 from pathlib import Path
+from urllib.error import URLError
+from urllib.request import urlopen
 
 from xernel.config import PROVIDERS, config_path, endpoint_for, mask_secret, read_config
 from xernel import __version__ as VERSION
@@ -18,6 +20,7 @@ NOTICE_TEXT = "\033[38;5;160m"
 MUTED = "\033[38;5;245m"
 WHITE = "\033[38;5;255m"
 GREEN = "\033[38;5;114m"
+LATEST_VERSION_URL = "https://raw.githubusercontent.com/ardakooza/xernel/main/src/xernel/VERSION"
 
 
 def paint(text: str, color: str) -> str:
@@ -126,17 +129,27 @@ def card(
     *,
     width: int | None = None,
     centered_lines: set[str] | None = None,
+    right_aligned_lines: dict[str, str] | None = None,
     border_color: str = BORDER,
     text_color: str = WHITE,
 ) -> None:
     terminal_width = shutil.get_terminal_size((80, 24)).columns
     inner = min(width or 68, max(20, terminal_width - 8))
     centered_lines = centered_lines or set()
+    right_aligned_lines = right_aligned_lines or {}
     print(paint("  ╭" + "─" * (inner + 2) + "╮", border_color))
     content_lines = ([title] if title is not None else []) + lines
     for line in content_lines:
         is_centered = line == title or line in centered_lines
-        chunks = wrap_text(line, inner)
+        if line in right_aligned_lines:
+            right = right_aligned_lines[line]
+            left = line
+            if display_width(left) + display_width(right) + 1 > inner:
+                left = line.rsplit(" / ", 1)[-1]
+            gap = max(1, inner - display_width(left) - display_width(right))
+            chunks = [left + " " * gap + right]
+        else:
+            chunks = wrap_text(line, inner)
         for chunk in chunks:
             text = centered(chunk, inner) if is_centered else chunk
             content = " " + text + " " * (inner - display_width(text) + 1)
@@ -203,12 +216,31 @@ def run_git_animated(args: list[str], lines: list[str], active_line: int, messag
                 update_card(lines)
 
 
+def latest_version() -> str | None:
+    try:
+        with urlopen(LATEST_VERSION_URL, timeout=10) as response:
+            version = response.read().decode("utf-8").strip()
+    except (OSError, TimeoutError, URLError, UnicodeError):
+        return None
+    return version or None
+
+
 def update() -> int:
     repo = Path(__file__).resolve().parents[2]
     lines = ["Checking status", "Waiting for updates", "Fast-forward only"]
     if not (repo / ".git").exists():
-        lines[:] = ["Installed package", "Checking for updates", "Using pip safely"]
+        lines[:] = ["Checking installed version", "Contacting GitHub", ""]
         update_card(lines, initial=True)
+        remote_version = latest_version()
+        if remote_version is None:
+            update_card(["Version check failed", "Could not reach GitHub", "Retry later"], final=True)
+            return 1
+        if remote_version == VERSION:
+            update_card(["Version already current", f"xernel {VERSION}", ""], final=True)
+            return 0
+
+        lines[:] = ["Update available", f"{VERSION} → {remote_version}", "Installing with pip"]
+        update_card(lines)
         _, _, status_code = run_git_animated(
             [
                 sys.executable,
@@ -227,7 +259,7 @@ def update() -> int:
         if status_code != 0:
             update_card(["Update failed", "Check network or pip", "Retry later"], final=True)
             return status_code
-        update_card(["Update complete", "Restart Xernel", "Latest version ready"], final=True)
+        update_card(["Update complete", f"xernel {remote_version}", "Restart Xernel"], final=True)
         return 0
 
     update_card(lines, initial=True)
@@ -250,9 +282,13 @@ def update() -> int:
         update_card(["Update failed", "Check network or Git", "Retry later"], final=True)
         return pull_code
     if stdout and "Already up to date" in stdout:
-        update_card(["Already up to date", "No update needed", ""], final=True)
+        update_card(["Version already current", f"xernel {VERSION}", ""], final=True)
     else:
-        update_card(["Update complete", "Restart Xernel", "New version ready"], final=True)
+        try:
+            updated_version = (repo / "src" / "xernel" / "VERSION").read_text(encoding="utf-8").strip()
+        except OSError:
+            updated_version = "latest"
+        update_card(["Update complete", f"xernel {updated_version}", "Restart Xernel"], final=True)
     return 0
 
 

@@ -11,6 +11,10 @@ from xernel.config import PROVIDERS, config_path, read_config, write_config
 from xernel.core import card, clear_terminal
 
 
+def _step_heading(section: str) -> str:
+    return f"SETUP / {section}"
+
+
 def _read_key() -> str:
     import termios
     import tty
@@ -61,11 +65,43 @@ def _choose_provider() -> str | None:
 
     while True:
         clear_terminal()
+        heading = _step_heading("PROVIDER")
         card(
             "Xernel",
             [
-                "SETUP  /  PROVIDER  ·  1 OF 4",
+                heading,
                 "Choose a service for model requests.",
+                "",
+                f"{'›' if selected == 0 else ' '} {labels[0]}",
+                f"{'›' if selected == 1 else ' '} {labels[1]}",
+                "",
+                "↑/↓ move   Enter/Space select   Q cancel",
+            ],
+            right_aligned_lines={heading: "1 OF 4"},
+        )
+        key = _read_key()
+        if key in {"UP", "LEFT"}:
+            selected = (selected - 1) % len(choices)
+        elif key in {"DOWN", "RIGHT"}:
+            selected = (selected + 1) % len(choices)
+        elif key in {"ENTER", "SPACE"}:
+            return choices[selected]
+        elif key == "CANCEL":
+            return None
+
+
+def _choose_existing_action(existing: dict[str, object]) -> str | None:
+    choices = ["keep", "reconfigure"]
+    labels = ["Keep current settings", "Reconfigure provider"]
+    provider = str(existing["provider"])
+    selected = 0
+    while True:
+        clear_terminal()
+        card(
+            "Xernel",
+            [
+                "CURRENT PROVIDER",
+                f"{PROVIDERS[provider]['label']} · {existing['model']}",
                 "",
                 f"{'›' if selected == 0 else ' '} {labels[0]}",
                 f"{'›' if selected == 1 else ' '} {labels[1]}",
@@ -93,15 +129,16 @@ def _choose_model(provider: str, default_model: str, saved_model: str = "") -> s
     selected = 0
     while True:
         clear_terminal()
+        heading = _step_heading("MODEL")
         rows = [
-            "SETUP  /  MODEL  ·  2 OF 4",
+            heading,
             f"Provider: {PROVIDERS[provider]['label']}",
             "Choose a preset or enter your own model ID.",
             "",
         ]
         rows.extend(f"{'›' if index == selected else ' '} {label}" for index, (_, label) in enumerate(options))
         rows.extend(["", "↑/↓ move   Enter/Space select   Q cancel"])
-        card("Xernel", rows)
+        card("Xernel", rows, right_aligned_lines={heading: "2 OF 4"})
         key = _read_key()
         if key in {"UP", "LEFT"}:
             selected = (selected - 1) % len(options)
@@ -123,6 +160,22 @@ def run_setup_wizard() -> int:
         card("Xernel", ["Existing configuration could not be read.", str(error)])
         return 1
 
+    if existing is not None:
+        action = _choose_existing_action(existing)
+        if action == "keep":
+            card(
+                "Xernel",
+                [
+                    "Current provider settings kept.",
+                    f"Provider: {PROVIDERS[existing['provider']]['label']}",
+                    f"Model: {existing['model']}",
+                ],
+            )
+            return 0
+        if action is None:
+            card("Xernel", ["Setup cancelled. No changes were made."])
+            return 1
+
     provider = _choose_provider()
     if provider is None:
         card("Xernel", ["Setup cancelled."])
@@ -136,7 +189,8 @@ def run_setup_wizard() -> int:
         card("Xernel", ["Setup cancelled."])
         return 1
     if model_choice == "__custom__":
-        print("\nSETUP  /  CUSTOM MODEL  ·  2 OF 4")
+        heading = _step_heading("CUSTOM MODEL")
+        card("Xernel", [heading, "Enter a model ID."], right_aligned_lines={heading: "2 OF 4"})
         model = input("Model ID: ").strip()
         if not model:
             card("Xernel", ["A model ID is required.", "No configuration was saved."])
@@ -146,8 +200,9 @@ def run_setup_wizard() -> int:
 
     old_key = (existing or {}).get("api_key", "") if same_provider else ""
     key_hint = "leave blank to keep saved key" if old_key else "required"
-    print("\nSETUP  /  CREDENTIALS  ·  3 OF 4")
     credential_label = "API key" if provider == "openrouter" else "API token (Workers AI Read + Edit)"
+    heading = _step_heading("CREDENTIALS")
+    card("Xernel", [heading, f"Enter {credential_label}."], right_aligned_lines={heading: "3 OF 4"})
     api_key = getpass.getpass(f"{credential_label} (hidden; {key_hint}): ").strip()
     if not api_key:
         api_key = old_key
@@ -176,8 +231,9 @@ def run_setup_wizard() -> int:
         data["endpoint"] = f"{spec['endpoint_base']}/{account_id}/ai/run/{model}"
 
     clear_terminal()
+    heading = _step_heading("REVIEW")
     summary = [
-        "SETUP  /  REVIEW  ·  4 OF 4",
+        heading,
         f"Provider: {spec['label']}",
         f"Model: {model}",
         "Credential: hidden; file is restricted to this user",
@@ -185,7 +241,7 @@ def run_setup_wizard() -> int:
     if provider == "cloudflare":
         summary.append(f"Account ID: {data['account_id']}")
     summary.extend([f"Config: {config_path()}", "", "Press Enter to save, or Q to cancel."])
-    card("Xernel", summary)
+    card("Xernel", summary, right_aligned_lines={heading: "4 OF 4"})
     if sys.stdin.isatty():
         key = _read_key()
         if key not in {"ENTER", "SPACE"}:

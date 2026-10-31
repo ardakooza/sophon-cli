@@ -16,10 +16,10 @@ xernel = "xernel.core:main"
 where = ["src"]
 
 [tool.setuptools.dynamic]
-version = { file = ["src/xernel/VERSION"] }
+version = { file = ["src/xernel/PYPI_VERSION"] }
 
 [tool.setuptools.package-data]
-xernel = ["VERSION"]
+xernel = ["VERSION", "PYPI_VERSION"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

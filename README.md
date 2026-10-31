@@ -43,7 +43,7 @@ python -m pip install -e .
 xernel
 ```
 
-`src/xernel/VERSION` is the version source for the CLI and package metadata.
+`src/xernel/VERSION` is the user-facing CLI version in `DD.MM.YYYY - NN` format. Increment `NN` for each release that day, starting at `00`; begin a new date at `00`. `src/xernel/PYPI_VERSION` stores the corresponding PEP 440 package version used by Python installers.
 
 ## Website
 

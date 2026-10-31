@@ -7,8 +7,15 @@ import os
 import select
 import sys
 
-from sophon.config import PROVIDERS, config_display_path, read_config, write_config
-from sophon.core import MUTED, WHITE, card, clear_terminal
+from sophon.config import (
+    PROVIDERS,
+    agent_instructions_path,
+    config_display_path,
+    ensure_agent_instructions_file,
+    read_config,
+    write_config,
+)
+from sophon.core import MUTED, WHITE, auto_update_enabled, card, clear_terminal
 
 
 def _read_key() -> str:
@@ -208,6 +215,8 @@ def run_setup_wizard() -> int:
         "provider": provider,
         "model": model,
         "api_key": api_key,
+        "agent_instructions_path": str(agent_instructions_path()),
+        "auto_update": auto_update_enabled(),
     }
     if provider == "openrouter":
         data["endpoint"] = spec["endpoint"]
@@ -222,6 +231,19 @@ def run_setup_wizard() -> int:
             return 1
         data["account_id"] = account_id
         data["endpoint"] = f"{spec['endpoint_base']}/{account_id}/ai/run/{model}"
+
+    saved_reasoning = (existing or {}).get("reasoning") if same_provider and saved_model == model else None
+    if isinstance(saved_reasoning, dict):
+        data["reasoning"] = saved_reasoning
+    else:
+        card("Model capabilities", [f"Checking reasoning support for {model}…"])
+        try:
+            from sophon.agent import _detect_reasoning_support
+
+            is_support = _detect_reasoning_support(data)
+        except (OSError, RuntimeError, ValueError):
+            is_support = False
+        data["reasoning"] = {"is_support": is_support, "enabled": False, "effort": "medium"}
 
     clear_terminal()
     summary = [
@@ -251,6 +273,7 @@ def run_setup_wizard() -> int:
             return 1
 
     try:
+        ensure_agent_instructions_file(agent_instructions_path())
         path = write_config(data)
     except (OSError, ValueError) as error:
         card("Sophon", ["Could not save configuration.", str(error)])

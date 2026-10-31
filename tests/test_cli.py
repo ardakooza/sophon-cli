@@ -91,9 +91,11 @@ def test_review_and_complete_card_titles_and_provider_labels_are_white(tmp_path)
         patch("sophon.setup_wizard.read_config", return_value=None),
         patch("sophon.setup_wizard._choose_provider", return_value="openrouter"),
         patch("sophon.setup_wizard._choose_model", return_value="test-model"),
+        patch("sophon.agent._detect_reasoning_support", return_value=False),
         patch("sophon.setup_wizard.getpass.getpass", return_value="test-secret"),
         patch("sophon.setup_wizard._read_key", return_value="ENTER"),
         patch("sophon.setup_wizard.write_config", return_value=tmp_path / "config.json"),
+        patch("sophon.setup_wizard.ensure_agent_instructions_file"),
     ):
         assert run_setup_wizard() == 0
     text = output.getvalue()
@@ -197,17 +199,81 @@ def test_config_hides_credentials_and_uses_private_file_permissions():
         assert "Endpoint:" not in result.stdout
 
 
-def test_auto_update_setting_defaults_off_and_is_persisted_privately(tmp_path):
+def test_auto_update_setting_defaults_off_and_is_persisted_in_private_config(tmp_path):
     from sophon import core
 
     with patch.dict(os.environ, {"XDG_CONFIG_HOME": str(tmp_path)}):
         assert core.auto_update_enabled() is False
         core.set_auto_update(True)
         assert core.auto_update_enabled() is True
-        path = core.settings_path()
+        path = config_path()
         assert path.stat().st_mode & 0o777 == 0o600
+        assert not core.settings_path().exists()
         core.set_auto_update(False)
         assert core.auto_update_enabled() is False
+
+
+def test_legacy_auto_update_migrates_to_config_without_provider(tmp_path):
+    import json
+
+    from sophon import core
+
+    with patch.dict(os.environ, {"XDG_CONFIG_HOME": str(tmp_path)}):
+        legacy = core.settings_path()
+        legacy.parent.mkdir(parents=True)
+        legacy.write_text('{"auto_update": true}\n', encoding="utf-8")
+        assert core.auto_update_enabled() is True
+        saved = json.loads(config_path().read_text(encoding="utf-8"))
+        assert not legacy.exists()
+    assert saved == {"schema_version": 1, "auto_update": True}
+
+
+def test_auto_update_preference_is_written_into_provider_config(tmp_path):
+    import json
+
+    from sophon import core
+
+    with patch.dict(os.environ, {"XDG_CONFIG_HOME": str(tmp_path)}):
+        write_config({
+            "schema_version": 1,
+            "provider": "openrouter",
+            "model": "test-model",
+            "api_key": "test-key",
+        })
+        core.set_auto_update(True)
+        saved = json.loads(config_path().read_text(encoding="utf-8"))
+    assert saved["auto_update"] is True
+    assert saved["reasoning"] == {"is_support": False, "enabled": False, "effort": "medium"}
+    assert saved["agent_instructions_path"].endswith("/agent/AGENT.md")
+
+
+def test_legacy_auto_update_preference_migrates_into_config(tmp_path):
+    import json
+
+    from sophon.config import read_config
+
+    with patch.dict(os.environ, {"XDG_CONFIG_HOME": str(tmp_path)}):
+        settings = config_path().parent.parent / "settings.json"
+        settings.parent.mkdir(parents=True)
+        settings.write_text('{"auto_update": true}\n', encoding="utf-8")
+        write_config({
+            "schema_version": 1,
+            "provider": "openrouter",
+            "model": "test-model",
+            "api_key": "test-key",
+        })
+        # Remove fields that write_config intentionally preserves as opaque data.
+        path = config_path()
+        legacy_shape = json.loads(path.read_text(encoding="utf-8"))
+        legacy_shape.pop("auto_update", None)
+        legacy_shape.pop("reasoning", None)
+        legacy_shape.pop("agent_instructions_path", None)
+        path.write_text(json.dumps(legacy_shape), encoding="utf-8")
+        migrated = read_config()
+        persisted = json.loads(path.read_text(encoding="utf-8"))
+        assert not settings.exists()
+    assert migrated["auto_update"] is True
+    assert persisted["auto_update"] is True
 
 
 def test_terminal_auto_update_command_can_be_toggled(tmp_path):
@@ -263,7 +329,10 @@ def test_agent_exposes_required_builtin_tools_on_every_provider_request():
     from sophon.agent import BUILTIN_TOOLS, _request
 
     names = {tool["function"]["name"] for tool in BUILTIN_TOOLS}
-    assert names == {"get_version", "is_update", "update", "system_health", "workspace_list"}
+    assert names == {
+        "get_version", "is_update", "update", "system_health", "workspace_list",
+        "session_list", "session_rename", "get_time", "get_date",
+    }
 
     class FakeResponse:
         headers = {"Content-Type": "application/json"}
@@ -352,6 +421,137 @@ def test_builtin_tool_dispatch_returns_version_update_health_and_workspace_resul
         assert "restart after this agent response" in _execute_builtin_tool("update", {})
 
 
+def test_session_tools_list_and_rename_saved_sessions(tmp_path):
+    from sophon import agent
+
+    session_path = tmp_path / "sessions" / "sessions.json"
+    with (
+        patch("sophon.agent.SESSION_FILE", session_path),
+        patch("sophon.agent.LEGACY_SESSION_FILE", tmp_path / "legacy.json"),
+    ):
+        agent._write_sessions([
+            {
+                "id": "ab12cd34ef",
+                "title": "Old title",
+                "created_at": "2026-10-31T10:00:00+03:00",
+                "updated_at": "2026-10-31T10:00:00+03:00",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+            {
+                "id": "ab99cd34ef",
+                "title": "Another session",
+                "created_at": "2026-10-31T09:00:00+03:00",
+                "updated_at": "2026-10-31T09:00:00+03:00",
+                "messages": [],
+            },
+        ])
+        listed = agent._execute_builtin_tool("session_list", {})
+        renamed = agent._execute_builtin_tool(
+            "session_rename", {"session_id": "ab12", "title": "New title"}
+        )
+        sessions = agent._load_sessions()
+    assert "ab12cd34ef | Old title | 1 messages" in listed
+    assert "New title" in renamed
+    assert sessions[0]["title"] == "New title"
+    assert sessions[0]["updated_at"] != "2026-10-31T10:00:00+03:00"
+    with (
+        patch("sophon.agent.SESSION_FILE", session_path),
+        patch("sophon.agent.LEGACY_SESSION_FILE", tmp_path / "legacy.json"),
+    ):
+        assert "ambiguous" in str(_raises_runtime_error(
+            lambda: agent._execute_builtin_tool("session_rename", {"session_id": "a", "title": "x"})
+        ))
+
+
+def _raises_runtime_error(call):
+    try:
+        call()
+    except RuntimeError as error:
+        return error
+    raise AssertionError("Expected a RuntimeError")
+
+
+def test_get_time_and_date_builtins_return_local_values():
+    from sophon.agent import _execute_builtin_tool
+
+    assert re.fullmatch(r"\d{2}:\d{2}:\d{2} .* \(UTC[+-]\d{4}\)", _execute_builtin_tool("get_time", {}))
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}", _execute_builtin_tool("get_date", {}))
+
+
+def test_forked_session_has_new_identity_and_independent_message_objects():
+    from sophon.agent import _fork_session
+
+    source = {
+        "id": "source1234",
+        "title": "Debug session",
+        "messages": [{"role": "assistant", "content": "Answer", "reasoning": "Thought"}],
+    }
+    forked = _fork_session(source)
+    assert forked["id"] != source["id"]
+    assert forked["title"] == "Fork of Debug session"
+    assert forked["messages"] == source["messages"]
+    assert forked["messages"][0] is not source["messages"][0]
+
+
+def test_fork_command_persists_a_new_session_from_the_selected_session(tmp_path):
+    from sophon import agent
+
+    session_path = tmp_path / "sessions" / "sessions.json"
+    source = {
+        "id": "source1234",
+        "title": "Original project",
+        "created_at": "2026-10-31T10:00:00+03:00",
+        "updated_at": "2026-10-31T10:00:00+03:00",
+        "messages": [{"role": "user", "content": "first message"}],
+    }
+    with (
+        patch("sophon.agent.SESSION_FILE", session_path),
+        patch("sophon.agent.LEGACY_SESSION_FILE", tmp_path / "legacy.json"),
+    ):
+        agent._write_sessions([source.copy()])
+        commands = iter(["/fork", "/exit"])
+        with (
+            patch("sophon.agent._input_bar", side_effect=lambda *args, **kwargs: next(commands)),
+            patch("sophon.agent._pick_item", return_value={"session": source}),
+        ):
+            assert agent._interactive({"provider": "openrouter", "model": "test", "context_window": 1024}) == 0
+        sessions = agent._load_sessions()
+    forked = next(item for item in sessions if item["id"] != "source1234")
+    assert forked["title"] == "Fork of Original project"
+    assert forked["messages"] == source["messages"]
+
+
+def test_agent_and_workspace_markdown_guides_are_separate_and_used(tmp_path, monkeypatch):
+    import json
+
+    from sophon import agent
+    from sophon.config import ensure_agent_instructions_file
+
+    with patch.dict(os.environ, {"XDG_CONFIG_HOME": str(tmp_path)}):
+        agent_path = ensure_agent_instructions_file()
+        agent_path.write_text("# Custom Agent Guidance\nAlways explain tradeoffs.\n", encoding="utf-8")
+        write_config({
+            "schema_version": 1,
+            "provider": "openrouter",
+            "model": "test-model",
+            "api_key": "test-key",
+            "agent_instructions_path": str(agent_path),
+        })
+        workspace_root = tmp_path / "sophon" / "workspace"
+        project = workspace_root / "project-x"
+        monkeypatch.setattr(agent, "WORKSPACE_ROOT", workspace_root)
+        monkeypatch.setattr(agent, "PROJECT_DIR", project)
+        agent._ensure_workspace()
+        prompt = agent._system_message({"agent_instructions_path": str(agent_path)})
+        workspace_file = workspace_root / "WORKSPACE.md"
+        config = json.loads(config_path().read_text(encoding="utf-8"))
+    assert "Custom Agent Guidance" in prompt
+    assert "Workspace guidance (WORKSPACE.md)" in prompt
+    assert workspace_file.exists()
+    assert "top-level folder" in workspace_file.read_text(encoding="utf-8")
+    assert config["agent_instructions_path"] == str(agent_path)
+
+
 def test_answering_indicator_dot_pulses_more_slowly():
     from sophon.agent import _answering_rows
 
@@ -366,6 +566,96 @@ def test_answering_indicator_dot_pulses_more_slowly():
     dot = re.compile(r"\x1b\[38;5;\d+m•\x1b\[0m")
     assert dot.search(first).group() == dot.search(same_phase).group()
     assert dot.search(first).group() != dot.search(next_phase).group()
+
+
+def test_reasoning_support_detection_and_openrouter_request_payload():
+    import json
+
+    from sophon.agent import _model_supports_reasoning, _request
+
+    assert _model_supports_reasoning({"supported_parameters": ["tools", "reasoning"]})
+    assert _model_supports_reasoning({"capabilities": {"reasoning": True}})
+    assert not _model_supports_reasoning({"supported_parameters": ["tools"]})
+
+    class FakeResponse:
+        headers = {"Content-Type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return b'{"choices":[{"message":{"content":"answer","reasoning":"think carefully"}}]}'
+
+    captured = {}
+
+    def fake_urlopen(request, timeout):
+        captured["payload"] = json.loads(request.data.decode("utf-8"))
+        return FakeResponse()
+
+    config = {
+        "provider": "openrouter",
+        "model": "reasoning-model",
+        "api_key": "test-key",
+        "reasoning": {"is_support": True, "enabled": True, "effort": "high"},
+    }
+    reasoning_chunks = []
+    with patch("sophon.agent.urlopen", side_effect=fake_urlopen):
+        answer = _request(
+            config,
+            [{"role": "user", "content": "why?"}],
+            on_reasoning=reasoning_chunks.append,
+        )
+    assert answer == "answer"
+    assert captured["payload"]["reasoning"] == {"effort": "high"}
+    assert captured["payload"]["include_reasoning"] is True
+    assert reasoning_chunks == ["think carefully"]
+
+
+def test_reasoning_display_is_muted_and_precedes_the_agent_answer():
+    from sophon.agent import _message_rows
+
+    class TerminalBuffer(StringIO):
+        def isatty(self):
+            return True
+
+    with patch("sys.stdout", TerminalBuffer()):
+        rows = _message_rows(
+            [{"role": "assistant", "content": "Final answer", "reasoning": "Reasoning details"}],
+            80,
+        )
+    rendered = "\n".join(rows)
+    assert rendered.index("Reasoning details") < rendered.index("Final answer")
+    assert "\033[38;5;245m" in rendered
+
+
+def test_reasoning_commands_persist_support_enabled_and_effort(tmp_path):
+    import json
+
+    from sophon import agent
+
+    with patch.dict(os.environ, {"XDG_CONFIG_HOME": str(tmp_path)}):
+        initial = {
+            "schema_version": 1,
+            "provider": "openrouter",
+            "model": "reasoning-model",
+            "api_key": "test-key",
+            "agent_instructions_path": str(tmp_path / "sophon" / "agent" / "AGENT.md"),
+            "auto_update": False,
+            "reasoning": {"is_support": False, "enabled": False, "effort": "medium"},
+        }
+        write_config(initial)
+        commands = iter(["/reasoning on", "/reasoning-effort high", "/reasoning off", "/exit"])
+        with (
+            patch("sophon.agent._load_sessions", return_value=[]),
+            patch("sophon.agent._input_bar", side_effect=lambda *args, **kwargs: next(commands)),
+            patch("sophon.agent._detect_reasoning_support", return_value=True),
+        ):
+            assert agent._interactive(initial.copy()) == 0
+        saved = json.loads(config_path().read_text(encoding="utf-8"))
+    assert saved["reasoning"] == {"is_support": True, "enabled": False, "effort": "high"}
 
 
 def test_cwd_and_pwd_commands_are_available_inside_agent_only(tmp_path, monkeypatch):

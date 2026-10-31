@@ -37,9 +37,11 @@ Run `sophon setup` to choose OpenRouter or Cloudflare Workers AI and save the co
 - `sophon update` — safely update a source checkout or refresh an installed package
 - `sophon --help` — show command help
 
-In the terminal interface, `/restart` restarts Sophon and `/auto-update on|off` controls update checks at startup (off by default). A successful manual update restarts Sophon automatically. In Agent mode, `/cwd` shows the current directory and `/pwd` shows the active project workspace path. Agent mode always has built-in `get_version`, `is_update`, `update`, `system_health`, and `workspace_list` tools, in addition to its project file tools.
+In the terminal interface, `/restart` restarts Sophon and `/auto-update on|off` controls update checks at startup (off by default). With a configured provider, this preference is stored in `~/.sophon/config/config.json`; prior settings are migrated from the older settings file. A successful manual update restarts Sophon automatically.
 
-Agent project files live in `~/.sophon/workspace/my-project` by default. Each project has its own folder under `~/.sophon/workspace/`; the workspace `AGENT.md` explains the layout. The agent can list, read, and write files in the active project folder.
+In Agent mode, `/cwd` shows the current directory, `/pwd` shows the active project workspace, `/fork` creates a new session from a selected saved session, and `/reasoning on|off` toggles reasoning when the selected model advertises support. `/reasoning-effort low|medium|high` persists the requested effort in config. The Agent always receives built-in `get_version`, `is_update`, `update`, `system_health`, `workspace_list`, `session_list`, `session_rename`, `get_time`, and `get_date` tools, in addition to its project file tools.
+
+Agent project files live in `~/.sophon/workspace/my-project` by default. Each project has its own folder under `~/.sophon/workspace/`; the root `WORKSPACE.md` describes how to organize that workspace. Every Agent session receives the editable instructions from `~/.sophon/agent/AGENT.md`; its path is recorded in `~/.sophon/config/config.json`. The Agent can list, read, and write files in the active project folder.
 
 ## Development
 

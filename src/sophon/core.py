@@ -15,7 +15,7 @@ from pathlib import Path
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
-from sophon.config import PROVIDERS, config_display_path, config_path, read_config
+from sophon.config import PROVIDERS, config_display_path, config_path, read_config, write_config
 from sophon import __version__ as VERSION
 
 RESET = "\033[0m"
@@ -354,13 +354,55 @@ def settings_path() -> Path:
 
 def auto_update_enabled() -> bool:
     try:
+        data = read_config()
+    except (OSError, ValueError):
+        data = None
+    if data is not None and isinstance(data.get("auto_update"), bool):
+        return data["auto_update"]
+    try:
+        raw_config = json.loads(config_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        raw_config = None
+    if isinstance(raw_config, dict) and isinstance(raw_config.get("auto_update"), bool):
+        return raw_config["auto_update"]
+    try:
         value = json.loads(settings_path().read_text(encoding="utf-8"))
     except (OSError, ValueError, json.JSONDecodeError):
         return False
-    return isinstance(value, dict) and value.get("auto_update") is True
+    enabled = isinstance(value, dict) and value.get("auto_update") is True
+    if enabled:
+        preferences = raw_config if isinstance(raw_config, dict) and raw_config.get("provider") is None else {"schema_version": 1}
+        preferences["auto_update"] = True
+        try:
+            write_config(preferences)
+        except (OSError, ValueError):
+            pass
+        else:
+            try:
+                settings_path().unlink()
+            except OSError:
+                pass
+    return enabled
 
 
 def set_auto_update(enabled: bool) -> None:
+    try:
+        data = read_config()
+    except (OSError, ValueError):
+        data = None
+    if data is not None:
+        data["auto_update"] = enabled
+        write_config(data)
+        return
+    try:
+        raw_config = json.loads(config_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        raw_config = None
+    if not isinstance(raw_config, dict) or raw_config.get("provider") is None:
+        preferences = raw_config if isinstance(raw_config, dict) else {"schema_version": 1}
+        preferences["auto_update"] = enabled
+        write_config(preferences)
+        return
     path = settings_path()
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(path.parent, 0o700)
@@ -562,7 +604,15 @@ def show_config() -> int:
         f"Provider: {PROVIDERS[provider]['label']}",
         f"Model: {data['model']}",
         "API key: hidden",
+        f"Auto-update: {'on' if data.get('auto_update') is True else 'off'}",
     ]
+    reasoning = data.get("reasoning") if isinstance(data.get("reasoning"), dict) else {}
+    support = "supported" if reasoning.get("is_support") is True else "not supported"
+    state = "on" if reasoning.get("enabled") is True else "off"
+    lines.append(f"Reasoning: {support}, {state}, effort {reasoning.get('effort', 'medium')}")
+    instructions = str(data.get("agent_instructions_path", ""))
+    if instructions:
+        lines.append(f"Agent instructions: {instructions}")
     if provider == "cloudflare":
         lines.append(f"Account ID: {data['account_id']}")
     lines.append(f"Config: {config_display_path()}")

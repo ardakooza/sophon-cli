@@ -20,7 +20,14 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from sophon.config import PROVIDERS, endpoint_for, read_config, write_config
+from sophon.config import (
+    PROVIDERS,
+    agent_instructions_path,
+    endpoint_for,
+    ensure_agent_instructions_file,
+    read_config,
+    write_config,
+)
 from sophon.core import BORDER, MUTED, NOTICE_BORDER, NOTICE_TEXT, WHITE, card, centered, display_width, paint, wrap_text
 
 SESSION_FILE = Path.home() / ".sophon" / "sessions" / "sessions.json"
@@ -33,7 +40,8 @@ ANIMATION_TICK = 0.075
 SYSTEM_PROMPT = (
     "You are Sophon, a concise and practical development assistant. "
     "Use the provided file tools to inspect and edit project files in the active workspace. "
-    "Never access paths outside that workspace or claim to have run commands. "
+    "Do not access project files outside that workspace or claim to have run arbitrary shell commands. "
+    "Use built-in tools for supported system operations and report their results accurately. "
     "Keep all project files inside the active project folder."
 )
 
@@ -122,20 +130,64 @@ BUILTIN_TOOLS = [
             "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "session_list",
+            "description": "List saved Sophon Agent sessions with IDs, titles and message counts.",
+            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "session_rename",
+            "description": "Rename a saved session by its ID.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string", "description": "ID (or unique ID prefix) of the saved session"},
+                    "title": {"type": "string", "description": "New session title"},
+                },
+                "required": ["session_id", "title"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_time",
+            "description": "Get the current local time and time zone.",
+            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_date",
+            "description": "Get the current local date.",
+            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+        },
+    },
 ]
 
 
 def _ensure_workspace() -> Path:
     WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
     PROJECT_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
-    guide = WORKSPACE_ROOT / "AGENT.md"
+    guide = WORKSPACE_ROOT / "WORKSPACE.md"
     if not guide.exists():
-        content = (
-            "# Sophon Workspace\n\n"
-            "This folder keeps project work organized. Give each project its own subfolder and keep "
-            "that project's files together there. The empty `my-project/` folder is the starter "
-            "project. Keep unrelated projects separate and do not store API keys or other secrets here.\n"
-        )
+        legacy_guide = WORKSPACE_ROOT / "AGENT.md"
+        try:
+            content = legacy_guide.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            content = (
+                "# Sophon Workspace\n\n"
+                "This is the workspace root. Keep each project in its own top-level folder so files "
+                "from separate projects stay organized. `my-project/` is the starter project. Use "
+                "project-relative paths, and do not store API keys or other secrets here.\n"
+            )
         try:
             descriptor = os.open(guide, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         except FileExistsError:
@@ -146,16 +198,44 @@ def _ensure_workspace() -> Path:
     return PROJECT_DIR
 
 
-def _system_message() -> str:
-    guide = WORKSPACE_ROOT / "AGENT.md"
+def _instructions_file(config: dict[str, object] | None = None) -> Path:
+    default_path = agent_instructions_path().resolve()
+    config_root = default_path.parent.parent
+    configured_path = Path(str((config or {}).get("agent_instructions_path") or default_path)).expanduser()
+    if not configured_path.is_absolute():
+        configured_path = config_root / configured_path
+    candidate = configured_path.resolve()
+    if candidate == config_root or config_root not in candidate.parents:
+        candidate = default_path
+    return candidate
+
+
+def _ensure_agent_instructions(config: dict[str, object]) -> Path:
+    path = _instructions_file(config)
+    ensure_agent_instructions_file(path)
+    stored_path = str(path)
+    if config.get("agent_instructions_path") != stored_path:
+        config["agent_instructions_path"] = stored_path
+        write_config(config)
+    return path
+
+
+def _system_message(config: dict[str, object] | None = None) -> str:
+    instructions_path = _instructions_file(config)
     try:
-        instructions = guide.read_text(encoding="utf-8").strip()
+        instructions = instructions_path.read_text(encoding="utf-8").strip()
     except OSError:
-        instructions = "Keep project files inside the active project directory."
+        instructions = "Follow the user's project-specific instructions and keep project files in the active project directory."
+    guide = WORKSPACE_ROOT / "WORKSPACE.md"
+    try:
+        workspace_guidance = guide.read_text(encoding="utf-8").strip()
+    except OSError:
+        workspace_guidance = "Create one top-level folder per project and keep project files inside it."
     return (
         f"{SYSTEM_PROMPT}\n\n"
+        f"Agent instructions (AGENT.md):\n{instructions}\n\n"
         f"Active project directory: {PROJECT_DIR}\n"
-        f"Workspace guidance:\n{instructions}"
+        f"Workspace guidance (WORKSPACE.md):\n{workspace_guidance}"
     )
 
 
@@ -204,6 +284,32 @@ def _response_content(result: object, provider: str) -> str | None:
             str(part.get("text", "")) for part in content if isinstance(part, dict)
         )
     return content if isinstance(content, str) else None
+
+
+def _response_reasoning(result: object, provider: str) -> str | None:
+    if not isinstance(result, dict):
+        return None
+    if provider == "openrouter":
+        choices = result.get("choices")
+        choice = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
+        delta = choice.get("delta") or choice.get("message") or {}
+        if isinstance(delta, dict):
+            value = delta.get("reasoning") or delta.get("reasoning_content") or delta.get("reasoning_details")
+        else:
+            value = None
+    else:
+        value = result.get("reasoning")
+        if value is None and isinstance(result.get("result"), dict):
+            value = result["result"].get("reasoning")
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "".join(
+            str(part.get("text") or part.get("summary") or part.get("content") or "")
+            for part in value
+            if isinstance(part, dict)
+        )
+    return None
 
 
 def _workspace_file(relative_path: str, *, allow_root: bool = False) -> Path:
@@ -270,7 +376,12 @@ def _execute_builtin_tool(name: str, arguments: object) -> str:
             arguments = json.loads(arguments)
         except json.JSONDecodeError:
             raise RuntimeError("The built-in tool arguments were not valid JSON.") from None
-    if not isinstance(arguments, dict) or arguments:
+    if not isinstance(arguments, dict):
+        raise RuntimeError("Built-in tool arguments must be an object.")
+    if name == "session_rename":
+        if set(arguments) != {"session_id", "title"}:
+            raise RuntimeError("session_rename requires only session_id and title.")
+    elif arguments:
         raise RuntimeError("This built-in tool does not accept arguments.")
 
     from sophon import __version__
@@ -315,6 +426,33 @@ def _execute_builtin_tool(name: str, arguments: object) -> str:
             key=str.casefold,
         )
         return "\n".join(projects) if projects else "No project folders are in the workspace yet."
+    if name == "session_list":
+        sessions = _load_sessions()
+        if not sessions:
+            return "No saved sessions."
+        return "\n".join(
+            f"{item['id']} | {item['title']} | {len(item['messages'])} messages | {str(item.get('updated_at', ''))[:19]}"
+            for item in sessions
+        )
+    if name == "session_rename":
+        session_id = arguments.get("session_id")
+        title = arguments.get("title")
+        if not isinstance(session_id, str) or not session_id.strip() or not isinstance(title, str) or not title.strip():
+            raise RuntimeError("Provide a session_id and a non-empty title.")
+        sessions = _load_sessions()
+        matches = [item for item in sessions if str(item["id"]).startswith(session_id.strip())]
+        if len(matches) != 1:
+            raise RuntimeError("The session ID was not found or is ambiguous.")
+        target = matches[0]
+        target["title"] = title.strip()[:80]
+        target["updated_at"] = _timestamp()
+        _write_sessions(sessions)
+        return f"Renamed session {target['id']} to {target['title']}."
+    if name == "get_time":
+        now = dt.datetime.now().astimezone()
+        return now.strftime("%H:%M:%S %Z (UTC%z)")
+    if name == "get_date":
+        return dt.datetime.now().astimezone().strftime("%Y-%m-%d")
     raise RuntimeError(f"Unknown Sophon built-in tool: {name}")
 
 
@@ -325,6 +463,7 @@ def _request(
     tool_calls_out: list[dict[str, object]] | None = None,
     *,
     tools_enabled: bool = True,
+    on_reasoning: Callable[[str], None] | None = None,
 ) -> str:
     provider = str(config["provider"])
     payload: dict[str, object] = {"messages": messages}
@@ -333,6 +472,13 @@ def _request(
     else:
         payload["max_tokens"] = 2048
     payload["stream"] = True
+    reasoning = _reasoning_settings(config)
+    if reasoning["is_support"] and reasoning["enabled"]:
+        if provider == "openrouter":
+            payload["reasoning"] = {"effort": reasoning["effort"]}
+            payload["include_reasoning"] = True
+        else:
+            payload["reasoning"] = {"effort": reasoning["effort"]}
     if tools_enabled:
         all_tools = [*BUILTIN_TOOLS, *WORKSPACE_TOOLS]
         payload["tools"] = all_tools if provider == "openrouter" else [
@@ -389,12 +535,17 @@ def _request(
             if on_chunk is not None:
                 on_chunk(content)
 
+    def append_reasoning(reasoning_text: str | None) -> None:
+        if reasoning_text and on_reasoning is not None:
+            on_reasoning(reasoning_text)
+
     try:
         with urlopen(request, timeout=120) as response:
             content_type = response.headers.get("Content-Type", "").casefold()
             if "text/event-stream" not in content_type:
                 result = json.loads(response.read().decode("utf-8"))
                 collect_tool_calls(result)
+                append_reasoning(_response_reasoning(result, provider))
                 append_content(_response_content(result, provider))
             else:
                 for data in _event_data(response):
@@ -404,6 +555,7 @@ def _request(
                         except json.JSONDecodeError:
                             continue
                         collect_tool_calls(result)
+                        append_reasoning(_response_reasoning(result, provider))
                         append_content(_response_content(result, provider))
                     else:
                         break
@@ -416,6 +568,7 @@ def _request(
                 on_chunk=on_chunk,
                 tool_calls_out=tool_calls_out,
                 tools_enabled=False,
+                on_reasoning=on_reasoning,
             )
         raise RuntimeError(f"Provider returned HTTP {error.code}: {detail or error.reason}") from None
     except (OSError, TimeoutError, URLError, UnicodeError, json.JSONDecodeError) as error:
@@ -468,14 +621,25 @@ def _complete_turn(
     config: dict[str, object],
     history: list[dict[str, str]],
     on_chunk: Callable[[str], None] | None = None,
+    on_reasoning: Callable[[str], None] | None = None,
 ) -> str:
     messages: list[dict[str, object]] = [
-        {"role": "system", "content": _system_message()},
-        *(message for message in history if message.get("role") in {"user", "assistant"}),
+        {"role": "system", "content": _system_message(config)},
+        *(
+            {"role": message["role"], "content": message["content"]}
+            for message in history
+            if message.get("role") in {"user", "assistant"}
+        ),
     ]
     for _ in range(8):
         tool_calls: list[dict[str, object]] = []
-        answer = _request(config, messages, on_chunk=on_chunk, tool_calls_out=tool_calls)
+        answer = _request(
+            config,
+            messages,
+            on_chunk=on_chunk,
+            tool_calls_out=tool_calls,
+            on_reasoning=on_reasoning,
+        )
         if not tool_calls:
             return answer
         messages.append({"role": "assistant", "content": answer or None, "tool_calls": tool_calls})
@@ -509,9 +673,10 @@ def _ask(
     history: list[dict[str, str]],
     prompt: str,
     on_chunk: Callable[[str], None] | None = None,
+    on_reasoning: Callable[[str], None] | None = None,
 ) -> str:
     messages = [*history, {"role": "user", "content": prompt}]
-    answer = _complete_turn(config, messages, on_chunk=on_chunk)
+    answer = _complete_turn(config, messages, on_chunk=on_chunk, on_reasoning=on_reasoning)
     history.extend([{"role": "user", "content": prompt}, {"role": "assistant", "content": answer}])
     return answer
 
@@ -523,6 +688,18 @@ def _timestamp() -> str:
 def _new_session() -> dict[str, object]:
     now = _timestamp()
     return {"id": uuid.uuid4().hex[:10], "title": "New session", "created_at": now, "updated_at": now, "messages": []}
+
+
+def _fork_session(source: dict[str, object]) -> dict[str, object]:
+    now = _timestamp()
+    title = str(source.get("title") or "Session")
+    return {
+        "id": uuid.uuid4().hex[:10],
+        "title": f"Fork of {title}"[:80],
+        "created_at": now,
+        "updated_at": now,
+        "messages": [dict(message) for message in source.get("messages", [])],
+    }
 
 
 def _workspace_location(command: str) -> tuple[str, str, bool]:
@@ -742,6 +919,9 @@ def _message_rows(messages: list[dict[str, str]], columns: int) -> list[str]:
         if role == "user":
             rows.extend(_user_rows(content, columns))
         elif role == "assistant":
+            reasoning_text = message.get("reasoning")
+            if isinstance(reasoning_text, str) and reasoning_text.strip():
+                rows.extend(_reasoning_rows(reasoning_text, columns))
             rows.extend(_agent_rows(content, columns))
         else:
             rows.extend(
@@ -821,6 +1001,7 @@ def _draw_screen(
     answering: bool = False,
     animation_frame: int = 0,
     streaming_text: str = "",
+    reasoning_text: str = "",
     context_window: int | None = None,
 ) -> tuple[int, int]:
     size = shutil.get_terminal_size((80, 24))
@@ -842,7 +1023,9 @@ def _draw_screen(
         feed = panel_rows
     else:
         feed = list(notice_rows or []) + _message_rows(session["messages"], columns)
-        if answering and not streaming_text.strip():
+        if answering and reasoning_text.strip():
+            feed.extend(_reasoning_rows(reasoning_text, columns, frame=animation_frame))
+        elif answering and not streaming_text.strip():
             feed.extend(_answering_rows(animation_frame))
         if streaming_text:
             feed.extend(_agent_rows(streaming_text, columns))
@@ -1006,6 +1189,66 @@ def _context_window(item: dict[str, object]) -> int | None:
     return None
 
 
+def _model_supports_reasoning(item: dict[str, object]) -> bool:
+    if item.get("supports_reasoning") is True:
+        return True
+    capabilities = item.get("capabilities")
+    if isinstance(capabilities, dict) and capabilities.get("reasoning") is True:
+        return True
+    properties = item.get("properties")
+    candidates = [item, properties] if isinstance(properties, dict) else [item]
+    for candidate in candidates:
+        if candidate.get("supports_reasoning") is True or candidate.get("reasoning") is True:
+            return True
+        parameters = candidate.get("supported_parameters")
+        if isinstance(parameters, list) and any(
+            isinstance(parameter, str)
+            and parameter.casefold() in {"reasoning", "include_reasoning", "reasoning_effort"}
+            for parameter in parameters
+        ):
+            return True
+    return False
+
+
+def _detect_reasoning_support(config: dict[str, object]) -> bool:
+    model_id = str(config.get("model", ""))
+    try:
+        if config.get("provider") == "cloudflare":
+            base = f"https://api.cloudflare.com/client/v4/accounts/{config['account_id']}/ai/models/search"
+            result = _model_request(
+                base + "?" + urlencode({"per_page": "100", "page": "1", "search": model_id}),
+                str(config["api_key"]),
+                timeout=8,
+            )
+            items = result.get("result")
+            if not isinstance(items, list):
+                return False
+            match = next(
+                (item for item in items if isinstance(item, dict) and str(item.get("name") or item.get("id") or item.get("model")) == model_id),
+                None,
+            )
+            return bool(match and _model_supports_reasoning(match))
+        models = _list_models(config, model_id, timeout=8)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    match = next((item for item in models if item.get("id") == model_id), None)
+    return bool(match and match.get("reasoning_supported"))
+
+
+def _reasoning_settings(config: dict[str, object]) -> dict[str, object]:
+    value = config.get("reasoning")
+    value = value if isinstance(value, dict) else {}
+    is_support = value.get("is_support") is True
+    effort = value.get("effort")
+    if effort not in {"low", "medium", "high"}:
+        effort = "medium"
+    return {
+        "is_support": is_support,
+        "enabled": is_support and value.get("enabled") is True,
+        "effort": effort,
+    }
+
+
 def _list_models(
     config: dict[str, object], search: str = "", *, timeout: float = 30
 ) -> list[dict[str, object]]:
@@ -1021,6 +1264,7 @@ def _list_models(
                 "id": str(item["id"]),
                 "name": str(item.get("name") or item["id"]),
                 "context_window": _context_window(item),
+                "reasoning_supported": _model_supports_reasoning(item),
             }
             for item in data
             if isinstance(item, dict) and isinstance(item.get("id"), str)
@@ -1051,6 +1295,7 @@ def _list_models(
                         "id": str(model_id),
                         "name": str(item.get("display_name") or item.get("description") or model_id),
                         "context_window": _context_window(item),
+                        "reasoning_supported": _model_supports_reasoning(item),
                     }
                 )
         all_models.extend(batch)
@@ -1128,8 +1373,7 @@ def _footer_rows(
     )
 
 
-def _answering_rows(frame: int) -> list[str]:
-    label = "Answering"
+def _answering_rows(frame: int, label: str = "Answering") -> list[str]:
     center = frame % (len(label) + 6) - 3
     shimmer = ""
     for index, character in enumerate(label):
@@ -1139,6 +1383,17 @@ def _answering_rows(frame: int) -> list[str]:
         shimmer += paint(character, f"\033[38;5;{color}m")
     dot_color = WHITE if (frame // 6) % 2 == 0 else MUTED
     return ["  " + paint("•", dot_color) + " " + shimmer]
+
+
+def _reasoning_rows(text: str, columns: int, *, frame: int | None = None) -> list[str]:
+    rows = _answering_rows(frame, "Reasoning") if frame is not None else [paint("  • Reasoning", MUTED)]
+    width = max(20, columns - 8)
+    for paragraph in text.splitlines() or [text]:
+        if not paragraph:
+            rows.append(paint("    ", MUTED))
+            continue
+        rows.extend(paint("    " + line, MUTED) for line in wrap_text(paragraph, max(1, width - 4)))
+    return rows
 
 
 def _pick_item(
@@ -1295,7 +1550,7 @@ def _interactive(config: dict[str, object]) -> int:
             args=(config.copy(), context_state),
             daemon=True,
         ).start()
-    answering = {"active": False, "frame": 0, "text": ""}
+    answering = {"active": False, "frame": 0, "text": "", "reasoning": ""}
 
     def draw(
         text: str,
@@ -1317,6 +1572,7 @@ def _interactive(config: dict[str, object]) -> int:
             answering=bool(answering["active"]),
             animation_frame=int(answering["frame"]),
             streaming_text=str(answering["text"]),
+            reasoning_text=str(answering["reasoning"]),
             context_window=context_state["window"] if isinstance(context_state["window"], int) else None,
         )
 
@@ -1347,6 +1603,26 @@ def _interactive(config: dict[str, object]) -> int:
             notice("Session storage error", str(error), error=True)
             return False
 
+    def refresh_sessions_after_tools() -> None:
+        nonlocal sessions
+        try:
+            refreshed = _load_sessions()
+        except RuntimeError:
+            return
+        for index, saved in enumerate(refreshed):
+            if saved.get("id") == session.get("id"):
+                session["title"] = saved.get("title", session.get("title"))
+                session["updated_at"] = saved.get("updated_at", session.get("updated_at"))
+                refreshed[index] = session
+                break
+        sessions = refreshed
+
+    def save_reasoning_preferences(preferences: dict[str, object]) -> None:
+        updated_config = config.copy()
+        updated_config["reasoning"] = preferences
+        write_config(updated_config)
+        config.update(updated_config)
+
     while True:
         try:
             prompt = _input_bar(draw)
@@ -1370,7 +1646,7 @@ def _interactive(config: dict[str, object]) -> int:
             if command == "help":
                 notice_rows = _card_rows(
                     "Sophon Commands",
-                    ["/model [search]  Choose a provider model", "/new  Start a fresh saved session", "/rename [title]  Rename this session", "/resume  Load a saved session", "/cwd  Show the current directory", "/pwd  Show the project workspace path", "/clear  Start a new session", "/exit or Q  Close Sophon Agent"],
+                    ["/model [search]  Choose a provider model", "/new  Start a fresh saved session", "/rename [title]  Rename this session", "/resume  Load a saved session", "/fork  Fork a saved session", "/reasoning on|off  Toggle supported model reasoning", "/reasoning-effort low|medium|high  Set reasoning effort", "/cwd  Show the current directory", "/pwd  Show the project workspace path", "/clear  Start a new session", "/exit or Q  Close Sophon Agent"],
                     columns=shutil.get_terminal_size((80, 24)).columns,
                 )
             elif command == "cwd":
@@ -1400,6 +1676,68 @@ def _interactive(config: dict[str, object]) -> int:
                     notice_rows = []
                 else:
                     notice("Resume cancelled", "The current session is still open.")
+            elif command == "fork":
+                if not save_current():
+                    continue
+                items = [_session_item(item) for item in sessions]
+                selected = _pick_item(session, draw, items, title="Fork Session", current_id=str(session["id"]))
+                if selected:
+                    source = selected["session"]
+                    forked = _fork_session(source)
+                    sessions.append(forked)
+                    session = forked
+                    if save_current():
+                        notice_plain(f"Forked session {source['title']} into a new session.")
+                else:
+                    notice("Fork cancelled", "The current session is still open.")
+            elif command == "reasoning":
+                argument = argument.casefold()
+                preferences = _reasoning_settings(config)
+                if argument not in {"on", "off"}:
+                    state = "on" if preferences["enabled"] else "off"
+                    support = "supported" if preferences["is_support"] else "not detected for this model"
+                    notice("Model reasoning", f"Reasoning is {state}; {support}. Use /reasoning on or /reasoning off.")
+                    continue
+                if argument == "on" and not preferences["is_support"]:
+                    preferences["is_support"] = _detect_reasoning_support(config)
+                if argument == "on" and not preferences["is_support"]:
+                    try:
+                        save_reasoning_preferences(preferences)
+                    except (OSError, ValueError) as error:
+                        notice("Reasoning preference not saved", str(error), error=True)
+                    else:
+                        notice("Reasoning unavailable", "The selected model does not advertise reasoning support.", error=True)
+                    continue
+                preferences["enabled"] = argument == "on"
+                try:
+                    save_reasoning_preferences(preferences)
+                except (OSError, ValueError) as error:
+                    notice("Reasoning preference not saved", str(error), error=True)
+                else:
+                    notice("Model reasoning", f"Reasoning turned {argument}.")
+            elif command == "reasoning-effort":
+                argument = argument.casefold()
+                preferences = _reasoning_settings(config)
+                if argument not in {"low", "medium", "high"}:
+                    notice("Reasoning effort", f"Current effort: {preferences['effort']}. Choose low, medium or high.")
+                    continue
+                if not preferences["is_support"]:
+                    preferences["is_support"] = _detect_reasoning_support(config)
+                if not preferences["is_support"]:
+                    try:
+                        save_reasoning_preferences(preferences)
+                    except (OSError, ValueError) as error:
+                        notice("Reasoning preference not saved", str(error), error=True)
+                    else:
+                        notice("Reasoning unavailable", "The selected model does not advertise reasoning support.", error=True)
+                    continue
+                preferences["effort"] = argument
+                try:
+                    save_reasoning_preferences(preferences)
+                except (OSError, ValueError) as error:
+                    notice("Reasoning preference not saved", str(error), error=True)
+                else:
+                    notice("Reasoning effort", f"Reasoning effort set to {argument}.")
             elif command == "model":
                 try:
                     models = _list_models(config, argument)
@@ -1414,6 +1752,7 @@ def _interactive(config: dict[str, object]) -> int:
                         "id": model["id"],
                         "label": f"{model['id']} · {model['name']}",
                         "context_window": model.get("context_window"),
+                        "reasoning_supported": model.get("reasoning_supported", False),
                     }
                     for model in models
                 ]
@@ -1421,6 +1760,13 @@ def _interactive(config: dict[str, object]) -> int:
                 if selected:
                     updated_config = config.copy()
                     updated_config["model"] = str(selected["id"])
+                    old_reasoning = _reasoning_settings(config)
+                    support = selected.get("reasoning_supported") is True
+                    updated_config["reasoning"] = {
+                        "is_support": support,
+                        "enabled": support and old_reasoning["enabled"],
+                        "effort": old_reasoning["effort"],
+                    }
                     selected_window = selected.get("context_window")
                     if isinstance(selected_window, int) and selected_window > 0:
                         updated_config["context_window"] = selected_window
@@ -1460,6 +1806,7 @@ def _interactive(config: dict[str, object]) -> int:
         answering["active"] = True
         answering["frame"] = 0
         answering["text"] = ""
+        answering["reasoning"] = ""
         draw("", 0)
         events: queue.Queue[tuple[str, object]] = queue.Queue()
         request_messages = [
@@ -1472,6 +1819,7 @@ def _interactive(config: dict[str, object]) -> int:
                     config.copy(),
                     request_messages,
                     on_chunk=lambda chunk: events.put(("chunk", chunk)),
+                    on_reasoning=lambda chunk: events.put(("reasoning", chunk)),
                 )
             except Exception as error:
                 events.put(("error", error))
@@ -1480,6 +1828,7 @@ def _interactive(config: dict[str, object]) -> int:
 
         threading.Thread(target=request_answer, daemon=True).start()
         parts: list[str] = []
+        reasoning_parts: list[str] = []
         answer: str | None = None
         request_error: Exception | None = None
         while answer is None and request_error is None:
@@ -1497,6 +1846,8 @@ def _interactive(config: dict[str, object]) -> int:
             for kind, value in batch:
                 if kind == "chunk":
                     parts.append(str(value))
+                elif kind == "reasoning":
+                    reasoning_parts.append(str(value))
                 elif kind == "done":
                     answer = str(value)
                 elif kind == "error":
@@ -1504,10 +1855,13 @@ def _interactive(config: dict[str, object]) -> int:
             if answer is None and request_error is None:
                 answering["frame"] = int(answering["frame"]) + 1
                 answering["text"] = "".join(parts)
+                answering["reasoning"] = "".join(reasoning_parts)
                 draw("", 0)
 
         answering["active"] = False
         answering["text"] = ""
+        answering["reasoning"] = ""
+        refresh_sessions_after_tools()
         if request_error is not None:
             partial = "".join(parts).strip()
             if partial:
@@ -1516,7 +1870,11 @@ def _interactive(config: dict[str, object]) -> int:
             save_current()
             continue
         assert answer is not None
-        messages.append({"role": "assistant", "content": answer})
+        assistant_message: dict[str, str] = {"role": "assistant", "content": answer}
+        reasoning_text = "".join(reasoning_parts).strip()
+        if reasoning_text:
+            assistant_message["reasoning"] = reasoning_text
+        messages.append(assistant_message)
         if not save_current():
             notice("Session storage error", "The reply is visible but could not be saved.", error=True)
         from sophon import core
@@ -1550,8 +1908,9 @@ def main(args: list[str]) -> int:
     if not config:
         return 1
     try:
+        _ensure_agent_instructions(config)
         _ensure_workspace()
-    except OSError as error:
+    except (OSError, ValueError) as error:
         card("Workspace unavailable", [str(error)], border_color=NOTICE_BORDER, text_color=NOTICE_TEXT)
         return 1
     if one_shot is None:

@@ -30,6 +30,8 @@ Run `xernel setup` to choose OpenRouter or Cloudflare Workers AI and save the co
 - `xernel` or `xernel run` — open the terminal interface
 - `xernel setup` — configure a provider
 - `xernel config` — show saved provider settings
+- `xernel agent` — start an interactive AI chat using the configured provider
+- `xernel agent -p "message"` — send one message and print the response
 - `xernel init` — create a starter project configuration
 - `xernel update` — safely update a source checkout or refresh an installed package
 - `xernel --help` — show command help
@@ -43,7 +45,7 @@ python -m pip install -e .
 xernel
 ```
 
-`src/xernel/VERSION` is the user-facing CLI version in `DD.MM.YYYY - NN` format. Increment `NN` for each release that day, starting at `00`; begin a new date at `00`. `src/xernel/PYPI_VERSION` stores the corresponding PEP 440 package version used by Python installers.
+`src/xernel/VERSION` is the user-facing CLI version in `DD.MM.YYYY` format for a single release that day. If there are multiple releases that day, include the release time as `DD.MM.YYYY - HH:MM`. `src/xernel/PYPI_VERSION` stores the corresponding PEP 440 package version used by Python installers.
 
 ## Website
 

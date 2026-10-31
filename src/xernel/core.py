@@ -139,17 +139,23 @@ def card(
     terminal_width = shutil.get_terminal_size((80, 24)).columns
     inner = min(width or 68, max(20, terminal_width - 8))
     centered_lines = centered_lines or set()
-    if top_right:
-        border_inner = inner + 2
-        badge_width = display_width(top_right)
-        left_border = max(0, border_inner - badge_width - 1)
-        top_border = "  ╭" + "─" * left_border + " " + top_right + "╮"
-    else:
-        top_border = "  ╭" + "─" * (inner + 2) + "╮"
+    top_border = "  ╭" + "─" * (inner + 2) + "╮"
     print(paint(top_border, border_color))
-    content_lines = ([title] if title is not None else []) + lines
+    content_lines = list(lines)
+    if title is not None:
+        title_text = title
+        if top_right:
+            badge = top_right[:inner]
+            title_text = title[: max(0, inner - display_width(badge) - 1)]
+            gap = max(1, inner - display_width(title_text) - display_width(badge))
+            heading = title_text + " " * gap + badge
+            content = " " + heading + " " * (inner - display_width(heading) + 1)
+            print(paint("  │", border_color) + paint(content, text_color) + paint("│", border_color))
+            content_lines.insert(0, "")
+        else:
+            content_lines.insert(0, title)
     for line in content_lines:
-        is_centered = line == title or line in centered_lines
+        is_centered = (line == title and not top_right) or line in centered_lines
         chunks = wrap_text(line, inner)
         for chunk in chunks:
             text = centered(chunk, inner) if is_centered else chunk
@@ -223,7 +229,7 @@ def show_welcome() -> None:
     print()
     card(
         "Xernel",
-        [f"READY    v{VERSION}", "", "A minimal development environment.", "Build. Think. Execute."],
+        ["A minimal development environment.", "Build. Think. Execute.", "", f"READY    v{VERSION}"],
         centered_lines={"Xernel"},
     )
     print()
@@ -371,8 +377,8 @@ def run_session() -> int:
             elif command == "/setup":
                 from xernel.setup_wizard import run_setup_wizard
 
-                run_setup_wizard()
-                show_welcome()
+                if run_setup_wizard() == 0:
+                    show_welcome()
             elif command == "/config":
                 show_config()
             elif command == "/version":
@@ -433,13 +439,14 @@ def show_config() -> int:
 
 def print_help() -> None:
     print(
-        "Usage: xernel [run|update|init|setup|config|--version|--help]\n\n"
+        "Usage: xernel [run|update|init|setup|config|agent|--version|--help]\n\n"
         "Commands:\n"
         "  run       Start the Xernel terminal interface\n"
         "  update    Safely fetch the latest version\n"
         "  init      Create a starter configuration\n"
         "  setup     Configure an AI provider\n"
         "  config    Show saved provider settings\n"
+        "  agent     Start an AI chat session (agent -p MESSAGE for one-shot)\n"
         "  --version Show the current version\n"
         "  --help    Show this help"
     )
@@ -463,6 +470,10 @@ def main() -> int:
         return run_setup_wizard()
     if args == ["config"]:
         return show_config()
+    if args and args[0] == "agent":
+        from xernel.agent import main as agent_main
+
+        return agent_main(args[1:])
     if not args or args == ["run"]:
         return run_session()
     print(f"Unknown command: {' '.join(args)}", file=sys.stderr)

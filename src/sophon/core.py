@@ -11,12 +11,21 @@ import select
 import shutil
 import subprocess
 import sys
+import threading
+import time
 import unicodedata
 from pathlib import Path
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
-from sophon.config import PROVIDERS, config_display_path, config_path, read_config, write_config
+from sophon.config import (
+    PROVIDERS,
+    config_display_path,
+    config_path,
+    ensure_environment_config,
+    read_config,
+    write_config,
+)
 from sophon import __version__ as VERSION
 
 RESET = "\033[0m"
@@ -380,7 +389,7 @@ def auto_compression_settings(data: dict[str, object] | None = None) -> tuple[bo
     if not isinstance(enabled, bool):
         enabled = True
     threshold = data.get("auto_compression_threshold")
-    if not isinstance(threshold, int) or isinstance(threshold, bool) or not 50 <= threshold <= 95:
+    if not isinstance(threshold, int) or isinstance(threshold, bool) or not 30 <= threshold <= 95:
         threshold = 80
     return enabled, threshold
 
@@ -468,9 +477,14 @@ def update(*, quiet: bool = False, restart_after: bool = True, known_version: st
 
     def finish_update(version: str) -> None:
         global RESTART_REQUESTED
-        show(["Update complete", f"sophon {version}", "Restarting Sophon"], final=True)
         if restart_after:
+            if not quiet:
+                for remaining in (3, 2, 1):
+                    show(["Update complete", f"sophon {version}", f"Restarting Sophon in {remaining}…"], final=True)
+                    time.sleep(0.65)
             restart_sophon()
+        else:
+            show(["Update complete", f"sophon {version}", "Restart when ready"], final=True)
         RESTART_REQUESTED = True
 
     repo = Path(__file__).resolve().parents[2]
@@ -543,14 +557,33 @@ def update(*, quiet: bool = False, restart_after: bool = True, known_version: st
 def auto_update_on_start() -> None:
     if not auto_update_enabled():
         return
-    remote_version = latest_version(timeout=4)
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        result: list[str | None] = []
+        worker = threading.Thread(target=lambda: result.append(latest_version(timeout=4)), daemon=True)
+        update_card(["Sophon is ready", "Checking for updates ·", "Restart only if an update is found"], initial=True)
+        worker.start()
+        frame = 0
+        while worker.is_alive():
+            dots = "." * (frame % 3 + 1)
+            update_card(["Sophon is ready", f"Checking for updates{dots}", "Restart only if an update is found"])
+            time.sleep(0.2)
+            frame += 1
+        worker.join()
+        remote_version = result[0] if result else None
+    else:
+        remote_version = latest_version(timeout=4)
     if remote_version and remote_version != VERSION:
         update(known_version=remote_version, restart_after=True)
 
 
 def run_session() -> int:
     clear_terminal()
-    show_welcome(check_updates=True)
+    show_welcome(check_updates=False)
+    if auto_update_enabled():
+        auto_update_on_start()
+        if not RESTART_REQUESTED:
+            clear_terminal()
+            show_welcome()
     while True:
         try:
             value = read_prompt(paint("  › ", GREEN)).strip()
@@ -629,13 +662,21 @@ def show_config() -> int:
         card(None, ["Configuration is invalid or unreadable.", f"Path: {config_display_path()}"])
         return 1
     if data is None:
-        card(None, ["No provider is configured.", "Run sophon setup to connect one."])
+        environment = "unknown"
+        try:
+            preferences = json.loads(config_path().read_text(encoding="utf-8"))
+            if isinstance(preferences, dict) and isinstance(preferences.get("Environment"), str):
+                environment = preferences["Environment"]
+        except (OSError, ValueError):
+            pass
+        card(None, ["No provider is configured.", f"Environment: {environment}", "Run sophon setup to connect one."])
         return 0
 
     provider = data["provider"]
     lines = [
         f"Provider: {PROVIDERS[provider]['label']}",
         f"Model: {data['model']}",
+        f"Environment: {data.get('Environment', 'unknown')}",
         "API key: hidden",
         f"Auto-update: {'on' if data.get('auto_update') is True else 'off'}",
     ]
@@ -787,7 +828,8 @@ def print_help() -> None:
     card(
         "sophon --help",
         [
-            "Usage: sophon [COMMAND] [OPTIONS]",
+            "Usage: sophon [run|update|init|setup|config|doctor|agent]",
+            "Flags: --version, --help",
             "",
             "Commands:",
             "run — Start terminal UI",
@@ -798,7 +840,7 @@ def print_help() -> None:
             "doctor — Check system health",
             "agent — Chat (-m MESSAGE, -t TASK)",
             "agent -p SYSTEM_PROMPT -m MESSAGE — Custom system prompt",
-            "--version — Show installed version",
+            "-v, --version — Show installed version",
             "--help — Show this help",
         ],
     )
@@ -812,8 +854,10 @@ def main() -> int:
     if args in (["--help"], ["-h"]):
         print_help()
         return 0
-    if args != ["update"] and auto_update_enabled():
-        auto_update_on_start()
+    try:
+        ensure_environment_config()
+    except (OSError, ValueError):
+        pass
     if args == ["update"]:
         return update()
     if args == ["init"]:

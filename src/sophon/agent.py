@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Callable, Iterator
@@ -50,6 +51,55 @@ WORKSPACE_ROOT = Path.home() / ".sophon" / "workspace"
 PROJECT_DIR = WORKSPACE_ROOT / "my-project"
 INPUT_PLACEHOLDER = "Create something with sophon"
 ANIMATION_TICK = 0.075
+AGENT_MODES = {"chat", "plan", "build"}
+PLAN_BUILTIN_TOOLS = {"get_version", "is_update", "system_health", "workspace_list", "session_list", "get_time", "get_date"}
+SLASH_COMMANDS = (
+    "/auto-compression", "/changelog", "/clear", "/compact", "/cwd", "/delete",
+    "/exit", "/fork", "/help", "/mode", "/model", "/new", "/reasoning",
+    "/reasoning-effort", "/rename", "/resume", "/sessions", "/threshold",
+)
+
+
+class AgentInterrupted(RuntimeError):
+    """Raised when the user explicitly cancels an active model request."""
+
+
+class RequestCancellation:
+    def __init__(self) -> None:
+        self.event = threading.Event()
+        self._lock = threading.Lock()
+        self._response = None
+
+    @property
+    def cancelled(self) -> bool:
+        return self.event.is_set()
+
+    def check(self) -> None:
+        if self.cancelled:
+            raise AgentInterrupted("Response interrupted by user.")
+
+    def attach(self, response) -> None:
+        with self._lock:
+            self._response = response
+            cancelled = self.cancelled
+        if cancelled:
+            response.close()
+            self.check()
+
+    def detach(self, response) -> None:
+        with self._lock:
+            if self._response is response:
+                self._response = None
+
+    def cancel(self) -> None:
+        self.event.set()
+        with self._lock:
+            response = self._response
+        if response is not None:
+            try:
+                response.close()
+            except OSError:
+                pass
 
 SYSTEM_PROMPT = (
     "You are Sophon, a concise and practical development assistant. "
@@ -237,6 +287,7 @@ def _ensure_agent_instructions(config: dict[str, object]) -> Path:
 def _system_message(
     config: dict[str, object] | None = None,
     custom_system_prompt: str | None = None,
+    mode: str = "chat",
 ) -> str:
     instructions_path = _instructions_file(config)
     try:
@@ -249,6 +300,13 @@ def _system_message(
     except OSError:
         workspace_guidance = "Create one top-level folder per project and keep project files inside it."
     system_prompt = SYSTEM_PROMPT
+    mode_instruction = {
+        "chat": "Mode: Chat. Focus on general conversation and advice. Do not change project files unless the user clearly asks for implementation.",
+        "plan": "Mode: Plan. Inspect and reason read-only, then present a concise implementation plan and ask for approval. Do not modify files or run mutating tools. The user can approve implementation with /mode build.",
+        "build": "Mode: Build. Implement the user's requested changes directly, use available workspace tools, and verify the result.",
+    }.get(mode, "")
+    if mode_instruction:
+        system_prompt += "\n\n" + mode_instruction
     if custom_system_prompt and custom_system_prompt.strip():
         system_prompt += "\n\nUser-provided system prompt:\n" + custom_system_prompt.strip()
     return (
@@ -257,6 +315,20 @@ def _system_message(
         f"Active project directory: {PROJECT_DIR}\n"
         f"Workspace guidance (WORKSPACE.md):\n{workspace_guidance}"
     )
+
+
+def _tools_for_mode(mode: str) -> list[dict[str, object]]:
+    if mode != "plan":
+        return [*BUILTIN_TOOLS, *WORKSPACE_TOOLS]
+    builtins = [
+        tool for tool in BUILTIN_TOOLS
+        if tool["function"]["name"] in PLAN_BUILTIN_TOOLS
+    ]
+    workspace = [
+        tool for tool in WORKSPACE_TOOLS
+        if tool["function"]["name"] in {"list_files", "read_file"}
+    ]
+    return [*builtins, *workspace]
 
 
 def _event_data(response) -> Iterator[str]:
@@ -484,6 +556,8 @@ def _request(
     *,
     tools_enabled: bool = True,
     on_reasoning: Callable[[str], None] | None = None,
+    mode: str = "chat",
+    cancellation: RequestCancellation | None = None,
 ) -> str:
     provider = str(config["provider"])
     payload: dict[str, object] = {"messages": messages}
@@ -500,7 +574,7 @@ def _request(
         else:
             payload["reasoning"] = {"effort": reasoning["effort"]}
     if tools_enabled:
-        all_tools = [*BUILTIN_TOOLS, *WORKSPACE_TOOLS]
+        all_tools = _tools_for_mode(mode)
         payload["tools"] = all_tools if provider == "openrouter" else [
             tool["function"] for tool in all_tools
         ]
@@ -560,26 +634,38 @@ def _request(
             on_reasoning(reasoning_text)
 
     try:
+        if cancellation is not None:
+            cancellation.check()
         with urlopen(request, timeout=120) as response:
-            content_type = response.headers.get("Content-Type", "").casefold()
-            if "text/event-stream" not in content_type:
-                result = json.loads(response.read().decode("utf-8"))
-                collect_tool_calls(result)
-                append_reasoning(_response_reasoning(result, provider))
-                append_content(_response_content(result, provider))
-            else:
-                for data in _event_data(response):
-                    if data != "[DONE]":
-                        try:
-                            result = json.loads(data)
-                        except json.JSONDecodeError:
-                            continue
-                        collect_tool_calls(result)
-                        append_reasoning(_response_reasoning(result, provider))
-                        append_content(_response_content(result, provider))
-                    else:
-                        break
+            if cancellation is not None:
+                cancellation.attach(response)
+            try:
+                content_type = response.headers.get("Content-Type", "").casefold()
+                if "text/event-stream" not in content_type:
+                    result = json.loads(response.read().decode("utf-8"))
+                    collect_tool_calls(result)
+                    append_reasoning(_response_reasoning(result, provider))
+                    append_content(_response_content(result, provider))
+                else:
+                    for data in _event_data(response):
+                        if cancellation is not None:
+                            cancellation.check()
+                        if data != "[DONE]":
+                            try:
+                                result = json.loads(data)
+                            except json.JSONDecodeError:
+                                continue
+                            collect_tool_calls(result)
+                            append_reasoning(_response_reasoning(result, provider))
+                            append_content(_response_content(result, provider))
+                        else:
+                            break
+            finally:
+                if cancellation is not None:
+                    cancellation.detach(response)
     except HTTPError as error:
+        if cancellation is not None and cancellation.cancelled:
+            raise AgentInterrupted("Response interrupted by user.") from None
         detail = error.read(2048).decode("utf-8", errors="replace").strip()
         if tools_enabled and ("tool" in detail.casefold() or "function" in detail.casefold()):
             return _request(
@@ -589,9 +675,13 @@ def _request(
                 tool_calls_out=tool_calls_out,
                 tools_enabled=False,
                 on_reasoning=on_reasoning,
+                mode=mode,
+                cancellation=cancellation,
             )
         raise RuntimeError(f"Provider returned HTTP {error.code}: {detail or error.reason}") from None
-    except (OSError, TimeoutError, URLError, UnicodeError, json.JSONDecodeError) as error:
+    except (OSError, TimeoutError, URLError, UnicodeError, json.JSONDecodeError, ValueError) as error:
+        if cancellation is not None and cancellation.cancelled:
+            raise AgentInterrupted("Response interrupted by user.") from None
         raise RuntimeError(f"Could not reach the configured provider: {error}") from None
     if tool_calls_out is not None:
         if provider == "openrouter":
@@ -643,9 +733,11 @@ def _complete_turn(
     on_chunk: Callable[[str], None] | None = None,
     on_reasoning: Callable[[str], None] | None = None,
     custom_system_prompt: str | None = None,
+    mode: str = "chat",
+    cancellation: RequestCancellation | None = None,
 ) -> str:
     messages: list[dict[str, object]] = [
-        {"role": "system", "content": _system_message(config, custom_system_prompt)},
+        {"role": "system", "content": _system_message(config, custom_system_prompt, mode)},
         *(
             {"role": message["role"], "content": message["content"]}
             for message in history
@@ -653,6 +745,8 @@ def _complete_turn(
         ),
     ]
     for _ in range(8):
+        if cancellation is not None:
+            cancellation.check()
         tool_calls: list[dict[str, object]] = []
         answer = _request(
             config,
@@ -660,16 +754,22 @@ def _complete_turn(
             on_chunk=on_chunk,
             tool_calls_out=tool_calls,
             on_reasoning=on_reasoning,
+            mode=mode,
+            cancellation=cancellation,
         )
         if not tool_calls:
             return answer
         messages.append({"role": "assistant", "content": answer or None, "tool_calls": tool_calls})
         for call in tool_calls:
+            if cancellation is not None:
+                cancellation.check()
             function = call.get("function")
             if not isinstance(function, dict):
                 continue
             name = str(function.get("name", ""))
             try:
+                if mode == "plan" and name not in PLAN_BUILTIN_TOOLS | {"list_files", "read_file"}:
+                    raise RuntimeError("This tool is disabled in plan mode; switch to /mode build after approval.")
                 if name in {tool["function"]["name"] for tool in BUILTIN_TOOLS}:
                     result = _execute_builtin_tool(name, function.get("arguments", "{}"))
                 else:
@@ -696,6 +796,7 @@ def _ask(
     on_chunk: Callable[[str], None] | None = None,
     on_reasoning: Callable[[str], None] | None = None,
     custom_system_prompt: str | None = None,
+    mode: str = "chat",
 ) -> str:
     messages = [*history, {"role": "user", "content": prompt}]
     answer = _complete_turn(
@@ -704,6 +805,7 @@ def _ask(
         on_chunk=on_chunk,
         on_reasoning=on_reasoning,
         custom_system_prompt=custom_system_prompt,
+        mode=mode,
     )
     history.extend([{"role": "user", "content": prompt}, {"role": "assistant", "content": answer}])
     return answer
@@ -715,7 +817,14 @@ def _timestamp() -> str:
 
 def _new_session() -> dict[str, object]:
     now = _timestamp()
-    return {"id": uuid.uuid4().hex[:10], "title": "New session", "created_at": now, "updated_at": now, "messages": []}
+    return {
+        "id": uuid.uuid4().hex[:10],
+        "title": "New session",
+        "created_at": now,
+        "updated_at": now,
+        "mode": "chat",
+        "messages": [],
+    }
 
 
 def _fork_session(source: dict[str, object]) -> dict[str, object]:
@@ -726,6 +835,7 @@ def _fork_session(source: dict[str, object]) -> dict[str, object]:
         "title": f"Fork of {title}"[:80],
         "created_at": now,
         "updated_at": now,
+        "mode": "chat",
         "messages": [dict(message) for message in source.get("messages", [])],
     }
 
@@ -733,8 +843,7 @@ def _fork_session(source: dict[str, object]) -> dict[str, object]:
 def _workspace_location(command: str) -> tuple[str, str, bool]:
     if command == "cwd":
         return "Current directory", display_home_paths(Path.cwd().resolve()), False
-    workspace = PROJECT_DIR.resolve()
-    return "Project workspace", display_home_paths(workspace), False
+    return "Unknown Agent command", "Use /cwd to show the current directory.", True
 
 
 def _load_sessions() -> list[dict[str, object]]:
@@ -765,6 +874,9 @@ def _load_sessions() -> list[dict[str, object]]:
             for message in messages
         ):
             raise RuntimeError("Saved sessions file contains an invalid message.")
+        item.setdefault("mode", "chat")
+        if item.get("mode") not in AGENT_MODES:
+            item["mode"] = "chat"
         sessions.append(item)
     sessions.sort(key=lambda item: str(item.get("updated_at", "")), reverse=True)
     if source == LEGACY_SESSION_FILE:
@@ -1031,16 +1143,16 @@ def _message_rows(messages: list[dict[str, object]], columns: int) -> list[str]:
             else:
                 reasoning_text = message.get("reasoning")
                 if isinstance(reasoning_text, str) and reasoning_text.strip():
-                    rows.extend(_reasoning_rows(reasoning_text, columns))
+                    rows.extend(_reasoning_rows(reasoning_text, columns, connect_to_answer=True))
                 rows.extend(_agent_rows(content, columns))
         else:
             rows.extend(
                 _card_rows(
-                    "Agent request failed",
+                    "Response interrupted" if message.get("cancelled") is True else "Agent request failed",
                     [content],
                     columns=columns,
-                    border_color=NOTICE_BORDER,
-                    text_color=NOTICE_TEXT,
+                    border_color=MUTED if message.get("cancelled") is True else NOTICE_BORDER,
+                    text_color=MUTED if message.get("cancelled") is True else NOTICE_TEXT,
                 )
             )
         rows.append("")
@@ -1068,6 +1180,13 @@ def _editor_layout(
     if not empty and cursor == len(text) and not completion:
         cursor_row, cursor_col = len(lines) - 1, display_width(lines[-1])
     return lines, cursor_row, cursor_col
+
+
+def _slash_command_completion(text: str, cursor: int) -> str:
+    if not text.startswith("/") or cursor != len(text) or any(char.isspace() for char in text):
+        return ""
+    candidate = next((command for command in SLASH_COMMANDS if command.startswith(text) and command != text), None)
+    return candidate[len(text):] if candidate else ""
 
 
 def _input_box_rows(lines: list[str], width: int, *, placeholder: bool, text_length: int = 0) -> list[str]:
@@ -1098,6 +1217,20 @@ def _input_box_rows(lines: list[str], width: int, *, placeholder: bool, text_len
     return rows
 
 
+def _interrupt_warning_rows(columns: int) -> list[str]:
+    message = "! İptal etmek için bir kez daha basın"
+    width = min(68, max(20, columns - 8))
+    content = " " + message + " "
+    if display_width(content) > width:
+        content = " ! Press Esc again to cancel "
+    padding = " " * max(0, width - display_width(content))
+    return [
+        paint("  ╭" + "─" * (width + 2) + "╮", NOTICE_BORDER),
+        paint("  │", NOTICE_BORDER) + paint(content + padding, NOTICE_TEXT) + paint("│", NOTICE_BORDER),
+        paint("  ╰" + "─" * (width + 2) + "╯", NOTICE_BORDER),
+    ]
+
+
 def _draw_screen(
     session: dict[str, object],
     text: str,
@@ -1113,6 +1246,10 @@ def _draw_screen(
     streaming_text: str = "",
     reasoning_text: str = "",
     context_window: int | None = None,
+    mode: str = "chat",
+    reasoning_state: str = "off",
+    display_message_start: int = 0,
+    interrupt_warning: bool = False,
 ) -> tuple[int, int]:
     size = shutil.get_terminal_size((80, 24))
     columns, height = size.columns, max(8, size.lines)
@@ -1122,7 +1259,15 @@ def _draw_screen(
         ["Ask about code, debugging, and development."],
         columns=columns,
     )
-    footer = _footer_rows(model, session["messages"], context_window, columns)
+    footer = _footer_rows(
+        model,
+        session["messages"],
+        context_window,
+        columns,
+        mode=mode,
+        reasoning=reasoning_state,
+    )
+    visible_messages = session["messages"][max(0, display_message_start):]
     editor_lines, cursor_row, cursor_col = _editor_layout(text, cursor, width, placeholder, suggestion)
     max_editor_lines = max(1, min(5, height - len(header) - len(footer) - 3))
     visible_start = max(0, min(cursor_row, len(editor_lines) - max_editor_lines))
@@ -1132,23 +1277,31 @@ def _draw_screen(
     if panel_rows is not None:
         feed = panel_rows
     else:
-        feed = list(notice_rows or []) + _message_rows(session["messages"], columns)
+        feed = list(notice_rows or []) + _message_rows(visible_messages, columns)
         if answering and reasoning_text.strip():
-            feed.extend(_reasoning_rows(reasoning_text, columns, frame=animation_frame))
+            feed.extend(_reasoning_rows(
+                reasoning_text,
+                columns,
+                frame=None if streaming_text.strip() else animation_frame,
+                connect_to_answer=bool(streaming_text.strip()),
+            ))
         elif answering and not streaming_text.strip():
-            feed.extend(_answering_rows(animation_frame))
+            label = "Reasoning" if reasoning_state not in {"off", "not supported"} else "Answering"
+            feed.extend(_answering_rows(animation_frame, label))
         if streaming_text:
+            feed.extend(_answering_rows(animation_frame, "Answering"))
             feed.extend(_agent_rows(streaming_text, columns))
-    room = max(0, height - len(header) - len(box) - len(footer))
+    warning_rows = _interrupt_warning_rows(columns) if interrupt_warning else []
+    room = max(0, height - len(header) - len(box) - len(footer) - len(warning_rows))
     visible_feed = feed[-room:] if room else []
     if panel_rows is not None and room >= 2 and len(panel_rows) > room:
         visible_feed = [panel_rows[0], *panel_rows[1 : room - 1], panel_rows[-1]]
-    screen = header + visible_feed + [""] * max(0, room - len(visible_feed)) + box + footer
+    screen = header + visible_feed + [""] * max(0, room - len(visible_feed)) + warning_rows + box + footer
     screen = screen[-height:]
     if len(screen) < height:
         screen = [""] * (height - len(screen)) + screen
     output = "\033[2J\033[H" + "\r\n".join(screen)
-    absolute_row = height - len(box) - len(footer) + 1 + cursor_row - visible_start
+    absolute_row = height - len(box) - len(footer) - len(warning_rows) + 1 + cursor_row - visible_start
     absolute_col = 4 + cursor_col
     output += f"\033[{max(1, absolute_row + 1)};{max(1, absolute_col + 1)}H"
     sys.stdout.write(output)
@@ -1156,8 +1309,45 @@ def _draw_screen(
     return cursor_row, cursor_col
 
 
-def _read_key(timeout: float | None = None) -> str:
+def _read_key_raw(timeout: float | None = None) -> str:
     import select
+
+    fd = sys.stdin.fileno()
+    if timeout is not None and not select.select([fd], [], [], timeout)[0]:
+        return "TIMEOUT"
+    first = os.read(fd, 1)
+    if first in {b"\r", b"\n"}:
+        return "ENTER"
+    if first == b"\x03":
+        return "CANCEL"
+    if first in {b"\x08", b"\x7f"}:
+        return "BACKSPACE"
+    if first == b"\x1b":
+        if not select.select([fd], [], [], 0.08)[0]:
+            return "CANCEL"
+        sequence = bytearray()
+        while select.select([fd], [], [], 0.08)[0]:
+            sequence.extend(os.read(fd, 1))
+            if len(sequence) >= 2 and 0x40 <= sequence[-1] <= 0x7E:
+                break
+        if sequence == b"\x1b":
+            return "DOUBLE_CANCEL"
+        return {b"A": "UP", b"B": "DOWN", b"C": "RIGHT", b"D": "LEFT"}.get(bytes(sequence[-1:]), "OTHER")
+    first_byte = first[0]
+    expected_bytes = 1 if first_byte < 0x80 else 2 if first_byte < 0xE0 else 3 if first_byte < 0xF0 else 4
+    encoded = bytearray(first)
+    for _ in range(expected_bytes - 1):
+        if not select.select([fd], [], [], 0.05)[0]:
+            break
+        encoded.extend(os.read(fd, 1))
+    try:
+        character = encoded.decode("utf-8")
+    except UnicodeDecodeError:
+        return "OTHER"
+    return f"CHAR:{character}" if character.isprintable() else "OTHER"
+
+
+def _read_key(timeout: float | None = None) -> str:
     import termios
     import tty
 
@@ -1165,36 +1355,35 @@ def _read_key(timeout: float | None = None) -> str:
     previous = termios.tcgetattr(fd)
     try:
         tty.setraw(fd)
-        if timeout is not None and not select.select([fd], [], [], timeout)[0]:
-            return "TIMEOUT"
-        first = os.read(fd, 1)
-        if first in {b"\r", b"\n"}:
-            return "ENTER"
-        if first == b"\x03":
-            return "CANCEL"
-        if first in {b"\x08", b"\x7f"}:
-            return "BACKSPACE"
-        if first == b"\x1b":
-            if not select.select([fd], [], [], 0.08)[0]:
-                return "CANCEL"
-            sequence = bytearray()
-            while select.select([fd], [], [], 0.08)[0]:
-                sequence.extend(os.read(fd, 1))
-                if len(sequence) >= 2 and 0x40 <= sequence[-1] <= 0x7E:
-                    break
-            return {b"A": "UP", b"B": "DOWN", b"C": "RIGHT", b"D": "LEFT"}.get(bytes(sequence[-1:]), "OTHER")
-        try:
-            character = first.decode("utf-8")
-        except UnicodeDecodeError:
-            return "OTHER"
-        return f"CHAR:{character}" if character.isprintable() else "OTHER"
+        return _read_key_raw(timeout)
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, previous)
 
 
-def _input_bar(draw, placeholder: str = INPUT_PLACEHOLDER) -> str:
+def _input_key_reader(events: queue.Queue[str], stop_event: threading.Event) -> None:
+    """Read typeahead in raw mode for a complete response, without terminal echo."""
+    if not sys.stdin.isatty():
+        return
+    import termios
+    import tty
+
+    fd = sys.stdin.fileno()
+    previous = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        while not stop_event.is_set():
+            key = _read_key_raw(timeout=0.1)
+            if key != "TIMEOUT":
+                events.put(key)
+    except OSError:
+        pass
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, previous)
+
+
+def _input_bar(draw, placeholder: str = INPUT_PLACEHOLDER, *, prefill: str = "") -> str:
     if not sys.stdin.isatty() or not sys.stdout.isatty():
-        return input(f"› {placeholder}: ").strip()
+        return input(f"› {placeholder}: {prefill}").strip()
 
     import select
     import termios
@@ -1203,13 +1392,13 @@ def _input_bar(draw, placeholder: str = INPUT_PLACEHOLDER) -> str:
     fd = sys.stdin.fileno()
     previous = termios.tcgetattr(fd)
     decoder = codecs.getincrementaldecoder(sys.stdin.encoding or "utf-8")()
-    characters: list[str] = []
-    cursor = 0
+    characters: list[str] = list(prefill)
+    cursor = len(characters)
     last_size = shutil.get_terminal_size((80, 24))
 
     def redraw() -> None:
         text = "".join(characters)
-        draw(text, cursor, placeholder=placeholder)
+        draw(text, cursor, placeholder=placeholder, suggestion=_slash_command_completion(text, cursor))
 
     try:
         tty.setraw(fd)
@@ -1243,7 +1432,9 @@ def _input_bar(draw, placeholder: str = INPUT_PLACEHOLDER) -> str:
                 redraw()
                 continue
             if raw in {b"\r", b"\n"}:
-                return "".join(characters).strip()
+                text = "".join(characters)
+                completion = _slash_command_completion(text, cursor)
+                return (text + completion).strip()
             if raw == b"\x03":
                 raise KeyboardInterrupt
             if raw in {b"\x08", b"\x7f"}:
@@ -1255,6 +1446,13 @@ def _input_bar(draw, placeholder: str = INPUT_PLACEHOLDER) -> str:
             if raw == b"\x04":
                 if cursor < len(characters):
                     characters.pop(cursor)
+                    redraw()
+                continue
+            if raw == b"\t":
+                completion = _slash_command_completion("".join(characters), cursor)
+                if completion:
+                    characters[cursor:cursor] = list(completion)
+                    cursor += len(completion)
                     redraw()
                 continue
             character = decoder.decode(raw)
@@ -1462,6 +1660,9 @@ def _footer_rows(
     messages: list[dict[str, object]],
     context_window: int | None,
     columns: int,
+    *,
+    mode: str = "chat",
+    reasoning: str = "off",
 ) -> list[str]:
     inner = min(68, max(20, columns - 8))
     context = "—"
@@ -1469,58 +1670,59 @@ def _footer_rows(
         percent = min(100, round(_estimated_context_tokens(messages) * 100 / context_window))
         context = f"~{percent}%"
     context_label = f"Context: {context}"
-    separators = " · "
-    model_prefix, dir_prefix = "Model: ", "Directory: "
-    model_width = max(1, inner - display_width(model_prefix + context_label + separators * 2 + dir_prefix))
-    model_width = min(model_width, max(8, (inner - display_width(context_label) - 11) * 2 // 3))
-    dir_width = max(1, inner - display_width(model_prefix) - model_width - display_width(context_label) - display_width(dir_prefix) - 6)
-    model_text = model_prefix + _truncate_display(model, model_width)
     try:
         directory = "~/" + PROJECT_DIR.relative_to(Path.home()).as_posix()
     except ValueError:
         directory = display_home_paths(PROJECT_DIR)
-    first = f"{model_text}{separators}{dir_prefix}{_tail_truncate(directory, dir_width)}{separators}{context_label}"
-    second = f"Project workspace · {directory}"
-    # Keep the current path readable while preserving the compact footer at normal widths.
-    if inner >= 56:
-        body = [first, _truncate_display(second, inner)]
-    else:
-        body = [
-            _truncate_display(model_prefix + model, inner),
-            _truncate_display("Directory: " + directory, inner),
-            _truncate_display(context_label, inner),
-        ]
+    body = [
+        _truncate_display("Model: " + model, inner),
+        _truncate_display("Reasoning: " + reasoning, inner),
+        _truncate_display(f"Mode: {mode} · {context_label}", inner),
+        _truncate_display("Directory: " + directory, inner),
+    ]
     return _card_rows(
         None,
         body,
         columns=columns,
         width=inner,
         text_color=MUTED,
-        highlight_terms=("Model:", "Directory:", "Context:"),
+        highlight_terms=("Model:", "Reasoning:", "Mode:", "Directory:", "Context:"),
     )
 
 
 def _answering_rows(frame: int, label: str = "Answering") -> list[str]:
-    center = frame % (len(label) + 6) - 3
+    center = (frame // 2) % (len(label) + 6) - 3
     shimmer = ""
     for index, character in enumerate(label):
         distance = abs(index - center)
         brightness = max(0.0, 1.0 - distance / 2.0)
         color = 240 + round(15 * brightness**2)
         shimmer += paint(character, f"\033[38;5;{color}m")
-    dot_color = WHITE if (frame // 6) % 2 == 0 else MUTED
+    pulse = (238, 241, 244, 247, 250, 253, 255, 253, 250, 247, 244, 241)
+    dot_color = f"\033[38;5;{pulse[(frame // 6) % len(pulse)]}m"
     return ["  " + paint("•", dot_color) + " " + shimmer]
 
 
-def _reasoning_rows(text: str, columns: int, *, frame: int | None = None) -> list[str]:
+def _reasoning_rows(
+    text: str,
+    columns: int,
+    *,
+    frame: int | None = None,
+    connect_to_answer: bool = False,
+) -> list[str]:
     text = display_home_paths(text)
     rows = _answering_rows(frame, "Reasoning") if frame is not None else [paint("  • Reasoning", MUTED)]
     width = max(20, columns - 8)
     for paragraph in text.splitlines() or [text]:
         if not paragraph:
-            rows.append(paint("    ", MUTED))
+            rows.append(paint("  │", MUTED))
             continue
-        rows.extend(paint("    " + line, MUTED) for line in wrap_text(paragraph, max(1, width - 4)))
+        rows.extend(
+            paint("  │  ", MUTED) + paint(line, MUTED)
+            for line in wrap_text(paragraph, max(1, width - 6))
+        )
+    if connect_to_answer:
+        rows.append(paint("  │", MUTED))
     return rows
 
 
@@ -1659,6 +1861,29 @@ def _session_item(session: dict[str, object]) -> dict[str, object]:
     }
 
 
+def _sessions_panel_rows(
+    sessions: list[dict[str, object]],
+    fallback_context_window: int | None,
+) -> list[str]:
+    if not sessions:
+        return ["No saved sessions."]
+    rows: list[str] = []
+    for item in sorted(sessions, key=lambda value: str(value.get("title", "")).casefold()):
+        messages = item.get("messages", [])
+        messages = messages if isinstance(messages, list) else []
+        window = item.get("context_window")
+        if not isinstance(window, int) or window < 1:
+            window = fallback_context_window
+        if isinstance(window, int) and window > 0:
+            context = f"~{_context_percentage(messages, window)}% of {window:,}"
+        else:
+            context = "unknown"
+        updated = str(item.get("updated_at") or item.get("created_at") or "")[:10] or "unknown date"
+        title = " ".join(str(item.get("title") or "Untitled").split())
+        rows.append(f"{title} — Context {context} — {updated}")
+    return rows
+
+
 def _interactive(config: dict[str, object]) -> int:
     try:
         sessions = _load_sessions()
@@ -1667,6 +1892,9 @@ def _interactive(config: dict[str, object]) -> int:
         return 1
     session = _new_session()
     notice_rows: list[str] = []
+    display_message_start = 0
+    pending_prompts: list[str] = []
+    prefill_characters: list[str] = []
     context_window = config.get("context_window")
     context_state: dict[str, object] = {
         "model": str(config["model"]),
@@ -1689,6 +1917,13 @@ def _interactive(config: dict[str, object]) -> int:
         panel_rows: list[str] | None = None,
         suggestion: str = "",
     ) -> None:
+        reasoning_preferences = _reasoning_settings(config)
+        if not reasoning_preferences["is_support"]:
+            reasoning_state = "not supported"
+        elif reasoning_preferences["enabled"]:
+            reasoning_state = str(reasoning_preferences["effort"])
+        else:
+            reasoning_state = "off"
         _draw_screen(
             session,
             text,
@@ -1703,6 +1938,10 @@ def _interactive(config: dict[str, object]) -> int:
             streaming_text=str(answering["text"]),
             reasoning_text=str(answering["reasoning"]),
             context_window=context_state["window"] if isinstance(context_state["window"], int) else None,
+            mode=str(session.get("mode", "chat")),
+            reasoning_state=reasoning_state,
+            display_message_start=display_message_start,
+            interrupt_warning=bool(answering.get("interrupt_warning")),
         )
 
     def notice(title: str, message: str, *, error: bool = False) -> None:
@@ -1724,8 +1963,17 @@ def _interactive(config: dict[str, object]) -> int:
             width=display_width(message),
         )
 
+    def close_with_card() -> None:
+        sys.stdout.write("\033[2J\033[H")
+        sys.stdout.flush()
+        card(None, ["Session closed. See you soon."])
+
     def save_current() -> bool:
         try:
+            session["model"] = str(config["model"])
+            window = context_state.get("window")
+            if isinstance(window, int) and window > 0:
+                session["context_window"] = window
             _save_session(sessions, session)
             return True
         except OSError as error:
@@ -1760,6 +2008,7 @@ def _interactive(config: dict[str, object]) -> int:
         return window if isinstance(window, int) and window > 0 else None
 
     def maybe_auto_compress() -> None:
+        nonlocal display_message_start
         enabled, threshold = auto_compression_settings(config)
         messages = session["messages"]
         if len(messages) < 2 or not enabled:
@@ -1776,21 +2025,26 @@ def _interactive(config: dict[str, object]) -> int:
             notice("Auto-compression failed", str(error), error=True)
             return
         messages[:] = compressed
+        display_message_start = min(display_message_start, len(messages))
         if save_current():
             after = _context_percentage(messages, window)
             notice_plain(f"Context auto-compressed · ~{before}% to ~{after}%")
 
     while True:
         try:
-            prompt = _input_bar(draw)
+            if pending_prompts:
+                prompt = pending_prompts.pop(0)
+            else:
+                prompt = _input_bar(draw, prefill="".join(prefill_characters))
+                prefill_characters.clear()
         except (EOFError, KeyboardInterrupt):
-            sys.stdout.write("\033[2J\033[H" + paint("Session closed. See you soon.", MUTED) + "\r\n")
+            close_with_card()
             return 0
         if not prompt:
             notice_rows = []
             continue
         if prompt.casefold() == "q":
-            sys.stdout.write("\033[2J\033[H" + paint("Session closed. See you soon.", MUTED) + "\r\n")
+            close_with_card()
             return 0
         if prompt.startswith("/"):
             command, _, argument = prompt[1:].partition(" ")
@@ -1798,28 +2052,30 @@ def _interactive(config: dict[str, object]) -> int:
             argument = argument.strip()
             notice_rows = []
             if command in {"exit", "quit"}:
-                sys.stdout.write("\033[2J\033[H" + paint("Session closed. See you soon.", MUTED) + "\r\n")
+                close_with_card()
                 return 0
             if command == "help":
                 notice_rows = _card_rows(
-                    "Sophon Commands",
+                    "Agent Commands",
                     [
-                        "/model [search]  Choose a model",
-                        "/new  Start a new session",
-                        "/rename [title]  Rename this session",
-                        "/resume  Load a saved session",
-                        "/fork  Fork a saved session",
-                        "/delete  Delete a saved session",
-                        "/compact  Summarize earlier context",
-                        "/auto-compression on|off  Toggle auto mode",
-                        "/auto-compression 50–95  Set compression threshold",
-                        "/changelog  Show latest changes",
-                        "/reasoning on|off  Toggle model reasoning",
-                        "/reasoning-effort low|medium|high  Set effort",
-                        "/cwd  Show current directory",
-                        "/pwd  Show project workspace",
-                        "/clear  Start a new session",
-                        "/exit or Q  Close Sophon Agent",
+                        "/help — Show available commands",
+                        "/model [search] — Choose a model",
+                        "/new — Start a new session",
+                        "/rename [title] — Rename this session",
+                        "/resume — Load a saved session",
+                        "/fork — Fork a saved session",
+                        "/sessions — List sessions by title and context",
+                        "/delete — Delete a saved session",
+                        "/compact — Summarize context at 50% or more",
+                        "/auto-compression on|off — Toggle automatic mode",
+                        "/threshold 30–95 — Set auto-compression threshold",
+                        "/mode plan|build|chat — Set the Agent mode",
+                        "/changelog — Show latest changes",
+                        "/reasoning on|off — Toggle model reasoning",
+                        "/reasoning-effort low|medium|high — Set effort",
+                        "/cwd — Show current directory",
+                        "/clear — Clear the screen, keep this session",
+                        "/exit or Q — Close Sophon Agent",
                     ],
                     columns=shutil.get_terminal_size((80, 24)).columns,
                 )
@@ -1831,22 +2087,32 @@ def _interactive(config: dict[str, object]) -> int:
                         f"Version: {VERSION}",
                         f"Last updated: {updated}",
                         "",
-                        "Added: /delete, /compact and /changelog.",
-                        "Added: automatic context compression (default 80%; range 50–95%).",
-                        "Added: -m MESSAGE, -p SYSTEM_PROMPT -m MESSAGE, and -t TASK.",
-                        "Improved: Doctor checks, compact help, and ~/ path display.",
+                        "Added: /sessions, /mode, /threshold and the single /cwd command.",
+                        "Added: default chat sessions, read-only planning, and build approval flow.",
+                        "Added: auto-compression at 30–95%; /compact unlocks at 50% context.",
+                        "Improved: double-Esc interruption, slash completion, and connected reasoning.",
+                        "Improved: session context/date list, environment detection, and update progress.",
                     ],
                     columns=shutil.get_terminal_size((80, 24)).columns,
                 )
             elif command == "cwd":
                 title, message, error = _workspace_location(command)
                 notice(title, message, error=error)
-            elif command == "pwd":
-                title, message, error = _workspace_location(command)
-                notice(title, message, error=error)
-            elif command in {"new", "clear"}:
+            elif command == "sessions":
+                notice_rows = _card_rows(
+                    "Saved Sessions",
+                    _sessions_panel_rows(sessions, known_context_window()),
+                    columns=shutil.get_terminal_size((80, 24)).columns,
+                )
+            elif command == "new":
                 session = _new_session()
+                display_message_start = 0
                 notice_plain("New session created.")
+            elif command == "clear":
+                display_message_start = len(session["messages"])
+                notice_rows = []
+                sys.stdout.write("\033[2J\033[H")
+                sys.stdout.flush()
             elif command == "rename":
                 title = argument or _input_bar(draw, "Enter a session title")
                 if title.strip():
@@ -1862,6 +2128,7 @@ def _interactive(config: dict[str, object]) -> int:
                 selected = _pick_item(session, draw, items, title="Resume Session", current_id=str(session["id"]))
                 if selected:
                     session = selected["session"]
+                    display_message_start = 0
                     notice_rows = []
                 else:
                     notice("Resume cancelled", "The current session is still open.")
@@ -1875,6 +2142,7 @@ def _interactive(config: dict[str, object]) -> int:
                     forked = _fork_session(source)
                     sessions.append(forked)
                     session = forked
+                    display_message_start = 0
                     if save_current():
                         notice_plain(f"Forked session {source['title']} into a new session.")
                 else:
@@ -1912,6 +2180,7 @@ def _interactive(config: dict[str, object]) -> int:
                     continue
                 if str(session.get("id")) == selected_id:
                     session = _new_session()
+                    display_message_start = 0
                 notice_plain(f'Deleted session "{selected["title"]}".')
             elif command == "auto-compression":
                 enabled, threshold = auto_compression_settings(config)
@@ -1920,14 +2189,10 @@ def _interactive(config: dict[str, object]) -> int:
                 if value in {"on", "off"}:
                     updated_config["auto_compression"] = value == "on"
                     status = f"Auto-compression is {value} at {threshold}%."
-                elif value.isdecimal() and 50 <= int(value) <= 95:
-                    threshold = int(value)
-                    updated_config["auto_compression_threshold"] = threshold
-                    status = f"Auto-compression threshold set to {threshold}% (range: 50–95%)."
                 else:
                     notice(
                         "Auto-compression",
-                        f"Currently {'on' if enabled else 'off'} at {threshold}%. Use /auto-compression on|off or a threshold from 50 to 95.",
+                        f"Currently {'on' if enabled else 'off'} with threshold {threshold}%. Use /auto-compression on or /auto-compression off.",
                     )
                     continue
                 try:
@@ -1937,15 +2202,45 @@ def _interactive(config: dict[str, object]) -> int:
                 else:
                     config.update(updated_config)
                     notice("Auto-compression", status)
+            elif command == "threshold":
+                enabled, threshold = auto_compression_settings(config)
+                if not argument.isdecimal() or not 30 <= int(argument) <= 95:
+                    notice("Auto-compression threshold", f"Current threshold: {threshold}%. Use /threshold 30–95.", error=True)
+                    continue
+                threshold = int(argument)
+                updated_config = config.copy()
+                updated_config["auto_compression_threshold"] = threshold
+                try:
+                    write_config(updated_config)
+                except (OSError, ValueError) as error:
+                    notice("Preference not saved", str(error), error=True)
+                else:
+                    config.update(updated_config)
+                    notice("Auto-compression threshold", f"Set to {threshold}% (automatic compression is {'on' if enabled else 'off'}).")
+            elif command == "mode":
+                requested_mode = argument.casefold()
+                if requested_mode not in AGENT_MODES:
+                    notice("Agent mode", f"Current mode: {session.get('mode', 'chat')}. Use /mode plan, /mode build, or /mode chat.", error=True)
+                    continue
+                previous_mode = str(session.get("mode", "chat"))
+                session["mode"] = requested_mode
+                if session["messages"] and not save_current():
+                    session["mode"] = previous_mode
+                    continue
+                descriptions = {
+                    "chat": "General conversation; file changes require a clear request.",
+                    "plan": "Read-only planning. Approve implementation with /mode build.",
+                    "build": "Implement directly and verify the result.",
+                }
+                notice("Agent mode", f"Mode set to {requested_mode}. {descriptions[requested_mode]}")
             elif command == "compact":
                 window = known_context_window(discover=True)
                 if window is None:
                     notice("Context window unavailable", "The selected model did not report its context size.", error=True)
                     continue
-                _, threshold = auto_compression_settings(config)
                 before = _context_percentage(session["messages"], window)
-                if before < threshold:
-                    notice("Context is below the limit", f"Current usage is ~{before}%; /compact is available at {threshold}% or above.")
+                if before < 50:
+                    notice("Context is below the limit", f"Current usage is ~{before}%; /compact is available at 50% or above.")
                     continue
                 notice("Context compression", "Summarizing earlier conversation…")
                 draw("", 0)
@@ -1955,6 +2250,7 @@ def _interactive(config: dict[str, object]) -> int:
                     notice("Context not compacted", str(error), error=True)
                     continue
                 session["messages"][:] = compacted
+                display_message_start = min(display_message_start, len(session["messages"]))
                 if save_current():
                     after = _context_percentage(session["messages"], window)
                     notice_plain(f"Context compacted · ~{before}% to ~{after}%")
@@ -2077,8 +2373,12 @@ def _interactive(config: dict[str, object]) -> int:
         answering["frame"] = 0
         answering["text"] = ""
         answering["reasoning"] = ""
+        answering["interrupt_warning"] = False
+        request_started = time.monotonic()
         draw("", 0)
         events: queue.Queue[tuple[str, object]] = queue.Queue()
+        cancellation = RequestCancellation()
+        turn_mode = str(session.get("mode", "chat"))
         request_messages = [
             item for item in messages if item["role"] in {"user", "assistant"}
         ]
@@ -2090,6 +2390,8 @@ def _interactive(config: dict[str, object]) -> int:
                     request_messages,
                     on_chunk=lambda chunk: events.put(("chunk", chunk)),
                     on_reasoning=lambda chunk: events.put(("reasoning", chunk)),
+                    mode=turn_mode,
+                    cancellation=cancellation,
                 )
             except Exception as error:
                 events.put(("error", error))
@@ -2101,13 +2403,24 @@ def _interactive(config: dict[str, object]) -> int:
         reasoning_parts: list[str] = []
         answer: str | None = None
         request_error: Exception | None = None
+        interrupted_by_user = False
+        last_escape_at: float | None = None
+        key_events: queue.Queue[str] = queue.Queue()
+        key_stop = threading.Event()
+        key_reader = None
+        if sys.stdin.isatty():
+            key_reader = threading.Thread(
+                target=_input_key_reader,
+                args=(key_events, key_stop),
+                daemon=True,
+            )
+            key_reader.start()
         while answer is None and request_error is None:
+            batch: list[tuple[str, object]] = []
             try:
                 batch = [events.get(timeout=ANIMATION_TICK)]
             except queue.Empty:
-                answering["frame"] = int(answering["frame"]) + 1
-                draw("", 0)
-                continue
+                pass
             while True:
                 try:
                     batch.append(events.get_nowait())
@@ -2122,16 +2435,77 @@ def _interactive(config: dict[str, object]) -> int:
                     answer = str(value)
                 elif kind == "error":
                     request_error = value if isinstance(value, Exception) else RuntimeError(str(value))
-            if answer is None and request_error is None:
-                answering["frame"] = int(answering["frame"]) + 1
-                answering["text"] = "".join(parts)
-                answering["reasoning"] = "".join(reasoning_parts)
-                draw("", 0)
+            if answer is not None or request_error is not None:
+                while True:
+                    try:
+                        queued_key = key_events.get_nowait()
+                    except queue.Empty:
+                        break
+                    if queued_key.startswith("CHAR:"):
+                        prefill_characters.extend(list(queued_key[5:]))
+                    elif queued_key == "BACKSPACE" and prefill_characters:
+                        prefill_characters.pop()
+                    elif queued_key == "ENTER" and prefill_characters:
+                        pending_prompts.append("".join(prefill_characters).strip())
+                        prefill_characters.clear()
+                break
+            now = time.monotonic()
+            answering["frame"] = int((now - request_started) / 0.14)
+            while True:
+                try:
+                    key = key_events.get_nowait()
+                except queue.Empty:
+                    break
+                if key in {"CANCEL", "DOUBLE_CANCEL"}:
+                    if key == "DOUBLE_CANCEL" or (last_escape_at is not None and now - last_escape_at <= 1.5):
+                        cancellation.cancel()
+                        interrupted_by_user = True
+                        break
+                    last_escape_at = now
+                    answering["interrupt_warning"] = True
+                    break
+                elif key.startswith("CHAR:"):
+                    prefill_characters.extend(list(key[5:]))
+                elif key == "BACKSPACE" and prefill_characters:
+                    prefill_characters.pop()
+                elif key == "ENTER" and prefill_characters:
+                    pending_prompts.append("".join(prefill_characters).strip())
+                    prefill_characters.clear()
+            if last_escape_at is not None and now - last_escape_at > 1.5:
+                last_escape_at = None
+                answering["interrupt_warning"] = False
+            answering["text"] = "".join(parts)
+            answering["reasoning"] = "".join(reasoning_parts)
+            draw("", 0)
 
+        if key_reader is not None:
+            key_stop.set()
+            key_reader.join(timeout=0.25)
+        while True:
+            try:
+                queued_key = key_events.get_nowait()
+            except queue.Empty:
+                break
+            if queued_key.startswith("CHAR:"):
+                prefill_characters.extend(list(queued_key[5:]))
+            elif queued_key == "BACKSPACE" and prefill_characters:
+                prefill_characters.pop()
+            elif queued_key == "ENTER" and prefill_characters:
+                pending_prompts.append("".join(prefill_characters).strip())
+                prefill_characters.clear()
         answering["active"] = False
         answering["text"] = ""
         answering["reasoning"] = ""
+        answering["interrupt_warning"] = False
         refresh_sessions_after_tools()
+        if interrupted_by_user:
+            partial = "".join(parts).strip()
+            if partial:
+                messages.append({"role": "assistant", "content": partial, "interrupted": True})
+            messages.append({"role": "error", "content": "Stopped by user.", "cancelled": True})
+            save_current()
+            notice_plain("Response interrupted.")
+            continue
         if request_error is not None:
             partial = "".join(parts).strip()
             if partial:

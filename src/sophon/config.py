@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -34,6 +35,54 @@ def config_display_path() -> str:
         return "~/" + path.relative_to(Path.home()).as_posix()
     except ValueError:
         return str(path)
+
+
+def detect_environment() -> str:
+    """Return a concise, stable platform label suitable for local config metadata."""
+    if os.environ.get("TERMUX_VERSION") or os.environ.get("PREFIX", "").startswith("/data/data/com.termux"):
+        return "Termux (Android)"
+    system = platform.system()
+    if system == "Linux":
+        try:
+            release = platform.freedesktop_os_release()
+        except (AttributeError, OSError):
+            release = {}
+        pretty_name = release.get("PRETTY_NAME", "").strip()
+        if pretty_name:
+            return pretty_name
+        distribution = release.get("NAME", "").strip()
+        return f"{distribution} (Linux)" if distribution else "Linux"
+    if system == "Darwin":
+        return "macOS"
+    return system or "Unknown"
+
+
+def ensure_environment_config() -> str:
+    """Persist Environment in config.json without disturbing provider settings."""
+    environment = detect_environment()
+    try:
+        data = read_config()
+    except (OSError, ValueError, json.JSONDecodeError):
+        return environment
+    if data is not None:
+        if data.get("Environment") != environment:
+            data["Environment"] = environment
+            write_config(data)
+        return environment
+    path = config_path()
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raw = {"schema_version": 1}
+    except (OSError, ValueError, json.JSONDecodeError):
+        return environment
+    if not isinstance(raw, dict) or raw.get("provider") is not None:
+        return environment
+    if raw.get("Environment") != environment:
+        raw["Environment"] = environment
+        raw.setdefault("schema_version", 1)
+        write_config(raw)
+    return environment
 
 
 def agent_instructions_path() -> Path:
@@ -101,7 +150,7 @@ def read_config() -> dict[str, Any] | None:
     if data.get("provider") is None:
         allowed_preferences = {
             "schema_version", "auto_update", "agent_instructions_path", "reasoning",
-            "auto_compression", "auto_compression_threshold",
+            "auto_compression", "auto_compression_threshold", "Environment",
         }
         if set(data) <= allowed_preferences:
             return None
@@ -148,7 +197,7 @@ def read_config() -> dict[str, Any] | None:
     if not isinstance(auto_compression, bool):
         auto_compression = True
     threshold = data.get("auto_compression_threshold")
-    if not isinstance(threshold, int) or isinstance(threshold, bool) or not 50 <= threshold <= 95:
+    if not isinstance(threshold, int) or isinstance(threshold, bool) or not 30 <= threshold <= 95:
         threshold = 80
     if data.get("auto_compression") is not auto_compression:
         data["auto_compression"] = auto_compression
@@ -173,7 +222,7 @@ def write_config(data: dict[str, Any]) -> Path:
     if provider is None:
         allowed_preferences = {
             "schema_version", "auto_update", "agent_instructions_path", "reasoning",
-            "auto_compression", "auto_compression_threshold",
+            "auto_compression", "auto_compression_threshold", "Environment",
         }
         if set(data) - allowed_preferences:
             raise ValueError("Preferences-only config contains unsupported fields")
@@ -183,9 +232,12 @@ def write_config(data: dict[str, Any]) -> Path:
             raise ValueError("Auto-compression preference must be a boolean")
         threshold = data.get("auto_compression_threshold")
         if threshold is not None and (
-            not isinstance(threshold, int) or isinstance(threshold, bool) or not 50 <= threshold <= 95
+            not isinstance(threshold, int) or isinstance(threshold, bool) or not 30 <= threshold <= 95
         ):
-            raise ValueError("Auto-compression threshold must be between 50 and 95")
+            raise ValueError("Auto-compression threshold must be between 30 and 95")
+        environment = data.get("Environment")
+        if environment is not None and (not isinstance(environment, str) or not environment.strip()):
+            raise ValueError("Environment must be a non-empty string")
     else:
         if provider not in PROVIDERS:
             raise ValueError("Unsupported provider")

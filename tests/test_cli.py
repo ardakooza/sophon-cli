@@ -46,7 +46,8 @@ def test_help_is_shared_between_entry_points():
     assert "setup" in standalone.stdout
     assert "config" in standalone.stdout
     assert "sophon --help" in standalone.stdout
-    assert "Usage: sophon" in standalone.stdout
+    assert "Usage: sophon [run|update|init|setup|config|doctor|agent]" in standalone.stdout
+    assert "Flags: --version, --help" in standalone.stdout
     assert "agent — Chat (-m MESSAGE, -t TASK)" in standalone.stdout
     assert "-p SYSTEM_PROMPT -m MESSAGE" in standalone.stdout
     assert "╭" in standalone.stdout
@@ -347,17 +348,33 @@ def test_auto_update_checks_on_startup_only_when_enabled():
     update.assert_called_once_with(known_version=latest, restart_after=True)
 
 
-def test_main_checks_auto_update_before_normal_cli_command():
+def test_main_does_not_run_startup_update_check_for_maintenance_commands():
     from sophon import core
 
     with (
-        patch("sophon.core.auto_update_enabled", return_value=True),
         patch("sophon.core.auto_update_on_start") as startup_update,
+        patch("sophon.core.ensure_environment_config"),
         patch("sophon.core.doctor", return_value=0),
         patch("sophon.core.sys.argv", ["sophon", "doctor"]),
     ):
         assert core.main() == 0
-    startup_update.assert_called_once_with()
+    startup_update.assert_not_called()
+
+
+def test_run_session_shows_welcome_before_deferred_update_check():
+    from sophon import core
+
+    events = []
+    with (
+        patch("sophon.core.clear_terminal", side_effect=lambda: events.append("clear")),
+        patch("sophon.core.show_welcome", side_effect=lambda **kwargs: events.append("welcome")),
+        patch("sophon.core.auto_update_enabled", return_value=True),
+        patch("sophon.core.auto_update_on_start", side_effect=lambda: events.append("update")),
+        patch("sophon.core.read_prompt", return_value="/exit"),
+        patch.object(core, "RESTART_REQUESTED", False),
+    ):
+        assert core.run_session() == 0
+    assert events[:3] == ["clear", "welcome", "update"]
 
 
 def test_agent_exposes_required_builtin_tools_on_every_provider_request():
@@ -696,7 +713,7 @@ def test_reasoning_commands_persist_support_enabled_and_effort(tmp_path):
     assert saved["reasoning"] == {"is_support": True, "enabled": False, "effort": "high"}
 
 
-def test_cwd_and_pwd_commands_are_available_inside_agent_only(tmp_path, monkeypatch):
+def test_cwd_is_the_only_directory_command_and_is_agent_only(tmp_path, monkeypatch):
     from sophon import agent
 
     project = tmp_path / "workspace" / "project"
@@ -707,7 +724,9 @@ def test_cwd_and_pwd_commands_are_available_inside_agent_only(tmp_path, monkeypa
     cwd_title, cwd_path, cwd_error = agent._workspace_location("cwd")
     pwd_title, pwd_path, pwd_error = agent._workspace_location("pwd")
     assert (cwd_title, cwd_path, cwd_error) == ("Current directory", str(project), False)
-    assert (pwd_title, pwd_path, pwd_error) == ("Project workspace", str(project), False)
+    assert pwd_title == "Unknown Agent command"
+    assert "Use /cwd" in pwd_path
+    assert pwd_error is True
 
 
 def test_agent_argument_forms_support_custom_prompt_message_and_task():
@@ -794,7 +813,7 @@ def test_auto_compression_commands_persist_toggle_and_threshold(tmp_path):
             "context_window": 1024,
         }
         write_config(initial.copy())
-        commands = iter(["/auto-compression off", "/auto-compression 65", "/exit"])
+        commands = iter(["/auto-compression off", "/threshold 65", "/exit"])
         with (
             patch("sophon.agent._load_sessions", return_value=[]),
             patch("sophon.agent._input_bar", side_effect=lambda *args, **kwargs: next(commands)),
@@ -945,8 +964,9 @@ def test_changelog_shows_release_and_last_updated_date():
     rendered = "\n".join(captured)
     assert "Sophon Changelog" in rendered
     assert "Last updated:" in rendered
-    assert "/delete" in rendered
-    assert "automatic context compression" in rendered
+    assert "/sessions" in rendered
+    assert "double-Esc" in rendered
+    assert "30–95%" in rendered
 
 
 def test_config_reasoning_labels_only_show_effort_when_supported_and_on(tmp_path):
@@ -1116,3 +1136,213 @@ def test_manual_compact_is_rejected_below_threshold():
             "auto_compression_threshold": 80,
         }) == 0
     assert "Context is below the limit" in "\n".join(captured)
+
+
+def test_environment_detection_and_config_persistence(tmp_path):
+    import json
+
+    from sophon.config import detect_environment, ensure_environment_config
+
+    with patch.dict(os.environ, {"XDG_CONFIG_HOME": str(tmp_path), "TERMUX_VERSION": "0.118"}):
+        assert detect_environment() == "Termux (Android)"
+        assert ensure_environment_config() == "Termux (Android)"
+        saved = json.loads(config_path().read_text(encoding="utf-8"))
+    assert saved["Environment"] == "Termux (Android)"
+
+
+def test_plan_mode_is_read_only_and_prompts_for_explicit_build_approval():
+    from sophon.agent import _complete_turn, _tools_for_mode
+
+    names = {tool["function"]["name"] for tool in _tools_for_mode("plan")}
+    assert {"list_files", "read_file"} <= names
+    assert "write_file" not in names
+    assert "update" not in names
+    assert "session_rename" not in names
+    captured = {}
+
+    def fake_request(config, messages, **kwargs):
+        captured["messages"] = messages
+        captured["kwargs"] = kwargs
+        return "Here is the plan."
+
+    with patch("sophon.agent._request", side_effect=fake_request):
+        answer = _complete_turn(
+            {"provider": "openrouter", "model": "test", "api_key": "key"},
+            [{"role": "user", "content": "Plan this"}],
+            mode="plan",
+        )
+    assert answer == "Here is the plan."
+    assert "read-only" in captured["messages"][0]["content"]
+    assert captured["kwargs"]["mode"] == "plan"
+
+
+def test_new_and_forked_agent_sessions_default_to_chat_mode():
+    from sophon.agent import _fork_session, _new_session
+
+    assert _new_session()["mode"] == "chat"
+    forked = _fork_session({"id": "session123", "title": "Plan", "mode": "build", "messages": []})
+    assert forked["mode"] == "chat"
+
+
+def test_footer_reasoning_and_mode_are_stacked_below_model():
+    from sophon.agent import _footer_rows
+
+    rendered = "\n".join(_footer_rows("test/model", [], 4096, 100, mode="build", reasoning="high"))
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", rendered)
+    assert plain.index("Model:") < plain.index("Reasoning: high") < plain.index("Mode: build")
+    assert "Context:" in plain
+
+
+def test_reasoning_transcript_uses_a_vertical_connector_to_the_answer():
+    from sophon.agent import _message_rows
+
+    rendered = "\n".join(_message_rows([
+        {"role": "assistant", "content": "The answer", "reasoning": "First inspect the request."},
+    ], 80))
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", rendered)
+    assert plain.index("Reasoning") < plain.index("│") < plain.index("The answer")
+
+
+def test_slash_completion_is_a_suffix_and_only_completes_at_input_end():
+    from sophon.agent import _slash_command_completion
+
+    assert _slash_command_completion("/sess", 5) == "ions"
+    assert _slash_command_completion("/sess", 3) == ""
+    assert _slash_command_completion("/sessions ", 10) == ""
+
+
+def test_sessions_panel_sorts_by_title_and_shows_context_and_date():
+    from sophon.agent import _sessions_panel_rows
+
+    sessions = [
+        {"title": "Zeta", "updated_at": "2026-11-01T10:00:00+03:00", "context_window": 1000,
+         "messages": [{"role": "user", "content": "hello"}]},
+        {"title": "Alpha", "updated_at": "2026-10-30T10:00:00+03:00", "context_window": 1000,
+         "messages": [{"role": "user", "content": "hi"}]},
+    ]
+    rows = _sessions_panel_rows(sessions, None)
+    assert rows[0].startswith("Alpha")
+    assert rows[1].startswith("Zeta")
+    assert all("Context" in row and "2026-" in row for row in rows)
+
+
+def test_auto_compression_threshold_accepts_30_and_rejects_out_of_range(tmp_path):
+    from sophon.core import auto_compression_settings
+
+    with patch.dict(os.environ, {"XDG_CONFIG_HOME": str(tmp_path)}):
+        write_config({"schema_version": 1, "auto_compression": True, "auto_compression_threshold": 30})
+        assert auto_compression_settings() == (True, 30)
+        try:
+            write_config({"schema_version": 1, "auto_compression_threshold": 29})
+        except ValueError as error:
+            assert "30 and 95" in str(error)
+        else:
+            raise AssertionError("Threshold below 30 must be rejected")
+
+
+def test_clear_keeps_the_current_session_and_hides_old_transcript():
+    from sophon import agent
+
+    saved = {
+        "id": "keep123456", "title": "Keep me", "created_at": "2026-11-01T10:00:00+03:00",
+        "updated_at": "2026-11-01T10:00:00+03:00", "messages": [
+            {"role": "user", "content": "Earlier question"},
+            {"role": "assistant", "content": "Earlier answer"},
+        ],
+    }
+    commands = iter(["/resume", "/clear", "/exit"])
+    draws = []
+
+    def fake_draw(session, text, cursor, **kwargs):
+        draws.append((session["id"], kwargs.get("display_message_start", 0)))
+
+    def fake_input(draw, *args, **kwargs):
+        draw("", 0)
+        return next(commands)
+
+    with (
+        patch("sophon.agent._load_sessions", return_value=[saved]),
+        patch("sophon.agent._pick_item", side_effect=lambda session, draw, items, **kwargs: items[0]),
+        patch("sophon.agent._input_bar", side_effect=fake_input),
+        patch("sophon.agent._draw_screen", side_effect=fake_draw),
+    ):
+        assert agent._interactive({"provider": "openrouter", "model": "test", "context_window": 1024}) == 0
+    assert any(session_id == "keep123456" and offset == 2 for session_id, offset in draws)
+    assert saved["id"] == "keep123456"
+
+
+def test_double_escape_cancels_active_response_and_shows_hint(tmp_path, monkeypatch):
+    import time
+
+    from sophon import agent
+
+    class FakeTTY:
+        def isatty(self):
+            return True
+
+    class CapturedTTY(StringIO):
+        def isatty(self):
+            return True
+
+    commands = iter(["hello", "/exit"])
+    captured = CapturedTTY()
+
+    def fake_complete(config, messages, **kwargs):
+        cancellation = kwargs["cancellation"]
+        while not cancellation.cancelled:
+            time.sleep(0.005)
+        raise agent.AgentInterrupted("Response interrupted by user.")
+
+    def fake_input(draw, *args, **kwargs):
+        draw("", 0)
+        return next(commands)
+
+    def fake_key_reader(events, stop_event):
+        events.put("CANCEL")
+        events.put("CANCEL")
+
+    with (
+        patch.dict(os.environ, {"XDG_CONFIG_HOME": str(tmp_path)}),
+        patch("sophon.agent.SESSION_FILE", tmp_path / "sessions.json"),
+        patch("sophon.agent.LEGACY_SESSION_FILE", tmp_path / "legacy.json"),
+        patch("sophon.agent._load_sessions", return_value=[]),
+        patch("sophon.agent._input_bar", side_effect=fake_input),
+        patch("sophon.agent._complete_turn", side_effect=fake_complete),
+        patch("sophon.agent._input_key_reader", side_effect=fake_key_reader),
+        patch("sys.stdin", FakeTTY()),
+        patch("sys.stdout", captured),
+    ):
+        assert agent._interactive({"provider": "openrouter", "model": "test", "context_window": 1024}) == 0
+    assert "İptal etmek için bir kez daha basın" in captured.getvalue()
+    assert "Response interrupted." in captured.getvalue()
+    stored = (tmp_path / "sessions.json").read_text(encoding="utf-8")
+    assert '"cancelled": true' in stored
+
+
+def test_plan_mode_blocks_unexpected_mutating_tool_calls():
+    from sophon.agent import _complete_turn
+
+    captured = {"calls": 0}
+
+    def fake_request(config, messages, *, tool_calls_out, **kwargs):
+        captured["calls"] += 1
+        if captured["calls"] == 1:
+            tool_calls_out.append({
+                "id": "call-write",
+                "type": "function",
+                "function": {"name": "write_file", "arguments": '{"path":"blocked.txt","content":"no"}'},
+            })
+            return ""
+        captured["messages"] = messages
+        return "Plan only."
+
+    with patch("sophon.agent._request", side_effect=fake_request), patch(
+        "sophon.agent._execute_workspace_tool", side_effect=AssertionError("plan mode must not write")
+    ):
+        answer = _complete_turn(
+            {"provider": "openrouter", "model": "test", "api_key": "key"},
+            [{"role": "user", "content": "Plan a change"}],
+            mode="plan",
+        )
+    assert answer == "Plan only."
+    assert "disabled in plan mode" in captured["messages"][-1]["content"]

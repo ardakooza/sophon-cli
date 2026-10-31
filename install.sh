@@ -16,6 +16,7 @@ if ! command -v curl >/dev/null 2>&1 || ! command -v tar >/dev/null 2>&1; then
     echo "curl and tar are required to install Sophon." >&2
     exit 1
 fi
+printf '%s\n' "[ok] Python $(python3 --version 2>&1 | awk '{print $2}')" "[ok] curl" "[ok] tar" "[ok] Python standard-library runtime"
 
 if [ -n "${PREFIX:-}" ] && [ -d "$PREFIX/bin" ] && [ -w "$PREFIX/bin" ]; then
     BIN_DIR="$PREFIX/bin"
@@ -102,19 +103,28 @@ if [ "$MANAGED_INSTALL" -eq 1 ] && [ -n "$REMOTE_VERSION" ]; then
     INSTALLED_VERSION=$("$INSTALL_DIR/venv/bin/python" -c 'from sophon import __version__; print(__version__)' 2>/dev/null || true)
     if [ "$INSTALLED_VERSION" = "$REMOTE_VERSION" ]; then
         remove_managed_legacy_xernel
+        "$INSTALL_DIR/venv/bin/python" -c 'from sophon.config import ensure_environment_config; ensure_environment_config()' || true
         echo "Sophon is already up to date ($REMOTE_VERSION)."
         exit 0
     fi
 fi
 
 echo "Downloading latest Sophon..."
-curl -fsSL "$ARCHIVE" -o "$TEMP_DIR/sophon.tar.gz"
+if [ -t 1 ]; then
+    curl -fL --progress-bar "$ARCHIVE" -o "$TEMP_DIR/sophon.tar.gz"
+else
+    curl -fsSL "$ARCHIVE" -o "$TEMP_DIR/sophon.tar.gz"
+fi
 tar -xzf "$TEMP_DIR/sophon.tar.gz" -C "$TEMP_DIR"
 SOURCE_DIR="$TEMP_DIR/sophon-cli-main"
+printf '%s\n' "[ok] Source archive downloaded and unpacked"
 
 if [ ! -x "$INSTALL_DIR/venv/bin/python" ]; then
+    echo "Preparing isolated Python environment..."
     python3 -m venv "$INSTALL_DIR/venv"
 fi
+"$INSTALL_DIR/venv/bin/python" -m pip --version >/dev/null
+printf '%s\n' "[ok] Isolated virtual environment" "[ok] pip" "Runtime packages: Python standard library only" "Build requirement: setuptools>=68 (resolved by pip)" "Installing Sophon..."
 PIP_LOG="$TEMP_DIR/pip.log"
 PIP_STATUS_FILE="$TEMP_DIR/pip.status"
 if [ -t 1 ]; then
@@ -130,13 +140,17 @@ if [ -t 1 ]; then
     PIP_PID=$!
     SPIN=0
     while [ ! -f "$PIP_STATUS_FILE" ]; do
-        case $((SPIN % 4)) in
-            0) FRAME='|' ;;
-            1) FRAME='/' ;;
-            2) FRAME='-' ;;
-            3) FRAME='\\' ;;
+        case $((SPIN % 8)) in
+            0) FRAME='.' ;;
+            1) FRAME='o' ;;
+            2) FRAME='O' ;;
+            3) FRAME='o' ;;
+            4) FRAME='.' ;;
+            5) FRAME='·' ;;
+            6) FRAME='•' ;;
+            7) FRAME='·' ;;
         esac
-        printf '\r  %s Working...' "$FRAME"
+        printf '\r  %s Installing Sophon dependencies...' "$FRAME"
         SPIN=$((SPIN + 1))
         sleep 0.12
     done
@@ -156,6 +170,8 @@ if [ "$PIP_STATUS" -ne 0 ]; then
     cat "$PIP_LOG" >&2
     exit "$PIP_STATUS"
 fi
+"$INSTALL_DIR/venv/bin/python" -c 'from sophon.config import ensure_environment_config; print("[ok] Environment: " + ensure_environment_config())' || echo "[warn] Could not save environment metadata; Sophon can retry on startup." >&2
+printf '%s\n' "[ok] Sophon CLI package installed"
 
 if [ -L "$TARGET" ]; then
     ln -sfn "$INSTALL_DIR/venv/bin/sophon" "$TARGET.new"

@@ -15,7 +15,7 @@ from pathlib import Path
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
-from sophon.config import PROVIDERS, config_display_path, endpoint_for, mask_secret, read_config
+from sophon.config import PROVIDERS, config_display_path, config_path, endpoint_for, mask_secret, read_config
 from sophon import __version__ as VERSION
 
 RESET = "\033[0m"
@@ -469,15 +469,96 @@ def show_config() -> int:
     return 0
 
 
+def doctor() -> int:
+    checks: list[str] = []
+    counts = {"PASS": 0, "WARN": 0, "FAIL": 0}
+
+    def record(status: str, detail: str) -> None:
+        counts[status] += 1
+        checks.append(f"{status} · {detail}")
+
+    if sys.version_info >= (3, 10):
+        record("PASS", f"Python {sys.version_info.major}.{sys.version_info.minor}")
+    else:
+        record("FAIL", "Python 3.10 or newer is required")
+    record("PASS", f"Sophon CLI · {VERSION}")
+
+    try:
+        data = read_config()
+    except (OSError, ValueError) as error:
+        data = None
+        record("FAIL", f"Provider configuration is invalid · {error}")
+    if data is None and not any(line.startswith("FAIL · Provider configuration") for line in checks):
+        record("WARN", "Provider is not configured · Run sophon setup")
+    elif data is not None:
+        record("PASS", f"Provider · {PROVIDERS[data['provider']]['label']}")
+        record("PASS", f"Model · {data['model']}")
+        path = config_path()
+        try:
+            mode = path.stat().st_mode
+        except OSError:
+            record("FAIL", "Credential file could not be inspected")
+        else:
+            if os.name != "nt" and mode & 0o077:
+                record("WARN", "Credential file permissions are broader than 600")
+            else:
+                record("PASS", "Credential file permissions")
+
+    def check_writable(label: str, path: Path) -> None:
+        candidate = path
+        while not candidate.exists() and candidate != candidate.parent:
+            candidate = candidate.parent
+        if candidate.is_dir() and os.access(candidate, os.W_OK):
+            record("PASS", f"{label} storage is writable")
+        else:
+            record("FAIL", f"{label} storage is not writable · {path}")
+
+    check_writable("Configuration", config_path().parent)
+    try:
+        from sophon.agent import SESSION_FILE, _load_sessions
+
+        sessions = _load_sessions()
+    except (OSError, RuntimeError) as error:
+        sessions = []
+        record("FAIL", f"Session history is unreadable · {error}")
+    else:
+        detail = f"Session history · {len(sessions)} saved" if sessions else "Session history · none yet"
+        record("PASS", detail)
+    check_writable("Session", SESSION_FILE.parent)
+    if SESSION_FILE.exists() and os.name != "nt":
+        try:
+            mode = SESSION_FILE.stat().st_mode
+        except OSError:
+            record("WARN", "Session file permissions could not be inspected")
+        else:
+            if mode & 0o077:
+                record("WARN", "Session file permissions are broader than 600")
+            else:
+                record("PASS", "Session file permissions")
+
+    summary = f"{counts['PASS']} passed · {counts['WARN']} warnings · {counts['FAIL']} errors"
+    checks.insert(0, summary)
+    checks.insert(1, "")
+    if counts["FAIL"]:
+        border_color, text_color = NOTICE_BORDER, NOTICE_TEXT
+    elif counts["WARN"]:
+        border_color, text_color = UPDATE_BORDER, UPDATE_TEXT
+    else:
+        border_color, text_color = GREEN, GREEN
+    card("Sophon Doctor", checks, border_color=border_color, text_color=text_color)
+    return int(bool(counts["WARN"] or counts["FAIL"]))
+
+
 def print_help() -> None:
     print(
-        "Usage: sophon [run|update|init|setup|config|agent|--version|--help]\n\n"
+        "Usage: sophon [run|update|init|setup|config|doctor|agent|--version|--help]\n\n"
         "Commands:\n"
         "  run       Start the Sophon terminal interface\n"
         "  update    Safely fetch the latest version\n"
         "  init      Create a starter configuration\n"
         "  setup     Configure an AI provider\n"
         "  config    Show saved provider settings\n"
+        "  doctor    Check Sophon system and configuration health\n"
         "  agent     Start an AI chat session (agent -p MESSAGE for one-shot)\n"
         "  --version Show the current version\n"
         "  --help    Show this help"
@@ -502,6 +583,8 @@ def main() -> int:
         return run_setup_wizard()
     if args == ["config"]:
         return show_config()
+    if args == ["doctor"]:
+        return doctor()
     if args and args[0] == "agent":
         from sophon.agent import main as agent_main
 

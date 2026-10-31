@@ -7,7 +7,7 @@ import os
 import select
 import sys
 
-from sophon.config import PROVIDERS, config_display_path, read_config, write_config
+from sophon.config import PROVIDERS, config_display_path, mask_secret, read_config, write_config
 from sophon.core import card, clear_terminal
 
 
@@ -249,13 +249,12 @@ def run_setup_wizard() -> int:
         card("Sophon", ["Could not save configuration.", str(error)])
         return 1
     card(
-        "Sophon",
+        "Setup Complete",
         [
-            "SETUP COMPLETE",
             f"Provider: {spec['label']}",
             f"Model: {model}",
             f"Saved: {config_display_path()}",
-            "API credential is not displayed.",
+            f"{'API key' if provider == 'openrouter' else 'API token'}: {mask_secret(api_key)}",
         ],
     )
     return 0

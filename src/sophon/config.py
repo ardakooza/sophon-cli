@@ -124,9 +124,8 @@ def write_config(data: dict[str, Any]) -> Path:
 def mask_secret(value: str) -> str:
     if not value:
         return "Not set"
-    if len(value) <= 4:
-        return "••••"
-    return "••••••••" + value[-4:]
+    visible = 4 if len(value) > 4 else 1
+    return value[:visible] + "*" * (len(value) - visible)
 
 
 def endpoint_for(data: dict[str, Any]) -> str:

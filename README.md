@@ -30,6 +30,7 @@ Run `sophon setup` to choose OpenRouter or Cloudflare Workers AI and save the co
 - `sophon` or `sophon run` — open the terminal interface
 - `sophon setup` — configure a provider
 - `sophon config` — show saved provider settings
+- `sophon doctor` — check runtime, provider configuration, and local storage health
 - `sophon agent` — start an interactive AI chat using the configured provider
 - `sophon agent -p "message"` — send one message and print the response
 - `sophon init` — create a starter project configuration

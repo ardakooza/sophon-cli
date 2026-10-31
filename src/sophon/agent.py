@@ -16,7 +16,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from sophon.config import PROVIDERS, endpoint_for, read_config, write_config
-from sophon.core import BORDER, MUTED, NOTICE_BORDER, NOTICE_TEXT, WHITE, card, display_width, paint, wrap_text
+from sophon.core import BORDER, MUTED, NOTICE_BORDER, NOTICE_TEXT, WHITE, card, centered, display_width, paint, wrap_text
 
 SESSION_FILE = Path.home() / ".sophon" / "sessions" / "sessions.json"
 LEGACY_SESSION_FILE = Path.home() / ".xernel" / "sessions" / "sessions.json"
@@ -146,6 +146,7 @@ def _load_sessions() -> list[dict[str, object]]:
         ):
             raise RuntimeError("Saved sessions file contains an invalid message.")
         sessions.append(item)
+    sessions.sort(key=lambda item: str(item.get("updated_at", "")), reverse=True)
     if source == LEGACY_SESSION_FILE:
         _write_sessions(sessions)
     return sessions
@@ -567,7 +568,8 @@ def _pick_item(
 ) -> dict[str, object] | None:
     if not items:
         return None
-    items = sorted(items, key=lambda item: str(item.get("id", "")).casefold())
+    if title == "Available Models":
+        items = sorted(items, key=lambda item: str(item.get("id", "")).casefold())
     selected_id = current_id
     query = ""
     last_size = shutil.get_terminal_size((80, 24))

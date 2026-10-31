@@ -220,6 +220,18 @@ def _user_rows(message: str, columns: int) -> list[str]:
     return _card_rows(None, [f"› {message}"], columns=columns, width=width)
 
 
+def _truncate_display(text: str, width: int) -> str:
+    if display_width(text) <= width:
+        return text
+    suffix = "…"
+    result = ""
+    for character in text:
+        if display_width(result + character + suffix) > width:
+            break
+        result += character
+    return result + suffix
+
+
 def _agent_rows(message: str, columns: int) -> list[str]:
     width = max(20, columns - 4)
     rows: list[str] = []
@@ -261,9 +273,16 @@ def _message_rows(messages: list[dict[str, str]], columns: int) -> list[str]:
     return rows
 
 
-def _editor_layout(text: str, cursor: int, width: int, placeholder: str) -> tuple[list[str], int, int]:
+def _editor_layout(
+    text: str,
+    cursor: int,
+    width: int,
+    placeholder: str,
+    suggestion: str = "",
+) -> tuple[list[str], int, int]:
     empty = not text
-    visible_text = placeholder if empty else text
+    completion = suggestion if text and cursor == len(text) else ""
+    visible_text = placeholder if empty else text + completion
     lines = ["› "]
     cursor_row, cursor_col = 0, 2
     for index, character in enumerate(visible_text):
@@ -272,19 +291,29 @@ def _editor_layout(text: str, cursor: int, width: int, placeholder: str) -> tupl
         if not empty and index == cursor:
             cursor_row, cursor_col = len(lines) - 1, display_width(lines[-1])
         lines[-1] += character
-    if not empty and cursor == len(text):
+    if not empty and cursor == len(text) and not completion:
         cursor_row, cursor_col = len(lines) - 1, display_width(lines[-1])
     return lines, cursor_row, cursor_col
 
 
-def _input_box_rows(lines: list[str], width: int, *, placeholder: bool) -> list[str]:
+def _input_box_rows(lines: list[str], width: int, *, placeholder: bool, text_length: int = 0) -> list[str]:
     rows = [paint("  ╭" + "─" * (width + 2) + "╮", BORDER)]
+    remaining = text_length
     for index, line in enumerate(lines):
         padding = " " * max(0, width - display_width(line))
         if index == 0 and line.startswith("› "):
-            content = paint("› ", WHITE) + paint(line[2:], MUTED if placeholder else WHITE)
+            content_text = line[2:]
+            actual_count = min(len(content_text), remaining)
+            content = paint("› ", WHITE) + paint(content_text[:actual_count], WHITE if not placeholder else MUTED)
+            if actual_count < len(content_text):
+                content += paint(content_text[actual_count:], MUTED)
+            remaining -= actual_count
         else:
-            content = paint(line, MUTED if placeholder else WHITE)
+            actual_count = min(len(line), remaining)
+            content = paint(line[:actual_count], WHITE if not placeholder else MUTED)
+            if actual_count < len(line):
+                content += paint(line[actual_count:], MUTED)
+            remaining -= actual_count
         rows.append(paint("  │ ", BORDER) + content + padding + " " + paint("│", BORDER))
     rows.append(paint("  ╰" + "─" * (width + 2) + "╯", BORDER))
     return rows
@@ -298,6 +327,7 @@ def _draw_screen(
     placeholder: str = INPUT_PLACEHOLDER,
     panel_rows: list[str] | None = None,
     notice_rows: list[str] | None = None,
+    suggestion: str = "",
 ) -> tuple[int, int]:
     size = shutil.get_terminal_size((80, 24))
     columns, height = size.columns, max(8, size.lines)
@@ -307,11 +337,11 @@ def _draw_screen(
         ["Ask about code, debugging, and development."],
         columns=columns,
     )
-    editor_lines, cursor_row, cursor_col = _editor_layout(text, cursor, width, placeholder)
+    editor_lines, cursor_row, cursor_col = _editor_layout(text, cursor, width, placeholder, suggestion)
     max_editor_lines = max(1, min(5, height - len(header) - 3))
     visible_start = max(0, min(cursor_row, len(editor_lines) - max_editor_lines))
     visible_lines = editor_lines[visible_start : visible_start + max_editor_lines]
-    box = _input_box_rows(visible_lines, width, placeholder=not text)
+    box = _input_box_rows(visible_lines, width, placeholder=not text, text_length=len(text))
 
     if panel_rows is not None:
         feed = panel_rows
@@ -319,6 +349,8 @@ def _draw_screen(
         feed = list(notice_rows or []) + _message_rows(session["messages"], columns)
     room = max(0, height - len(header) - len(box))
     visible_feed = feed[-room:] if room else []
+    if panel_rows is not None and room >= 2 and len(panel_rows) > room:
+        visible_feed = [panel_rows[0], *panel_rows[1 : room - 1], panel_rows[-1]]
     screen = header + visible_feed + [""] * max(0, room - len(visible_feed)) + box
     screen = screen[-height:]
     if len(screen) < height:
@@ -332,7 +364,7 @@ def _draw_screen(
     return cursor_row, cursor_col
 
 
-def _read_key() -> str:
+def _read_key(timeout: float | None = None) -> str:
     import select
     import termios
     import tty
@@ -341,11 +373,15 @@ def _read_key() -> str:
     previous = termios.tcgetattr(fd)
     try:
         tty.setraw(fd)
+        if timeout is not None and not select.select([fd], [], [], timeout)[0]:
+            return "TIMEOUT"
         first = os.read(fd, 1)
         if first in {b"\r", b"\n"}:
             return "ENTER"
-        if first in {b"q", b"Q", b"\x03"}:
+        if first == b"\x03":
             return "CANCEL"
+        if first in {b"\x08", b"\x7f"}:
+            return "BACKSPACE"
         if first == b"\x1b":
             if not select.select([fd], [], [], 0.08)[0]:
                 return "CANCEL"
@@ -355,7 +391,11 @@ def _read_key() -> str:
                 if len(sequence) >= 2 and 0x40 <= sequence[-1] <= 0x7E:
                     break
             return {b"A": "UP", b"B": "DOWN", b"C": "RIGHT", b"D": "LEFT"}.get(bytes(sequence[-1:]), "OTHER")
-        return "OTHER"
+        try:
+            character = first.decode("utf-8")
+        except UnicodeDecodeError:
+            return "OTHER"
+        return f"CHAR:{character}" if character.isprintable() else "OTHER"
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, previous)
 
@@ -373,10 +413,23 @@ def _input_bar(draw, placeholder: str = INPUT_PLACEHOLDER) -> str:
     decoder = codecs.getincrementaldecoder(sys.stdin.encoding or "utf-8")()
     characters: list[str] = []
     cursor = 0
+    last_size = shutil.get_terminal_size((80, 24))
+
+    def redraw() -> None:
+        text = "".join(characters)
+        draw(text, cursor, placeholder=placeholder)
+
     try:
         tty.setraw(fd)
-        draw("", cursor, placeholder=placeholder)
+        redraw()
         while True:
+            ready, _, _ = select.select([fd], [], [], 0.2)
+            if not ready:
+                size = shutil.get_terminal_size((80, 24))
+                if size != last_size:
+                    last_size = size
+                    redraw()
+                continue
             raw = os.read(fd, 1)
             if not raw:
                 raise EOFError
@@ -395,7 +448,7 @@ def _input_bar(draw, placeholder: str = INPUT_PLACEHOLDER) -> str:
                     cursor = min(len(characters), cursor + 1)
                 else:
                     continue
-                draw("".join(characters), cursor, placeholder=placeholder)
+                redraw()
                 continue
             if raw in {b"\r", b"\n"}:
                 return "".join(characters).strip()
@@ -405,18 +458,18 @@ def _input_bar(draw, placeholder: str = INPUT_PLACEHOLDER) -> str:
                 if cursor:
                     characters.pop(cursor - 1)
                     cursor -= 1
-                    draw("".join(characters), cursor, placeholder=placeholder)
+                    redraw()
                 continue
             if raw == b"\x04":
                 if cursor < len(characters):
                     characters.pop(cursor)
-                    draw("".join(characters), cursor, placeholder=placeholder)
+                    redraw()
                 continue
             character = decoder.decode(raw)
             if character and character.isprintable():
                 characters[cursor:cursor] = list(character)
                 cursor += len(character)
-                draw("".join(characters), cursor, placeholder=placeholder)
+                redraw()
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, previous)
 
@@ -444,8 +497,7 @@ def _list_models(config: dict[str, object], search: str = "") -> list[dict[str, 
     provider = str(config["provider"])
     token = str(config["api_key"])
     if provider == "openrouter":
-        params = {"output_modalities": "text"}
-        result = _model_request("https://openrouter.ai/api/v1/models?" + urlencode(params), token)
+        result = _model_request("https://openrouter.ai/api/v1/models", token)
         data = result.get("data")
         if not isinstance(data, list):
             raise RuntimeError("OpenRouter returned an invalid model list.")
@@ -457,7 +509,7 @@ def _list_models(config: dict[str, object], search: str = "") -> list[dict[str, 
         if search:
             needle = search.casefold()
             all_models = [model for model in all_models if needle in model["id"].casefold() or needle in model["name"].casefold()]
-        return all_models
+        return sorted(all_models, key=lambda model: model["id"].casefold())
 
     base = f"https://api.cloudflare.com/client/v4/accounts/{config['account_id']}/ai/models/search"
     all_models = []
@@ -480,7 +532,7 @@ def _list_models(config: dict[str, object], search: str = "") -> list[dict[str, 
         info = result.get("result_info")
         if len(data) < 100 or (isinstance(info, dict) and page >= int(info.get("total_pages", page))):
             break
-    return all_models
+    return sorted(all_models, key=lambda model: model["id"].casefold())
 
 
 def _pick_item(
@@ -493,35 +545,110 @@ def _pick_item(
 ) -> dict[str, object] | None:
     if not items:
         return None
-    selected = next((i for i, item in enumerate(items) if str(item.get("id")) == current_id), 0)
+    items = sorted(items, key=lambda item: str(item.get("id", "")).casefold())
+    selected_id = current_id
+    query = ""
+    last_size = shutil.get_terminal_size((80, 24))
     while True:
         size = shutil.get_terminal_size((80, 24))
         header_count = len(_card_rows("Xernel Agent", ["Ask about code, debugging, and development."], columns=size.columns))
         input_count = 3
-        visible_count = max(1, min(10, size.lines - header_count - input_count - 8))
-        start = max(0, min(selected - visible_count + 1, len(items) - visible_count))
-        shown = items[start : start + visible_count]
-        body = [f"{len(items)} available · current: {current_id or 'not set'}", ""]
-        if start:
-            body.append("↑ more")
-        for index, item in enumerate(shown, start):
-            marker = "› " if index == selected else "  "
-            label = str(item.get("label") or item.get("title") or item.get("id") or "Session")
-            body.append(marker + label)
-        if start + visible_count < len(items):
-            body.append("↓ more")
-        body.extend(["", "↑/↓ or ←/→ move · Enter select · Q cancel"])
-        panel = _card_rows(title, body, columns=size.columns)
-        draw("", 0, panel_rows=panel, placeholder="Choose an item with the arrow keys")
-        key = _read_key()
+        room = max(1, size.lines - header_count - input_count)
+        compact = room < 13
+        if compact:
+            visible_count = max(1, min(8, room - 6))
+        else:
+            visible_count = max(1, min(8, (room - 7) // 2))
+        filtered = [item for item in items if not query or query.casefold() in str(item.get("id", "")).casefold() or query.casefold() in str(item.get("label", item.get("title", ""))).casefold()]
+        if not filtered:
+            selected = 0
+            shown = []
+            start = 0
+        else:
+            selected = next((i for i, item in enumerate(filtered) if str(item.get("id", "")) == selected_id), 0)
+            if query and selected == 0:
+                selected_id = str(filtered[0].get("id", ""))
+            start = max(0, min(selected - visible_count + 1, len(filtered) - visible_count))
+            shown = filtered[start : start + visible_count]
+
+        inner_width = min(68, max(20, size.columns - 8))
+
+        def render(text: str, cursor: int) -> tuple[list[str], str]:
+            # The picker only autocompletes provider model IDs; session names stay literal.
+            completion = ""
+            if title == "Available Models" and text:
+                match = next(
+                    (str(item.get("id", "")) for item in items if str(item.get("id", "")).casefold().startswith(text.casefold())),
+                    "",
+                )
+                if match and cursor == len(text) and len(match) > len(text):
+                    completion = match[len(text):]
+            status = f"{len(filtered)} models · current: {current_id or 'not set'}" if title == "Available Models" else f"{len(filtered)} saved sessions"
+            body = [_truncate_display(status, inner_width)]
+            if not compact:
+                body.append("")
+            if not shown:
+                body.append("No matching models." if title == "Available Models" else "No saved sessions.")
+            else:
+                for index, item in enumerate(shown, start):
+                    label = str(item.get("label") or item.get("title") or item.get("id") or "Session")
+                    label = _truncate_display(label, inner_width - 3)
+                    marker = "❯" if index == selected else "·"
+                    body.append(marker + " " + label)
+                    if not compact and index + 1 < start + len(shown):
+                        body.append("")
+            if not compact:
+                body.append("")
+            footer = f"{start + 1 if shown else 0}–{start + len(shown)} of {len(filtered)} · ↑/↓ move · Enter select · Esc cancel"
+            body.append(_truncate_display(footer, inner_width))
+            return _card_rows(title, body, columns=size.columns), completion
+
+        panel, completion = render(query, len(query))
+        placeholder = "Type a model ID or use ↑/↓" if title == "Available Models" else "Type to filter or use ↑/↓"
+        draw(query, len(query), panel_rows=panel, placeholder=placeholder, suggestion=completion)
+        while True:
+            key = _read_key(timeout=0.2)
+            if key != "TIMEOUT":
+                break
+            size = shutil.get_terminal_size((80, 24))
+            if size != last_size:
+                last_size = size
+                key = "RESIZE"
+                break
+        if key == "RESIZE":
+            continue
         if key in {"UP", "LEFT"}:
-            selected = (selected - 1) % len(items)
+            if filtered:
+                selected = (selected - 1) % len(filtered)
+                selected_id = str(filtered[selected].get("id", ""))
         elif key in {"DOWN", "RIGHT"}:
-            selected = (selected + 1) % len(items)
+            if filtered:
+                selected = (selected + 1) % len(filtered)
+                selected_id = str(filtered[selected].get("id", ""))
         elif key == "ENTER":
-            return items[selected]
+            if not filtered:
+                continue
+            exact = next((item for item in filtered if str(item.get("id", "")).casefold() == query.casefold()), None)
+            if exact:
+                return exact
+            if title == "Available Models" and query:
+                candidate = str(filtered[0].get("id", ""))
+                if candidate.casefold().startswith(query.casefold()) and len(candidate) > len(query):
+                    query = candidate
+                    selected_id = candidate
+                    continue
+            return filtered[selected]
         elif key == "CANCEL":
             return None
+        elif key == "BACKSPACE":
+            query = query[:-1]
+            selected_id = ""
+        elif key.startswith("CHAR:"):
+            character = key[5:]
+            if not query and character == "Q":
+                return None
+            query += character
+            selected_id = ""
 
 
 def _session_item(session: dict[str, object]) -> dict[str, object]:
@@ -543,8 +670,23 @@ def _interactive(config: dict[str, object]) -> int:
     session = _new_session()
     notice_rows: list[str] = []
 
-    def draw(text: str, cursor: int, *, placeholder: str = INPUT_PLACEHOLDER, panel_rows: list[str] | None = None) -> None:
-        _draw_screen(session, text, cursor, placeholder=placeholder, panel_rows=panel_rows, notice_rows=notice_rows)
+    def draw(
+        text: str,
+        cursor: int,
+        *,
+        placeholder: str = INPUT_PLACEHOLDER,
+        panel_rows: list[str] | None = None,
+        suggestion: str = "",
+    ) -> None:
+        _draw_screen(
+            session,
+            text,
+            cursor,
+            placeholder=placeholder,
+            panel_rows=panel_rows,
+            notice_rows=notice_rows,
+            suggestion=suggestion,
+        )
 
     def notice(title: str, message: str, *, error: bool = False) -> None:
         nonlocal notice_rows
@@ -573,6 +715,9 @@ def _interactive(config: dict[str, object]) -> int:
         if not prompt:
             notice_rows = []
             continue
+        if prompt.casefold() == "q":
+            sys.stdout.write("\033[2J\033[H" + paint("Session closed. See you soon.", MUTED) + "\r\n")
+            return 0
         if prompt.startswith("/"):
             command, _, argument = prompt[1:].partition(" ")
             command = command.casefold()
@@ -584,7 +729,7 @@ def _interactive(config: dict[str, object]) -> int:
             if command == "help":
                 notice_rows = _card_rows(
                     "Agent Commands",
-                    ["/model [search]  Choose a provider model", "/new  Start a fresh saved session", "/rename [title]  Rename this session", "/resume  Load a saved session", "/clear  Start a new session", "/exit  Close Xernel Agent"],
+                    ["/model [search]  Choose a provider model", "/new  Start a fresh saved session", "/rename [title]  Rename this session", "/resume  Load a saved session", "/clear  Start a new session", "/exit or Q  Close Xernel Agent"],
                     columns=shutil.get_terminal_size((80, 24)).columns,
                 )
             elif command in {"new", "clear"}:

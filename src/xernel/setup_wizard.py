@@ -168,12 +168,12 @@ def run_setup_wizard() -> int:
             )
             return 0
         if action is None:
-            card("Xernel", ["Setup cancelled. No changes were made."])
+            card(None, ["Setup cancelled."], width=16)
             return 1
 
     provider = _choose_provider()
     if provider is None:
-        card("Xernel", ["Setup cancelled."])
+        card(None, ["Setup cancelled."], width=16)
         return 1
 
     spec = PROVIDERS[provider]
@@ -181,7 +181,7 @@ def run_setup_wizard() -> int:
     saved_model = (existing or {}).get("model", "") if same_provider else ""
     model_choice = _choose_model(provider, spec["default_model"], saved_model)
     if model_choice is None:
-        card("Xernel", ["Setup cancelled."])
+        card(None, ["Setup cancelled."], width=16)
         return 1
     if model_choice == "__custom__":
         card("Setup of Custom Model", ["Enter a model ID."], top_right="2 OF 4")
@@ -236,11 +236,11 @@ def run_setup_wizard() -> int:
     if sys.stdin.isatty():
         key = _read_key()
         if key not in {"ENTER", "SPACE"}:
-            card("Xernel", ["Setup cancelled. No changes were saved."])
+            card(None, ["Setup cancelled."], width=16)
             return 1
     else:
         if input("Save settings? [Y/n]: ").strip().lower() in {"n", "no", "q"}:
-            card("Xernel", ["Setup cancelled. No changes were saved."])
+            card(None, ["Setup cancelled."], width=16)
             return 1
 
     try:

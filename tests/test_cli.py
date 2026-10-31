@@ -1,4 +1,5 @@
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -44,12 +45,99 @@ def test_help_is_shared_between_entry_points():
     assert "init" in standalone.stdout
     assert "setup" in standalone.stdout
     assert "config" in standalone.stdout
+    assert "sophon --help" in standalone.stdout
+    assert "Usage: sophon" in standalone.stdout
+    assert "agent -p MESSAGE for one-shot" in standalone.stdout
+    assert "╭" in standalone.stdout
+
+
+def test_double_dash_version_alias_is_supported():
+    result = run(ROOT / "sophon", "--v")
+    assert result.returncode == 0
+    assert result.stdout == f"sophon {VERSION}\n"
+
+
+def test_setup_progress_uses_lowercase_of_and_white_text():
+    from sophon.setup_wizard import _choose_provider
+
+    class TerminalBuffer(StringIO):
+        def isatty(self):
+            return True
+
+    output = TerminalBuffer()
+    fake_input = type("TerminalInput", (), {"isatty": lambda self: True})()
+    with patch("sys.stdout", output), patch("sys.stdin", fake_input), patch(
+        "sophon.setup_wizard._read_key", return_value="CANCEL"
+    ):
+        assert _choose_provider() is None
+    text = output.getvalue()
+    assert "1 of 4" in text
+    assert "1 OF 4" not in text
+    assert "\033[38;5;255m" in text
+
+
+def test_review_and_complete_card_titles_and_provider_labels_are_white(tmp_path):
+    from sophon.setup_wizard import run_setup_wizard
+
+    class TerminalBuffer(StringIO):
+        def isatty(self):
+            return True
+
+    output = TerminalBuffer()
+    fake_input = type("TerminalInput", (), {"isatty": lambda self: True})()
+    with (
+        patch("sys.stdout", output),
+        patch("sys.stdin", fake_input),
+        patch("sophon.setup_wizard.read_config", return_value=None),
+        patch("sophon.setup_wizard._choose_provider", return_value="openrouter"),
+        patch("sophon.setup_wizard._choose_model", return_value="test-model"),
+        patch("sophon.setup_wizard.getpass.getpass", return_value="test-secret"),
+        patch("sophon.setup_wizard._read_key", return_value="ENTER"),
+        patch("sophon.setup_wizard.write_config", return_value=tmp_path / "config.json"),
+    ):
+        assert run_setup_wizard() == 0
+    text = output.getvalue()
+    assert re.search(r"\033\[38;5;255m\s*Review Setup", text)
+    assert re.search(r"\033\[38;5;255m\s*Setup Complete", text)
+    assert "\033[38;5;255mProvider:\033[0m" in text
+    assert "test-secret" not in text
 
 
 def test_plain_words_are_not_commands():
     result = run(ROOT / "sophon", input_text="exit\n/exit\n")
     assert result.returncode == 0
     assert "Commands must start with /." in result.stdout
+    assert "Session closed. See you soon." in result.stdout
+
+
+def test_cwd_and_pwd_slash_commands_show_current_and_project_paths():
+    result = run(ROOT / "sophon", input_text="/cwd\n/pwd\n/exit\n")
+    assert result.returncode == 0
+    assert str(ROOT) in result.stdout
+    assert "Current directory" in result.stdout
+    assert "Project workspace" in result.stdout
+
+
+def test_agent_single_dash_prompt_argument_is_accepted():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        result = run(
+            ROOT / "sophon",
+            "agent",
+            "-p",
+            "hello",
+            env_overrides={"XDG_CONFIG_HOME": temp_dir},
+        )
+    assert result.returncode == 1
+    assert "No provider is configured" in result.stdout
+    assert "Unknown command" not in result.stdout + result.stderr
+
+
+def test_card_puts_a_blank_row_after_its_title():
+    output = StringIO()
+    with patch("sys.stdout", output):
+        card("Heading", ["Body text"])
+    rows = output.getvalue().splitlines()
+    assert rows[2].split("│", 1)[1].rsplit("│", 1)[0].strip() == ""
 
 
 def test_setup_refuses_to_read_credentials_without_a_tty():
@@ -82,7 +170,7 @@ def test_unicode_card_border_rows_stay_aligned():
     assert len(widths) == 1
 
 
-def test_config_masks_credentials_and_uses_private_file_permissions():
+def test_config_hides_credentials_and_uses_private_file_permissions():
     with tempfile.TemporaryDirectory() as temp_dir:
         env = {"XDG_CONFIG_HOME": temp_dir}
         with patch.dict(os.environ, env):
@@ -98,4 +186,7 @@ def test_config_masks_credentials_and_uses_private_file_permissions():
         result = run(ROOT / "sophon", "config", env_overrides=env)
         assert result.returncode == 0
         assert "secret-openrouter-key" not in result.stdout
-        assert "••••••••-key" in result.stdout
+        assert "API key: hidden" in result.stdout
+        assert "Config:" in result.stdout
+        assert "Config file:" not in result.stdout
+        assert "Endpoint:" not in result.stdout

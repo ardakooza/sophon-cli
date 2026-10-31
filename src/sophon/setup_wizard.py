@@ -8,7 +8,7 @@ import select
 import sys
 
 from sophon.config import PROVIDERS, config_display_path, read_config, write_config
-from sophon.core import MUTED, card, clear_terminal
+from sophon.core import MUTED, WHITE, card, clear_terminal
 
 
 def _read_key() -> str:
@@ -75,7 +75,7 @@ def _choose_provider() -> str | None:
                 "",
                 "←/→ previous/next   ↑/↓ move   Enter select   Q cancel",
             ],
-            top_right="1 OF 4",
+            top_right="1 of 4",
         )
         key = _read_key()
         if key in {"UP", "LEFT"}:
@@ -133,7 +133,7 @@ def _choose_model(provider: str, default_model: str, saved_model: str = "") -> s
         ]
         rows.extend(f"{'›' if index == selected else ' '} {label}" for index, (_, label) in enumerate(options))
         rows.extend(["", "←/→ previous/next   ↑/↓ move   Enter select   Q cancel"])
-        card("Setup of Model", rows, top_right="2 OF 4")
+        card("Setup of Model", rows, top_right="2 of 4")
         key = _read_key()
         if key in {"UP", "LEFT"}:
             selected = (selected - 1) % len(options)
@@ -184,7 +184,7 @@ def run_setup_wizard() -> int:
         card(None, ["Setup cancelled."], width=16)
         return 1
     if model_choice == "__custom__":
-        card("Setup of Custom Model", ["Enter a model ID."], top_right="2 OF 4")
+        card("Setup of Custom Model", ["Enter a model ID."], top_right="2 of 4")
         model = input("Model ID: ").strip()
         if not model:
             card("Sophon", ["A model ID is required.", "No configuration was saved."])
@@ -195,7 +195,7 @@ def run_setup_wizard() -> int:
     old_key = (existing or {}).get("api_key", "") if same_provider else ""
     key_hint = "leave blank to keep saved key" if old_key else "required"
     credential_label = "API key" if provider == "openrouter" else "API token (Workers AI Read + Edit)"
-    card("Setup of Credentials", [f"Enter {credential_label}."], top_right="3 OF 4")
+    card("Setup of Credentials", [f"Enter {credential_label}."], top_right="3 of 4")
     api_key = getpass.getpass(f"{credential_label} (hidden; {key_hint}): ").strip()
     if not api_key:
         api_key = old_key
@@ -235,9 +235,10 @@ def run_setup_wizard() -> int:
     card(
         "Review Setup",
         summary,
-        top_right="4 OF 4",
+        top_right="4 of 4",
         text_color=MUTED,
-        highlight_terms=("Model:", "Credential:", "Config:"),
+        title_color=WHITE,
+        highlight_terms=("Provider:", "Model:", "Credential:", "Config:"),
     )
     if sys.stdin.isatty():
         key = _read_key()
@@ -263,6 +264,7 @@ def run_setup_wizard() -> int:
             f"{'API key' if provider == 'openrouter' else 'API token'}: hidden",
         ],
         text_color=MUTED,
-        highlight_terms=("Model:", "Saved:", "API key:", "API token:"),
+        title_color=WHITE,
+        highlight_terms=("Provider:", "Model:", "Saved:", "API key:", "API token:"),
     )
     return 0

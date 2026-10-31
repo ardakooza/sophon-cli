@@ -15,7 +15,7 @@ from pathlib import Path
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
-from sophon.config import PROVIDERS, config_display_path, config_path, endpoint_for, mask_secret, read_config
+from sophon.config import PROVIDERS, config_display_path, config_path, read_config
 from sophon import __version__ as VERSION
 
 RESET = "\033[0m"
@@ -159,6 +159,7 @@ def card(
     top_right: str | None = None,
     border_color: str = BORDER,
     text_color: str = WHITE,
+    title_color: str | None = None,
     highlight_terms: tuple[str, ...] = (),
 ) -> None:
     terminal_width = shutil.get_terminal_size((80, 24)).columns
@@ -178,23 +179,28 @@ def card(
                 heading = " " * left_pad + title + " " * max(1, right_start - left_pad - title_width) + badge
                 heading = heading + " " * max(0, inner - display_width(heading))
                 title_content = " " + heading + " "
-                print(paint("  │", border_color) + paint(title_content, text_color) + paint("│", border_color))
+                print(paint("  │", border_color) + paint(title_content, title_color or text_color) + paint("│", border_color))
             else:
                 title_text = centered(title, inner)
                 title_content = " " + title_text + " " * (inner - display_width(title_text) + 1)
-                print(paint("  │", border_color) + paint(title_content, text_color) + paint("│", border_color))
+                print(paint("  │", border_color) + paint(title_content, title_color or text_color) + paint("│", border_color))
                 badge_text = " " + " " * (inner - badge_width) + badge + " "
-                print(paint("  │", border_color) + paint(badge_text, text_color) + paint("│", border_color))
+                print(paint("  │", border_color) + paint(badge_text, title_color or text_color) + paint("│", border_color))
         else:
             content_lines.insert(0, "")
             content_lines.insert(0, title)
+    if title is not None and top_right:
+        content_lines.insert(0, "")
     for line in content_lines:
         is_centered = (line == title and not top_right) or line in centered_lines
         chunks = wrap_text(line, inner)
         for chunk in chunks:
             text = centered(chunk, inner) if is_centered else chunk
             content = " " + text + " " * (inner - display_width(text) + 1)
-            colored_content = _paint_highlight_terms(content, highlight_terms, text_color, WHITE)
+            if line == title and title_color is not None:
+                colored_content = paint(content, title_color)
+            else:
+                colored_content = _paint_highlight_terms(content, highlight_terms, text_color, WHITE)
             print(paint("  │", border_color) + colored_content + paint("│", border_color))
     print(paint("  ╰" + "─" * (inner + 2) + "╯", border_color))
 
@@ -415,7 +421,7 @@ def run_session() -> int:
             value = read_prompt(paint("  › ", GREEN)).strip()
         except (EOFError, KeyboardInterrupt):
             sys.stdout.write("\r\033[2K")
-            print(paint("Session closed. See you soon.", MUTED))
+            card(None, ["Session closed. See you soon."])
             return 0
         if not value:
             continue
@@ -426,7 +432,7 @@ def run_session() -> int:
             if command == "/update":
                 update()
             elif command == "/help":
-                card(None, ["/help     Show available commands", "/setup    Configure a provider", "/config   Show saved settings", "/clear    Redraw the welcome screen", "/version  Print the current version", "/update   Pull latest code safely", "/exit     Close Sophon"])
+                card("Sophon commands", ["/help — Show available commands", "/setup — Configure a provider", "/config — Show saved settings", "/cwd — Show the current directory", "/pwd — Show the project workspace", "/clear — Redraw the welcome screen", "/version — Print the current version", "/update — Pull latest code safely", "/exit — Close Sophon"])
             elif command == "/setup":
                 from sophon.setup_wizard import run_setup_wizard
 
@@ -434,6 +440,14 @@ def run_session() -> int:
                     show_welcome()
             elif command == "/config":
                 show_config()
+            elif command == "/cwd":
+                card("Current directory", [str(Path.cwd().resolve())])
+            elif command == "/pwd":
+                workspace = project_workspace()
+                if workspace is None:
+                    card("Project workspace", ["No project workspace found."])
+                else:
+                    card("Project workspace", [str(workspace)])
             elif command == "/version":
                 card(None, [f"sophon {VERSION}"])
             elif command == "/clear":
@@ -453,7 +467,7 @@ def run_session() -> int:
                 border_color=NOTICE_BORDER,
                 text_color=NOTICE_TEXT,
             )
-    print(paint("Session closed. See you soon.", MUTED))
+    card(None, ["Session closed. See you soon."])
     return 0
 
 
@@ -481,13 +495,32 @@ def show_config() -> int:
     lines = [
         f"Provider: {PROVIDERS[provider]['label']}",
         f"Model: {data['model']}",
-        f"API key: {mask_secret(data['api_key'])}",
+        "API key: hidden",
     ]
     if provider == "cloudflare":
         lines.append(f"Account ID: {data['account_id']}")
-    lines.extend([f"Endpoint: {endpoint_for(data)}", f"Config file: {config_display_path()}"])
+    lines.append(f"Config: {config_display_path()}")
     card(None, lines)
     return 0
+
+
+def project_workspace() -> Path | None:
+    """Return the nearest project root or Sophon's active agent workspace."""
+    current = Path.cwd().resolve()
+    try:
+        from sophon.agent import PROJECT_DIR
+
+        project_dir = PROJECT_DIR.resolve()
+        if current == project_dir or project_dir in current.parents:
+            return project_dir
+    except (ImportError, OSError):
+        pass
+
+    markers = (".git", "pyproject.toml", "package.json", "Cargo.toml", "go.mod")
+    for candidate in (current, *current.parents):
+        if any((candidate / marker).exists() for marker in markers):
+            return candidate
+    return None
 
 
 def doctor() -> int:
@@ -571,24 +604,28 @@ def doctor() -> int:
 
 
 def print_help() -> None:
-    print(
-        "Usage: sophon [run|update|init|setup|config|doctor|agent|--version|--help]\n\n"
-        "Commands:\n"
-        "  run       Start the Sophon terminal interface\n"
-        "  update    Safely fetch the latest version\n"
-        "  init      Create a starter configuration\n"
-        "  setup     Configure an AI provider\n"
-        "  config    Show saved provider settings\n"
-        "  doctor    Check Sophon system and configuration health\n"
-        "  agent     Start an AI chat session (agent -p MESSAGE for one-shot)\n"
-        "  --version Show the current version\n"
-        "  --help    Show this help"
+    card(
+        "sophon --help",
+        [
+            "Usage: sophon [run|update|init|setup|config|doctor|agent|--version|--help]",
+            "",
+            "Commands:",
+            "run — Start the Sophon terminal interface",
+            "update — Safely fetch the latest version",
+            "init — Create a starter configuration",
+            "setup — Configure an AI provider",
+            "config — Show saved provider settings",
+            "doctor — Check Sophon system and configuration health",
+            "agent — Start an AI chat session (agent -p MESSAGE for one-shot)",
+            "--version — Show the current version",
+            "--help — Show this help",
+        ],
     )
 
 
 def main() -> int:
     args = sys.argv[1:]
-    if args in (["--version"], ["-v"]):
+    if args in (["--version"], ["--v"], ["-v"]):
         print(f"sophon {VERSION}")
         return 0
     if args in (["--help"], ["-h"]):

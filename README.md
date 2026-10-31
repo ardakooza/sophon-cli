@@ -23,7 +23,7 @@ The installer will not overwrite an unrelated existing `sophon` command. Remove 
 
 ## Configure a provider
 
-Run `sophon setup` to choose OpenRouter or Cloudflare Workers AI and save the connection settings. Run `sophon config` to see the saved provider and model. Settings default to `~/.sophon/config/config.json` (or `$XDG_CONFIG_HOME/sophon/config/config.json` when set); an existing config is moved to the new path on first read. API credentials are stored with restricted file permissions; they are not encrypted.
+Run `sophon setup` to choose OpenRouter or Cloudflare Workers AI and save the connection settings. Run `sophon config` to see the saved provider and model; the API key is shown as `hidden`, and the endpoint is not displayed. Settings default to `~/.sophon/config/config.json` (or `$XDG_CONFIG_HOME/sophon/config/config.json` when set); an existing config is moved to the new path on first read. API credentials are stored with restricted file permissions; they are not encrypted.
 
 ## Commands
 
@@ -33,6 +33,8 @@ Run `sophon setup` to choose OpenRouter or Cloudflare Workers AI and save the co
 - `sophon doctor` — check runtime, provider configuration, and local storage health
 - `sophon agent` — start an interactive AI chat using the configured provider
 - `sophon agent -p "message"` — send one message and stream the response
+- `/cwd` — show the current working directory inside the terminal interface
+- `/pwd` — show the project workspace path when inside a workspace
 - `sophon init` — create a starter project configuration
 - `sophon update` — safely update a source checkout or refresh an installed package
 - `sophon --help` — show command help

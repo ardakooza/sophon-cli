@@ -69,7 +69,7 @@ def _choose_provider() -> str | None:
                 f"{'›' if selected == 0 else ' '} {labels[0]}",
                 f"{'›' if selected == 1 else ' '} {labels[1]}",
                 "",
-                "↑/↓ move   Enter/Space select   Q cancel",
+                "←/→ previous/next   ↑/↓ move   Enter select   Q cancel",
             ],
             top_right="1 OF 4",
         )
@@ -99,7 +99,7 @@ def _choose_existing_action(existing: dict[str, object]) -> str | None:
                 f"{'›' if selected == 0 else ' '} {labels[0]}",
                 f"{'›' if selected == 1 else ' '} {labels[1]}",
                 "",
-                "↑/↓ move   Enter/Space select   Q cancel",
+                "←/→ previous/next   ↑/↓ move   Enter select   Q cancel",
             ],
         )
         key = _read_key()
@@ -128,7 +128,7 @@ def _choose_model(provider: str, default_model: str, saved_model: str = "") -> s
             "",
         ]
         rows.extend(f"{'›' if index == selected else ' '} {label}" for index, (_, label) in enumerate(options))
-        rows.extend(["", "↑/↓ move   Enter/Space select   Q cancel"])
+        rows.extend(["", "←/→ previous/next   ↑/↓ move   Enter select   Q cancel"])
         card("Setup of Model", rows, top_right="2 OF 4")
         key = _read_key()
         if key in {"UP", "LEFT"}:

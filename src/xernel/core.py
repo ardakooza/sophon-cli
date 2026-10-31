@@ -143,14 +143,13 @@ def card(
     print(paint(top_border, border_color))
     content_lines = list(lines)
     if title is not None:
-        title_text = title
         if top_right:
             badge = top_right[:inner]
-            title_text = title[: max(0, inner - display_width(badge) - 1)]
-            gap = max(1, inner - display_width(title_text) - display_width(badge))
-            heading = title_text + " " * gap + badge
-            content = " " + heading + " " * (inner - display_width(heading) + 1)
-            print(paint("  │", border_color) + paint(content, text_color) + paint("│", border_color))
+            title_text = centered(title, inner)
+            title_content = " " + title_text + " " * (inner - display_width(title_text) + 1)
+            badge_text = " " + " " * (inner - display_width(badge)) + badge + " "
+            print(paint("  │", border_color) + paint(title_content, text_color) + paint("│", border_color))
+            print(paint("  │", border_color) + paint(badge_text, text_color) + paint("│", border_color))
             content_lines.insert(0, "")
         else:
             content_lines.insert(0, title)
@@ -299,7 +298,7 @@ def update() -> int:
             update_card(["Version check failed", "Could not reach GitHub", "Retry later"], final=True)
             return 1
         if remote_version == VERSION:
-            update_card(["Version already current", f"xernel {VERSION}", ""], final=True)
+            update_card(["! Version already current.", "", f"xernel {VERSION}"], final=True)
             return 0
 
         lines[:] = ["Update available", f"{VERSION} → {remote_version}", "Installing with pip"]
@@ -345,7 +344,7 @@ def update() -> int:
         update_card(["Update failed", "Check network or Git", "Retry later"], final=True)
         return pull_code
     if stdout and "Already up to date" in stdout:
-        update_card(["Version already current", f"xernel {VERSION}", ""], final=True)
+        update_card(["! Version already current.", "", f"xernel {VERSION}"], final=True)
     else:
         try:
             updated_version = (repo / "src" / "xernel" / "VERSION").read_text(encoding="utf-8").strip()
@@ -367,9 +366,9 @@ def run_session() -> int:
         if not value:
             continue
         command = value.lower()
+        if command in {"/exit", "/quit", "q"}:
+            break
         if command.startswith("/"):
-            if command in {"/exit", "/quit"}:
-                break
             if command == "/update":
                 update()
             elif command == "/help":
@@ -400,7 +399,7 @@ def run_session() -> int:
                 border_color=NOTICE_BORDER,
                 text_color=NOTICE_TEXT,
             )
-    print(paint("\n  Session closed. See you soon.\n", MUTED))
+    print(paint("  › ", GREEN) + paint("Session closed. See you soon.", MUTED))
     return 0
 
 

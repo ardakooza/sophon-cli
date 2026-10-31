@@ -10,7 +10,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from xernel.config import PROVIDERS, endpoint_for, read_config
-from xernel.core import GREEN, MUTED, RESET, card, paint, read_prompt
+from xernel.core import GREEN, MUTED, RESET, card, display_width, paint, read_prompt, wrap_text
 
 SYSTEM_PROMPT = (
     "You are Xernel Agent, a concise and practical development assistant. "
@@ -83,14 +83,17 @@ def _ask(config: dict[str, object], history: list[dict[str, str]], prompt: str) 
 
 def _input_bar(config: dict[str, object]) -> str:
     if sys.stdout.isatty():
-        width = max(20, shutil.get_terminal_size((80, 24)).columns - 2)
+        width = max(20, shutil.get_terminal_size((80, 24)).columns - 4)
         bg = "\033[48;5;236m"
         placeholder = "Ask Xernel to do anything"
         prompt_width = 4
         placeholder = placeholder[: max(0, width - prompt_width)]
-        sys.stdout.write(bg + " " * width + "\r" + bg + "  › " + paint(placeholder, MUTED))
-        sys.stdout.write(f"\r\033[{prompt_width}C" + " " * len(placeholder))
-        sys.stdout.write(f"\r\033[{prompt_width}C")
+        sys.stdout.write(
+            "  " + bg + " " * width + "\r\033[2C" + bg + "› "
+            + f"\033[38;5;245m{placeholder}{bg}"
+        )
+        sys.stdout.write(f"\r\033[{prompt_width}C" + bg + " " * len(placeholder))
+        sys.stdout.write(f"\r\033[{prompt_width}C" + bg)
         sys.stdout.flush()
         try:
             return read_prompt("").strip()
@@ -100,33 +103,78 @@ def _input_bar(config: dict[str, object]) -> str:
     return input(paint("› ", GREEN)).strip()
 
 
+def _render_user_message(message: str) -> None:
+    width = max(20, shutil.get_terminal_size((80, 24)).columns - 4)
+    background = "\033[48;5;236m" if sys.stdout.isatty() else ""
+    reset = RESET if background else ""
+    first = True
+    for paragraph in message.splitlines() or [message]:
+        if not paragraph:
+            print("  " + background + " " * width + reset)
+            first = True
+            continue
+        prefix = " › " if first else "   "
+        for line in wrap_text(paragraph, width - display_width(prefix)):
+            text = prefix + line
+            padding = " " * max(0, width - display_width(text))
+            print("  " + background + text + padding + reset)
+            first = False
+
+
+def _render_agent_message(message: str) -> None:
+    width = max(20, shutil.get_terminal_size((80, 24)).columns - 4)
+    print()
+    for paragraph in message.splitlines() or [message]:
+        if not paragraph:
+            print()
+            continue
+        for line in wrap_text(paragraph, width):
+            print("  " + line)
+    print()
+
+
+def _clear_input_echo(message: str) -> None:
+    if not sys.stdout.isatty():
+        return
+    columns = max(1, shutil.get_terminal_size((80, 24)).columns)
+    rows = max(1, (4 + display_width(message) + columns - 1) // columns)
+    sys.stdout.write(f"\033[{rows}A\r")
+    for _ in range(rows):
+        sys.stdout.write("\033[2K\033[1B")
+    sys.stdout.write(f"\033[{rows}A\r")
+    sys.stdout.flush()
+
+
 def _interactive(config: dict[str, object]) -> int:
     provider = PROVIDERS[str(config["provider"])]["label"]
     model = str(config["model"])
     history: list[dict[str, str]] = []
-    card("Xernel Agent", ["Ask about code, debugging, or development.", "This session cannot read or edit local files."])
+    print(paint("Xernel Agent · Ask about code, debugging, or development.", MUTED))
     while True:
         try:
             prompt = _input_bar(config)
         except (EOFError, KeyboardInterrupt):
-            print()
+            print("\n" + paint("  › ", GREEN) + paint("Session closed. See you soon.", MUTED))
             return 0
+        _clear_input_echo(prompt)
         if not prompt:
             continue
-        if prompt.casefold() in {"/exit", "/quit"}:
+        if prompt.casefold() in {"/exit", "/quit", "q"}:
+            print(paint("  › ", GREEN) + paint("Session closed. See you soon.", MUTED))
             return 0
         if prompt.casefold() == "/clear":
             history.clear()
-            card(None, ["Conversation cleared."])
+            print(paint("Conversation cleared.", MUTED))
             continue
-        card(None, [f"{provider} · {model} · {os.getcwd()}", "Enter sends · /clear resets · /exit closes"])
+        _render_user_message(prompt)
+        print(paint(f"{provider} · {model} · {os.getcwd()}", MUTED))
+        print(paint("Enter sends · /clear resets · /exit closes", MUTED))
         try:
             answer = _ask(config, history, prompt)
         except RuntimeError as error:
-            card("Agent request failed", [str(error)])
+            _render_agent_message(f"Request failed: {error}")
             continue
-        card("You", [prompt])
-        card("Xernel Agent", answer.splitlines() or [answer])
+        _render_agent_message(answer)
 
 
 def main(args: list[str]) -> int:

@@ -1,88 +1,54 @@
 # Xernel
 
-A minimal, extensible terminal interface for development.
+Xernel is an open source terminal interface for AI assisted development. The project is an early foundation: it currently includes a terminal UI, provider setup for OpenRouter and Cloudflare Workers AI, configuration display, and safe source checkout updates.
 
-## Install as a Python CLI package
+## Install
 
-Requires Python 3.10 or newer. The package publishes a `xernel` console command through its Python project entry point. For an isolated installation, use `pipx`:
+Requires Python 3.10 or newer, `curl`, and `tar`. The installer downloads the latest source from GitHub and installs Xernel into an isolated user virtual environment. It does not require Git or administrator access.
 
-```bash
-pipx install git+https://github.com/ardakooza/xernel.git
-xernel
+```sh
+curl -fsSL https://xernel.vercel.app/install.sh | sh
 ```
 
-If the `xernel` command is not found after installing pipx, run `pipx ensurepath` once and restart the terminal. Alternatively, install from an active virtual environment with `python -m pip install git+https://github.com/ardakooza/xernel.git`; activating that environment makes `xernel` available.
+On Termux, install Python and curl first:
 
-To upgrade a pipx installation, run `pipx upgrade xernel-cli`.
-
-### Termux (without pipx)
-
-Termux does not necessarily provide `pipx` as a `pkg` command. Install Git and Python with Termux, remove a stale source-launcher symlink if you previously deleted the cloned folder, then install the Python CLI package:
-
-```bash
-pkg install python git
-rm -f "$PREFIX/bin/xernel"
-python -m pip install --no-cache-dir --force-reinstall git+https://github.com/ardakooza/xernel.git
-hash -r
-xernel
+```sh
+pkg install python curl
+curl -fsSL https://xernel.vercel.app/install.sh | sh
 ```
 
-The package entry point installs `xernel` into Termux’s `$PREFIX/bin`, which is already on the standard Termux `PATH`.
+Run `xernel` to open the terminal interface. To upgrade, run the install command again. On Linux and macOS, the command is installed in `~/.local/bin`; on Termux it is installed in `$PREFIX/bin`. Add `~/.local/bin` to your `PATH` if your shell does not already include it.
 
-## Run from a source checkout
+The installer will not overwrite an unrelated existing `xernel` command. Remove or rename that command before installing if needed.
 
-If you prefer not to install the Python package, the repository also has a direct source launcher:
+## Configure a provider
 
-```bash
-git clone https://github.com/ardakooza/xernel.git
-sh xernel/install.sh
-xernel
-```
+Run `xernel setup` to choose OpenRouter or Cloudflare Workers AI and save the connection settings. Run `xernel config` to see the saved provider and model. API credentials are stored in the user configuration file with restricted file permissions; they are not encrypted.
 
-On Termux, the source installer places the launcher in `$PREFIX/bin`. On other Linux systems it uses `~/.local/bin`; add that directory to `PATH` if prompted.
+## Commands
 
-Optional commands:
+- `xernel` or `xernel run` — open the terminal interface
+- `xernel setup` — configure a provider
+- `xernel config` — show saved provider settings
+- `xernel init` — create a starter project configuration
+- `xernel update` — safely update a source checkout
+- `xernel --help` — show command help
 
-```bash
-xernel run
-xernel setup
-xernel config
-xernel update
-xernel --version
-xernel --help
-```
+## Development
 
-`xernel setup` opens a keyboard-driven provider wizard. Use the arrow keys to choose OpenRouter or Cloudflare Workers AI, then Enter or Space to select. Choose the documented default model or select a custom model ID; enter the API credential when prompted. Cloudflare also requires its 32-character Account ID. A custom Cloudflare token needs Workers AI Read and Edit permissions. Defaults use the model IDs in the [OpenRouter quickstart](https://openrouter.ai/docs/quickstart) and [Cloudflare Workers AI REST guide](https://developers.cloudflare.com/workers-ai/get-started/rest-api/). The wizard stores only provider connection settings in `~/.config/xernel/config.json` (or `$XDG_CONFIG_HOME/xernel/config.json`), with directory permissions `0700` and file permissions `0600`. The API key/token is stored as plaintext in that user-readable file, not encrypted.
-
-`xernel config` lists the saved provider, model, endpoint, and Account ID where applicable. It masks the API key/token rather than printing it.
-
-For a source-checkout installation, `xernel update` fetches changes with a fast-forward-only Git pull and stops if local changes are present. For a pipx package installation, use `pipx upgrade xernel-cli`. You can also type `/update` inside the TUI when running from a source checkout.
-
-## Development install
-
-Both the standalone launcher and installed console command use the same implementation in `src/xernel/core.py`.
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
+```sh
+python3 -m venv .venv
+. .venv/bin/activate
 python -m pip install -e .
 xernel
-xernel run
 ```
 
-On Termux, install Python first with `pkg install python`.
+`src/xernel/VERSION` is the version source for the CLI and package metadata.
 
-## Initial commands
+## Website
 
-- `xernel` — open the dependency-free prompt
-- `xernel run` — start an interactive prompt session
-- `xernel update` — safely fetch and apply the latest version
-- `xernel init` — create a starter configuration
-- `xernel --version` — show the version
-- `xernel --help` — show help
+The English landing page and hosted installer are in `public/`. The project is configured as a static Vercel site with `vercel.json`.
 
-## Versioning
+## License
 
-`src/xernel/VERSION` is the single source of truth. The standalone launcher, Python CLI, and package metadata all read the version from this file. Change it once for a release, then commit and push; `xernel update` retrieves the new version along with the code.
-
-This is the initial TUI foundation. AI providers, MCP, file tools, and agents are intentionally out of scope for this first step.
+MIT

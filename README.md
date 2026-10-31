@@ -45,7 +45,7 @@ python -m pip install -e .
 xernel
 ```
 
-`src/xernel/VERSION` is the user-facing CLI version in `DD.MM.YYYY` format for a single release that day. If there are multiple releases that day, include the release time as `DD.MM.YYYY - HH:MM`. `src/xernel/PYPI_VERSION` stores the corresponding PEP 440 package version used by Python installers.
+`src/xernel/VERSION` is the user-facing CLI version in `DD.MM.YYYY – #NNNN` format, where `NNNN` is a four-digit release identifier. `src/xernel/PYPI_VERSION` stores the corresponding PEP 440 package version used by Python installers.
 
 ## Website
 

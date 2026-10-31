@@ -23,10 +23,14 @@ def _read_key() -> str:
         if key == "\x1b":
             if not select.select([fd], [], [], 0.08)[0]:
                 return "CANCEL"
-            prefix = os.read(fd, 1).decode("utf-8", errors="ignore")
-            if prefix not in {"[", "O"}:
+            sequence = bytearray()
+            while select.select([fd], [], [], 0.08)[0]:
+                sequence.extend(os.read(fd, 1))
+                if len(sequence) >= 2 and 0x40 <= sequence[-1] <= 0x7E:
+                    break
+            if not sequence or sequence[0] not in {ord("["), ord("O")}:
                 return "CANCEL"
-            suffix = os.read(fd, 1).decode("utf-8", errors="ignore")
+            suffix = chr(sequence[-1])
             return {"A": "UP", "B": "DOWN", "C": "RIGHT", "D": "LEFT"}.get(suffix, "OTHER")
         if key in {"\r", "\n"}:
             return "ENTER"

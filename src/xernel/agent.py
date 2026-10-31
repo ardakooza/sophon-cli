@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import codecs
 import json
 import os
 import shutil
@@ -9,8 +10,8 @@ import sys
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from xernel.config import PROVIDERS, endpoint_for, read_config
-from xernel.core import GREEN, MUTED, RESET, card, display_width, paint, read_prompt, wrap_text
+from xernel.config import endpoint_for, read_config
+from xernel.core import BORDER, GREEN, MUTED, WHITE, card, display_width, paint, wrap_text
 
 SYSTEM_PROMPT = (
     "You are Xernel Agent, a concise and practical development assistant. "
@@ -81,94 +82,156 @@ def _ask(config: dict[str, object], history: list[dict[str, str]], prompt: str) 
     return answer
 
 
-def _input_bar(config: dict[str, object]) -> str:
-    if sys.stdout.isatty():
-        width = max(20, shutil.get_terminal_size((80, 24)).columns - 4)
-        bg = "\033[48;5;236m"
-        placeholder = "Ask Xernel to do anything"
-        prompt_width = 4
-        placeholder = placeholder[: max(0, width - prompt_width)]
-        sys.stdout.write(
-            "  " + bg + " " * width + "\r\033[2C" + bg + "› "
-            + f"\033[38;5;245m{placeholder}{bg}"
-        )
-        sys.stdout.write(f"\r\033[{prompt_width}C" + bg + " " * len(placeholder))
-        sys.stdout.write(f"\r\033[{prompt_width}C" + bg)
+def _input_bar() -> str:
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        return input("› Ask Codex to do anything: ").strip()
+
+    import select
+    import termios
+    import tty
+
+    inner = min(68, max(20, shutil.get_terminal_size((80, 24)).columns - 8))
+    placeholder = "Ask Codex to do anything"
+    fd = sys.stdin.fileno()
+    previous = termios.tcgetattr(fd)
+    characters: list[str] = []
+    rows: list[str] = []
+    cursor_row = 0
+    cursor_col = 2
+    previous_height = 0
+    decoder = codecs.getincrementaldecoder(sys.stdin.encoding or "utf-8")()
+
+    def layout() -> tuple[list[str], int, int]:
+        lines = ["› "]
+        placeholder_mode = not characters
+        text = placeholder if placeholder_mode else "".join(characters)
+        for character in text:
+            if display_width(lines[-1]) + display_width(character) > inner:
+                lines.append("")
+            lines[-1] += character
+        if placeholder_mode:
+            return lines, 0, 2
+        return lines, len(lines) - 1, display_width(lines[-1])
+
+    def clear_box() -> None:
+        nonlocal previous_height
+        if not previous_height:
+            return
+        sys.stdout.write(f"\033[{cursor_row}A\r")
+        for index in range(previous_height):
+            sys.stdout.write("\033[2K")
+            if index < previous_height - 1:
+                sys.stdout.write("\033[1B")
+        if previous_height > 1:
+            sys.stdout.write(f"\033[{previous_height - 1}A\r")
+        previous_height = 0
+
+    def redraw() -> None:
+        nonlocal rows, cursor_row, cursor_col, previous_height
+        clear_box()
+        rows, cursor_row, cursor_col = layout()
+        top = "  ╭" + "─" * (inner + 2) + "╮"
+        bottom = "  ╰" + "─" * (inner + 2) + "╯"
+        sys.stdout.write(paint(top, BORDER) + "\r\n")
+        for index, row in enumerate(rows):
+            prefix_width = display_width(row)
+            padding = " " * max(0, inner - prefix_width)
+            if index == 0 and row.startswith("› "):
+                visible = paint("› ", GREEN) + paint(row[2:], MUTED if not characters else WHITE)
+            else:
+                visible = paint(row, MUTED if not characters else WHITE)
+            sys.stdout.write(
+                paint("  │ ", BORDER) + visible + padding + " " + paint("│", BORDER) + "\r\n"
+            )
+        sys.stdout.write(paint(bottom, BORDER) + "\r\n")
+        previous_height = len(rows) + 2
+        delta = previous_height - 1 - cursor_row
+        sys.stdout.write(f"\033[{delta}A\r\033[{4 + cursor_col}C")
         sys.stdout.flush()
-        try:
-            return read_prompt("").strip()
-        finally:
-            sys.stdout.write(RESET)
-            sys.stdout.flush()
-    return input(paint("› ", GREEN)).strip()
+
+    def remove_box() -> None:
+        clear_box()
+        sys.stdout.flush()
+
+    try:
+        tty.setraw(fd)
+        redraw()
+        while True:
+            raw = os.read(fd, 1)
+            if not raw:
+                remove_box()
+                raise EOFError
+            if raw == b"\x1b":
+                if not select.select([fd], [], [], 0.08)[0]:
+                    remove_box()
+                    raise EOFError
+                sequence = bytearray()
+                while select.select([fd], [], [], 0.08)[0]:
+                    sequence.extend(os.read(fd, 1))
+                    if len(sequence) >= 2 and 0x40 <= sequence[-1] <= 0x7E:
+                        break
+                continue
+            if raw in {b"\r", b"\n"}:
+                remove_box()
+                return "".join(characters).strip()
+            if raw == b"\x03":
+                remove_box()
+                raise KeyboardInterrupt
+            if raw in {b"\x08", b"\x7f"}:
+                if characters:
+                    characters.pop()
+                    redraw()
+                continue
+            character = decoder.decode(raw)
+            if character and character.isprintable():
+                characters.append(character)
+                redraw()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, previous)
 
 
 def _render_user_message(message: str) -> None:
-    width = max(20, shutil.get_terminal_size((80, 24)).columns - 4)
-    background = "\033[48;5;236m" if sys.stdout.isatty() else ""
-    reset = RESET if background else ""
-    first = True
-    for paragraph in message.splitlines() or [message]:
-        if not paragraph:
-            print("  " + background + " " * width + reset)
-            first = True
-            continue
-        prefix = " › " if first else "   "
-        for line in wrap_text(paragraph, width - display_width(prefix)):
-            text = prefix + line
-            padding = " " * max(0, width - display_width(text))
-            print("  " + background + text + padding + reset)
-            first = False
+    terminal_width = max(28, shutil.get_terminal_size((80, 24)).columns - 8)
+    width = min(68, max(24, min(terminal_width, display_width(message) + 2)))
+    card(None, [f"› {message}"], width=width)
 
 
 def _render_agent_message(message: str) -> None:
     width = max(20, shutil.get_terminal_size((80, 24)).columns - 4)
     print()
+    first = True
     for paragraph in message.splitlines() or [message]:
         if not paragraph:
             print()
             continue
-        for line in wrap_text(paragraph, width):
-            print("  " + line)
+        for line in wrap_text(paragraph, width - (2 if first else 0)):
+            if first:
+                print(paint("• ", GREEN) + line)
+                first = False
+            else:
+                print("  " + line)
     print()
 
 
-def _clear_input_echo(message: str) -> None:
-    if not sys.stdout.isatty():
-        return
-    columns = max(1, shutil.get_terminal_size((80, 24)).columns)
-    rows = max(1, (4 + display_width(message) + columns - 1) // columns)
-    sys.stdout.write(f"\033[{rows}A\r")
-    for _ in range(rows):
-        sys.stdout.write("\033[2K\033[1B")
-    sys.stdout.write(f"\033[{rows}A\r")
-    sys.stdout.flush()
-
-
 def _interactive(config: dict[str, object]) -> int:
-    provider = PROVIDERS[str(config["provider"])]["label"]
-    model = str(config["model"])
     history: list[dict[str, str]] = []
-    print(paint("Xernel Agent · Ask about code, debugging, or development.", MUTED))
+    card("Xernel Agent", ["Ask about code, debugging, or development."])
     while True:
         try:
-            prompt = _input_bar(config)
+            prompt = _input_bar()
         except (EOFError, KeyboardInterrupt):
-            print("\n" + paint("  › ", GREEN) + paint("Session closed. See you soon.", MUTED))
+            print(paint("Session closed. See you soon.", MUTED))
             return 0
-        _clear_input_echo(prompt)
         if not prompt:
             continue
         if prompt.casefold() in {"/exit", "/quit", "q"}:
-            print(paint("  › ", GREEN) + paint("Session closed. See you soon.", MUTED))
+            print(paint("Session closed. See you soon.", MUTED))
             return 0
         if prompt.casefold() == "/clear":
             history.clear()
             print(paint("Conversation cleared.", MUTED))
             continue
         _render_user_message(prompt)
-        print(paint(f"{provider} · {model} · {os.getcwd()}", MUTED))
-        print(paint("Enter sends · /clear resets · /exit closes", MUTED))
         try:
             answer = _ask(config, history, prompt)
         except RuntimeError as error:

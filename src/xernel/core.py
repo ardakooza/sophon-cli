@@ -145,12 +145,21 @@ def card(
     if title is not None:
         if top_right:
             badge = top_right[:inner]
-            title_text = centered(title, inner)
-            title_content = " " + title_text + " " * (inner - display_width(title_text) + 1)
-            badge_text = " " + " " * (inner - display_width(badge)) + badge + " "
-            print(paint("  │", border_color) + paint(title_content, text_color) + paint("│", border_color))
-            print(paint("  │", border_color) + paint(badge_text, text_color) + paint("│", border_color))
-            content_lines.insert(0, "")
+            title_width = display_width(title)
+            badge_width = display_width(badge)
+            left_pad = max(0, (inner - title_width) // 2)
+            right_start = inner - badge_width
+            if left_pad + title_width + 1 <= right_start:
+                heading = " " * left_pad + title + " " * max(1, right_start - left_pad - title_width) + badge
+                heading = heading + " " * max(0, inner - display_width(heading))
+                title_content = " " + heading + " "
+                print(paint("  │", border_color) + paint(title_content, text_color) + paint("│", border_color))
+            else:
+                title_text = centered(title, inner)
+                title_content = " " + title_text + " " * (inner - display_width(title_text) + 1)
+                print(paint("  │", border_color) + paint(title_content, text_color) + paint("│", border_color))
+                badge_text = " " + " " * (inner - badge_width) + badge + " "
+                print(paint("  │", border_color) + paint(badge_text, text_color) + paint("│", border_color))
         else:
             content_lines.insert(0, title)
     for line in content_lines:
@@ -361,8 +370,9 @@ def run_session() -> int:
         try:
             value = read_prompt(paint("  › ", GREEN)).strip()
         except (EOFError, KeyboardInterrupt):
-            print()
-            break
+            sys.stdout.write("\r\033[2K")
+            print(paint("Session closed. See you soon.", MUTED))
+            return 0
         if not value:
             continue
         command = value.lower()
@@ -399,7 +409,7 @@ def run_session() -> int:
                 border_color=NOTICE_BORDER,
                 text_color=NOTICE_TEXT,
             )
-    print(paint("  › ", GREEN) + paint("Session closed. See you soon.", MUTED))
+    print(paint("Session closed. See you soon.", MUTED))
     return 0
 
 

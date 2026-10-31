@@ -29,24 +29,32 @@ mkdir -p "$INSTALL_DIR"
 is_legacy_xernel_link() {
     [ -L "$TARGET" ] || return 1
     LEGACY_TARGET=$(readlink "$TARGET") || return 1
-    case "$LEGACY_TARGET" in
-        */xernel/xernel) ;;
-        *) return 1 ;;
-    esac
     if [ -f "$LEGACY_TARGET" ]; then
         grep -q 'Launch the shared Xernel CLI directly from a source checkout' "$LEGACY_TARGET"
         return $?
     fi
+    case "$LEGACY_TARGET" in
+        */xernel/xernel) ;;
+        *) return 1 ;;
+    esac
     [ ! -e "$LEGACY_TARGET" ]
 }
 
+is_xernel_package_launcher() {
+    [ -f "$TARGET" ] || return 1
+    grep -Eq 'from xernel\.core import main|xernel\.core:main' "$TARGET"
+}
+
+REPLACE_TARGET=0
 if [ -e "$TARGET" ] || [ -L "$TARGET" ]; then
     if [ -L "$TARGET" ] && [ "$(readlink "$TARGET")" = "$INSTALL_DIR/venv/bin/xernel" ]; then
         :
     elif [ -f "$TARGET" ] && grep -q 'Xernel managed launcher' "$TARGET"; then
         :
     elif is_legacy_xernel_link; then
-        :
+        REPLACE_TARGET=1
+    elif is_xernel_package_launcher; then
+        REPLACE_TARGET=1
     else
         echo "Refusing to replace an existing command: $TARGET" >&2
         echo "Remove it yourself, then rerun this installer." >&2
@@ -69,7 +77,7 @@ fi
 if [ -L "$TARGET" ]; then
     ln -sfn "$INSTALL_DIR/venv/bin/xernel" "$TARGET.new"
     mv -f "$TARGET.new" "$TARGET"
-elif [ ! -e "$TARGET" ]; then
+elif [ "$REPLACE_TARGET" -eq 1 ] || [ ! -e "$TARGET" ]; then
     WRAPPER="$TARGET.new"
     cat > "$WRAPPER" <<EOF
 #!/bin/sh

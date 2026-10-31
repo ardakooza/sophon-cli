@@ -9,10 +9,10 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from xernel.config import config_path, write_config
-from xernel.core import card, display_width, wrap_text
+from sophon.config import config_path, write_config
+from sophon.core import card, display_width, wrap_text
 
-VERSION = (ROOT / "src" / "xernel" / "VERSION").read_text(encoding="utf-8").strip()
+VERSION = (ROOT / "src" / "sophon" / "VERSION").read_text(encoding="utf-8").strip()
 ENV = {**os.environ, "PYTHONPATH": str(ROOT / "src")}
 
 
@@ -30,15 +30,15 @@ def run(*args, input_text=None, env_overrides=None):
 
 
 def test_version_is_dynamic_and_shared():
-    standalone = run(ROOT / "xernel", "--version")
-    package_cli = run("-m", "xernel.cli", "--version")
+    standalone = run(ROOT / "sophon", "--version")
+    package_cli = run("-m", "sophon.cli", "--version")
     assert standalone.returncode == package_cli.returncode == 0
-    assert standalone.stdout == package_cli.stdout == f"xernel {VERSION}\n"
+    assert standalone.stdout == package_cli.stdout == f"sophon {VERSION}\n"
 
 
 def test_help_is_shared_between_entry_points():
-    standalone = run(ROOT / "xernel", "--help")
-    package_cli = run("-m", "xernel.cli", "--help")
+    standalone = run(ROOT / "sophon", "--help")
+    package_cli = run("-m", "sophon.cli", "--help")
     assert standalone.stdout == package_cli.stdout
     assert "update" in standalone.stdout
     assert "init" in standalone.stdout
@@ -47,13 +47,13 @@ def test_help_is_shared_between_entry_points():
 
 
 def test_plain_words_are_not_commands():
-    result = run(ROOT / "xernel", input_text="exit\n/exit\n")
+    result = run(ROOT / "sophon", input_text="exit\n/exit\n")
     assert result.returncode == 0
     assert "Commands must start with /." in result.stdout
 
 
 def test_setup_refuses_to_read_credentials_without_a_tty():
-    result = run(ROOT / "xernel", "setup", input_text="do-not-read-this-secret\n")
+    result = run(ROOT / "sophon", "setup", input_text="do-not-read-this-secret\n")
     assert result.returncode == 1
     assert "interactive terminal" in result.stdout
     assert "do-not-read-this-secret" not in result.stdout + result.stderr
@@ -95,7 +95,7 @@ def test_config_masks_credentials_and_uses_private_file_permissions():
             })
         assert path.stat().st_mode & 0o777 == 0o600
         assert path.parent.stat().st_mode & 0o777 == 0o700
-        result = run(ROOT / "xernel", "config", env_overrides=env)
+        result = run(ROOT / "sophon", "config", env_overrides=env)
         assert result.returncode == 0
         assert "secret-openrouter-key" not in result.stdout
         assert "••••••••-key" in result.stdout

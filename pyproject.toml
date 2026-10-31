@@ -3,23 +3,23 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "xernel-cli"
+name = "sophon-cli"
 dynamic = ["version"]
 description = "A minimal, extensible terminal interface for development."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 [project.scripts]
-xernel = "xernel.core:main"
+sophon = "sophon.core:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.dynamic]
-version = { file = ["src/xernel/PYPI_VERSION"] }
+version = { file = ["src/sophon/PYPI_VERSION"] }
 
 [tool.setuptools.package-data]
-xernel = ["VERSION", "PYPI_VERSION"]
+sophon = ["VERSION", "PYPI_VERSION"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -1,4 +1,4 @@
-"""Chat-only AI agent backed by the configured Xernel provider."""
+"""Chat-only AI agent backed by the configured Sophon provider."""
 
 from __future__ import annotations
 
@@ -15,14 +15,15 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from xernel.config import PROVIDERS, endpoint_for, read_config, write_config
-from xernel.core import BORDER, MUTED, NOTICE_BORDER, NOTICE_TEXT, WHITE, card, display_width, paint, wrap_text
+from sophon.config import PROVIDERS, endpoint_for, read_config, write_config
+from sophon.core import BORDER, MUTED, NOTICE_BORDER, NOTICE_TEXT, WHITE, card, display_width, paint, wrap_text
 
-SESSION_FILE = Path.home() / ".xernel" / "sessions" / "sessions.json"
-INPUT_PLACEHOLDER = "Create something with xernel"
+SESSION_FILE = Path.home() / ".sophon" / "sessions" / "sessions.json"
+LEGACY_SESSION_FILE = Path.home() / ".xernel" / "sessions" / "sessions.json"
+INPUT_PLACEHOLDER = "Create something with sophon"
 
 SYSTEM_PROMPT = (
-    "You are Xernel Agent, a concise and practical development assistant. "
+    "You are Sophon, a concise and practical development assistant. "
     "You can discuss code, but you cannot access or modify the user's local files. "
     "Never claim to have run commands or changed files."
 )
@@ -117,10 +118,11 @@ def _new_session() -> dict[str, object]:
 
 
 def _load_sessions() -> list[dict[str, object]]:
-    if not SESSION_FILE.exists():
+    source = SESSION_FILE if SESSION_FILE.exists() else LEGACY_SESSION_FILE
+    if not source.exists():
         return []
     try:
-        with SESSION_FILE.open(encoding="utf-8") as stream:
+        with source.open(encoding="utf-8") as stream:
             value = json.load(stream)
     except (OSError, json.JSONDecodeError) as error:
         raise RuntimeError(f"Could not read saved sessions: {error}") from None
@@ -144,6 +146,8 @@ def _load_sessions() -> list[dict[str, object]]:
         ):
             raise RuntimeError("Saved sessions file contains an invalid message.")
         sessions.append(item)
+    if source == LEGACY_SESSION_FILE:
+        _write_sessions(sessions)
     return sessions
 
 
@@ -193,6 +197,7 @@ def _card_rows(
     *,
     columns: int,
     width: int | None = None,
+    top_right: str | None = None,
     border_color: str = BORDER,
     text_color: str = WHITE,
 ) -> list[str]:
@@ -201,11 +206,25 @@ def _card_rows(
     bottom = "  ╰" + "─" * (inner + 2) + "╯"
     rows = [paint(top, border_color)]
     content = list(lines)
-    if title is not None:
+    if title is not None and top_right is not None:
+        badge = _truncate_display(top_right, inner)
+        title_width, badge_width = display_width(title), display_width(badge)
+        left_pad = max(0, (inner - title_width) // 2)
+        right_start = inner - badge_width
+        if left_pad + title_width + 1 <= right_start:
+            heading = " " * left_pad + title + " " * max(1, right_start - left_pad - title_width) + badge
+            heading += " " * max(0, inner - display_width(heading))
+            rows.append(paint("  │", border_color) + paint(" " + heading + " ", text_color) + paint("│", border_color))
+        else:
+            heading = centered(title, inner)
+            rows.append(paint("  │", border_color) + paint(" " + heading + " " * (inner - display_width(heading) + 1), text_color) + paint("│", border_color))
+            rows.append(paint("  │", border_color) + paint(" " + " " * (inner - badge_width) + badge + " ", text_color) + paint("│", border_color))
+        content.insert(0, "")
+    elif title is not None:
         content.insert(0, "")
         content.insert(0, title)
     for line in content:
-        is_title = line == title and title is not None
+        is_title = line == title and title is not None and top_right is None
         for wrapped in wrap_text(line, inner):
             text = " " * ((inner - display_width(wrapped)) // 2) + wrapped if is_title else wrapped
             padding = max(0, inner - display_width(text))
@@ -328,12 +347,13 @@ def _draw_screen(
     panel_rows: list[str] | None = None,
     notice_rows: list[str] | None = None,
     suggestion: str = "",
+    status_message: str | None = None,
 ) -> tuple[int, int]:
     size = shutil.get_terminal_size((80, 24))
     columns, height = size.columns, max(8, size.lines)
     width = min(68, max(20, columns - 8))
-    header = _card_rows(
-        "Xernel Agent",
+    header = [] if session["messages"] else _card_rows(
+        "Sophon Agent",
         ["Ask about code, debugging, and development."],
         columns=columns,
     )
@@ -347,6 +367,8 @@ def _draw_screen(
         feed = panel_rows
     else:
         feed = list(notice_rows or []) + _message_rows(session["messages"], columns)
+        if status_message:
+            feed.extend(_card_rows(None, [status_message], columns=columns, width=display_width(status_message)))
     room = max(0, height - len(header) - len(box))
     visible_feed = feed[-room:] if room else []
     if panel_rows is not None and room >= 2 and len(panel_rows) > room:
@@ -551,7 +573,7 @@ def _pick_item(
     last_size = shutil.get_terminal_size((80, 24))
     while True:
         size = shutil.get_terminal_size((80, 24))
-        header_count = len(_card_rows("Xernel Agent", ["Ask about code, debugging, and development."], columns=size.columns))
+        header_count = 0 if session.get("messages") else len(_card_rows("Sophon Agent", ["Ask about code, debugging, and development."], columns=size.columns))
         input_count = 3
         room = max(1, size.lines - header_count - input_count)
         compact = room < 13
@@ -583,8 +605,7 @@ def _pick_item(
                 )
                 if match and cursor == len(text) and len(match) > len(text):
                     completion = match[len(text):]
-            status = f"{len(filtered)} models · current: {current_id or 'not set'}" if title == "Available Models" else f"{len(filtered)} saved sessions"
-            body = [_truncate_display(status, inner_width)]
+            body = [f"Current model: {_truncate_display(current_id, inner_width - 15)}"] if title == "Available Models" else []
             if not compact:
                 body.append("")
             if not shown:
@@ -599,9 +620,12 @@ def _pick_item(
                         body.append("")
             if not compact:
                 body.append("")
-            footer = f"{start + 1 if shown else 0}–{start + len(shown)} of {len(filtered)} · ↑/↓ move · Enter select · Esc cancel"
+            footer = "↑/↓ move · Enter select · Esc cancel"
             body.append(_truncate_display(footer, inner_width))
-            return _card_rows(title, body, columns=size.columns), completion
+            range_label = f"{start + 1 if shown else 0}–{start + len(shown)} of {len(filtered)}"
+            if title == "Available Models":
+                range_label += f" · {len(filtered)} models"
+            return _card_rows(title, body, columns=size.columns, top_right=range_label), completion
 
         panel, completion = render(query, len(query))
         placeholder = "Type a model ID or use ↑/↓" if title == "Available Models" else "Type to filter or use ↑/↓"
@@ -669,6 +693,7 @@ def _interactive(config: dict[str, object]) -> int:
         return 1
     session = _new_session()
     notice_rows: list[str] = []
+    waiting = {"message": None}
 
     def draw(
         text: str,
@@ -686,6 +711,7 @@ def _interactive(config: dict[str, object]) -> int:
             panel_rows=panel_rows,
             notice_rows=notice_rows,
             suggestion=suggestion,
+            status_message=waiting["message"],
         )
 
     def notice(title: str, message: str, *, error: bool = False) -> None:
@@ -696,6 +722,15 @@ def _interactive(config: dict[str, object]) -> int:
             columns=shutil.get_terminal_size((80, 24)).columns,
             border_color=NOTICE_BORDER if error else BORDER,
             text_color=NOTICE_TEXT if error else WHITE,
+        )
+
+    def notice_plain(message: str) -> None:
+        nonlocal notice_rows
+        notice_rows = _card_rows(
+            None,
+            [message],
+            columns=shutil.get_terminal_size((80, 24)).columns,
+            width=display_width(message),
         )
 
     def save_current() -> bool:
@@ -728,19 +763,19 @@ def _interactive(config: dict[str, object]) -> int:
                 return 0
             if command == "help":
                 notice_rows = _card_rows(
-                    "Agent Commands",
-                    ["/model [search]  Choose a provider model", "/new  Start a fresh saved session", "/rename [title]  Rename this session", "/resume  Load a saved session", "/clear  Start a new session", "/exit or Q  Close Xernel Agent"],
+                    "Sophon Commands",
+                    ["/model [search]  Choose a provider model", "/new  Start a fresh saved session", "/rename [title]  Rename this session", "/resume  Load a saved session", "/clear  Start a new session", "/exit or Q  Close Sophon Agent"],
                     columns=shutil.get_terminal_size((80, 24)).columns,
                 )
             elif command in {"new", "clear"}:
                 session = _new_session()
-                notice("New session", "A fresh session is ready.")
+                notice_plain("New session")
             elif command == "rename":
                 title = argument or _input_bar(draw, "Enter a session title")
                 if title.strip():
                     session["title"] = title.strip()[:80]
                     if save_current():
-                        notice("Session renamed", str(session["title"]))
+                        notice_plain(f'Session renamed "{session["title"]}"')
                 else:
                     notice("Session not renamed", "A title is required.", error=True)
             elif command == "resume":
@@ -750,7 +785,7 @@ def _interactive(config: dict[str, object]) -> int:
                 selected = _pick_item(session, draw, items, title="Resume Session", current_id=str(session["id"]))
                 if selected:
                     session = selected["session"]
-                    notice("Session resumed", str(session["title"]))
+                    notice_rows = []
                 else:
                     notice("Resume cancelled", "The current session is still open.")
             elif command == "model":
@@ -791,12 +826,16 @@ def _interactive(config: dict[str, object]) -> int:
         if not save_current():
             messages.pop()
             continue
+        waiting["message"] = "Sophon is thinking…"
+        draw("", 0)
         try:
             answer = _request(config, [{"role": "system", "content": SYSTEM_PROMPT}, *(item for item in messages if item["role"] in {"user", "assistant"})])
         except RuntimeError as error:
+            waiting["message"] = None
             messages.append({"role": "error", "content": str(error)})
             save_current()
             continue
+        waiting["message"] = None
         messages.append({"role": "assistant", "content": answer})
         if not save_current():
             notice("Session storage error", "The reply is visible but could not be saved.", error=True)
@@ -810,7 +849,7 @@ def main(args: list[str]) -> int:
         else:
             card(
                 "Agent request failed",
-                ['Usage: xernel agent [-p "message"]'],
+                ['Usage: sophon agent [-p "message"]'],
                 border_color=NOTICE_BORDER,
                 text_color=NOTICE_TEXT,
             )
@@ -819,7 +858,7 @@ def main(args: list[str]) -> int:
     if config is None:
         card(
             "Provider required",
-            ["No provider is configured.", "Run xernel setup first."],
+            ["No provider is configured.", "Run sophon setup first."],
             border_color=NOTICE_BORDER,
             text_color=NOTICE_TEXT,
         )
@@ -836,6 +875,7 @@ def main(args: list[str]) -> int:
             text_color=NOTICE_TEXT,
         )
         return 2
+    card(None, ["Sophon is thinking…"], width=display_width("Sophon is thinking…"))
     try:
         _render_agent_message(_ask(config, [], one_shot))
     except RuntimeError as error:

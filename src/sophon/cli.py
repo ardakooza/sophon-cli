@@ -1,6 +1,6 @@
 """Installed console-script entry point; behavior lives in the shared core."""
 
-from xernel.core import main
+from sophon.core import main
 
 app = main
 

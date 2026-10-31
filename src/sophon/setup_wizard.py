@@ -7,8 +7,8 @@ import os
 import select
 import sys
 
-from xernel.config import PROVIDERS, config_display_path, read_config, write_config
-from xernel.core import card, clear_terminal
+from sophon.config import PROVIDERS, config_display_path, read_config, write_config
+from sophon.core import card, clear_terminal
 
 
 def _read_key() -> str:
@@ -147,19 +147,19 @@ def _choose_model(provider: str, default_model: str, saved_model: str = "") -> s
 
 def run_setup_wizard() -> int:
     if not sys.stdin.isatty() or not sys.stdout.isatty():
-        card("Xernel", ["Setup requires an interactive terminal.", "Run xernel setup from Termux or a shell."])
+        card("Sophon", ["Setup requires an interactive terminal.", "Run sophon setup from Termux or a shell."])
         return 1
     try:
         existing = read_config()
     except (OSError, ValueError) as error:
-        card("Xernel", ["Existing configuration could not be read.", str(error)])
+        card("Sophon", ["Existing configuration could not be read.", str(error)])
         return 1
 
     if existing is not None:
         action = _choose_existing_action(existing)
         if action == "keep":
             card(
-                "Xernel",
+                "Sophon",
                 [
                     "Current provider settings kept.",
                     f"Provider: {PROVIDERS[existing['provider']]['label']}",
@@ -187,7 +187,7 @@ def run_setup_wizard() -> int:
         card("Setup of Custom Model", ["Enter a model ID."], top_right="2 OF 4")
         model = input("Model ID: ").strip()
         if not model:
-            card("Xernel", ["A model ID is required.", "No configuration was saved."])
+            card("Sophon", ["A model ID is required.", "No configuration was saved."])
             return 1
     else:
         model = model_choice
@@ -200,7 +200,7 @@ def run_setup_wizard() -> int:
     if not api_key:
         api_key = old_key
     if not api_key:
-        card("Xernel", ["An API key/token is required.", "No configuration was saved."])
+        card("Sophon", ["An API key/token is required.", "No configuration was saved."])
         return 1
 
     data = {
@@ -215,10 +215,10 @@ def run_setup_wizard() -> int:
         old_account = (existing or {}).get("account_id", "") if same_provider else ""
         account_id = input(f"Cloudflare Account ID [{old_account}]: ").strip() or old_account
         if not account_id:
-            card("Xernel", ["Cloudflare Account ID is required.", "No configuration was saved."])
+            card("Sophon", ["Cloudflare Account ID is required.", "No configuration was saved."])
             return 1
         if len(account_id) != 32 or any(char not in "0123456789abcdefABCDEF" for char in account_id):
-            card("Xernel", ["Account ID must be 32 hexadecimal characters.", "No configuration was saved."])
+            card("Sophon", ["Account ID must be 32 hexadecimal characters.", "No configuration was saved."])
             return 1
         data["account_id"] = account_id
         data["endpoint"] = f"{spec['endpoint_base']}/{account_id}/ai/run/{model}"
@@ -246,10 +246,10 @@ def run_setup_wizard() -> int:
     try:
         path = write_config(data)
     except (OSError, ValueError) as error:
-        card("Xernel", ["Could not save configuration.", str(error)])
+        card("Sophon", ["Could not save configuration.", str(error)])
         return 1
     card(
-        "Xernel",
+        "Sophon",
         [
             "SETUP COMPLETE",
             f"Provider: {spec['label']}",

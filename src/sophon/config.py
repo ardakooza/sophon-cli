@@ -1,4 +1,4 @@
-"""Local provider configuration storage for Xernel."""
+"""Local provider configuration storage for Sophon."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ PROVIDERS: dict[str, dict[str, str]] = {
 
 def config_path() -> Path:
     xdg_home = os.environ.get("XDG_CONFIG_HOME")
-    base = Path(xdg_home) / "xernel" if xdg_home else Path.home() / ".xernel"
+    base = Path(xdg_home) / "sophon" if xdg_home else Path.home() / ".sophon"
     return base / "config" / "config.json"
 
 
@@ -38,16 +38,33 @@ def config_display_path() -> str:
 
 def legacy_config_path() -> Path:
     xdg_home = os.environ.get("XDG_CONFIG_HOME")
-    base = Path(xdg_home) if xdg_home else Path.home() / ".config"
-    return base / "xernel" / "config.json"
+    if xdg_home:
+        return Path(xdg_home) / "xernel" / "config" / "config.json"
+    return Path.home() / ".xernel" / "config" / "config.json"
+
+
+def _legacy_config_paths() -> tuple[Path, ...]:
+    xdg_home = os.environ.get("XDG_CONFIG_HOME")
+    if xdg_home:
+        base = Path(xdg_home)
+        return (
+            legacy_config_path(),
+            base / "xernel" / "config.json",
+            Path.home() / ".xernel" / "config" / "config.json",
+            Path.home() / ".config" / "xernel" / "config.json",
+        )
+    return (
+        legacy_config_path(),
+        Path.home() / ".config" / "xernel" / "config.json",
+    )
 
 
 def read_config() -> dict[str, Any] | None:
     path = config_path()
     source = path
     if not source.exists():
-        legacy_path = legacy_config_path()
-        if legacy_path == path or not legacy_path.exists():
+        legacy_path = next((candidate for candidate in _legacy_config_paths() if candidate.exists()), None)
+        if legacy_path is None:
             return None
         source = legacy_path
     with source.open(encoding="utf-8") as stream:

@@ -1,4 +1,4 @@
-"""Shared, dependency-free Xernel CLI and terminal UI."""
+"""Shared, dependency-free Sophon CLI and terminal UI."""
 
 from __future__ import annotations
 
@@ -13,8 +13,8 @@ from pathlib import Path
 from urllib.error import URLError
 from urllib.request import urlopen
 
-from xernel.config import PROVIDERS, config_display_path, endpoint_for, mask_secret, read_config
-from xernel import __version__ as VERSION
+from sophon.config import PROVIDERS, config_display_path, endpoint_for, mask_secret, read_config
+from sophon import __version__ as VERSION
 
 RESET = "\033[0m"
 BORDER = "\033[38;5;252m"
@@ -23,7 +23,9 @@ NOTICE_TEXT = "\033[38;5;160m"
 MUTED = "\033[38;5;245m"
 WHITE = "\033[38;5;255m"
 GREEN = "\033[38;5;114m"
-LATEST_VERSION_URL = "https://raw.githubusercontent.com/ardakooza/xernel/main/src/xernel/VERSION"
+UPDATE_BORDER = "\033[38;5;179m"
+UPDATE_TEXT = "\033[38;5;221m"
+LATEST_VERSION_URL = "https://raw.githubusercontent.com/ardakooza/sophon-cli/main/src/sophon/VERSION"
 
 
 def paint(text: str, color: str) -> str:
@@ -234,13 +236,22 @@ def read_prompt(prompt: str) -> str:
         termios.tcsetattr(fd, termios.TCSADRAIN, previous)
 
 
-def show_welcome() -> None:
+def show_welcome(*, check_updates: bool = False) -> None:
     print()
     card(
-        "Xernel",
+        "Sophon",
         ["A minimal development environment.", "Build. Think. Execute.", "", f"READY    v{VERSION}"],
-        centered_lines={"Xernel"},
+        centered_lines={"Sophon"},
     )
+    if check_updates and sys.stdin.isatty() and sys.stdout.isatty():
+        remote_version = latest_version(timeout=4)
+        if remote_version and remote_version != VERSION:
+            card(
+                None,
+                [f"Update available · {VERSION} → {remote_version}", "Run /update to install."],
+                border_color=UPDATE_BORDER,
+                text_color=UPDATE_TEXT,
+            )
     print()
 
 
@@ -288,9 +299,9 @@ def run_git_animated(args: list[str], lines: list[str], active_line: int, messag
                 update_card(lines)
 
 
-def latest_version() -> str | None:
+def latest_version(timeout: float = 10) -> str | None:
     try:
-        with urlopen(LATEST_VERSION_URL, timeout=10) as response:
+        with urlopen(LATEST_VERSION_URL, timeout=timeout) as response:
             version = response.read().decode("utf-8").strip()
     except (OSError, TimeoutError, URLError, UnicodeError):
         return None
@@ -308,7 +319,7 @@ def update() -> int:
             update_card(["Version check failed", "Could not reach GitHub", "Retry later"], final=True)
             return 1
         if remote_version == VERSION:
-            update_card(["! Version already current.", "", f"xernel {VERSION}"], final=True)
+            update_card(["! Version already current.", "", f"sophon {VERSION}"], final=True)
             return 0
 
         lines[:] = ["Update available", f"{VERSION} → {remote_version}", "Installing with pip"]
@@ -322,7 +333,7 @@ def update() -> int:
                 "--disable-pip-version-check",
                 "--upgrade",
                 "--force-reinstall",
-                "https://github.com/ardakooza/xernel/archive/refs/heads/main.tar.gz",
+                "https://github.com/ardakooza/sophon-cli/archive/refs/heads/main.tar.gz",
             ],
             lines,
             1,
@@ -331,7 +342,7 @@ def update() -> int:
         if status_code != 0:
             update_card(["Update failed", "Check network or pip", "Retry later"], final=True)
             return status_code
-        update_card(["Update complete", f"xernel {remote_version}", "Restart Xernel"], final=True)
+        update_card(["Update complete", f"sophon {remote_version}", "Restart Sophon"], final=True)
         return 0
 
     update_card(lines, initial=True)
@@ -354,19 +365,19 @@ def update() -> int:
         update_card(["Update failed", "Check network or Git", "Retry later"], final=True)
         return pull_code
     if stdout and "Already up to date" in stdout:
-        update_card(["! Version already current.", "", f"xernel {VERSION}"], final=True)
+        update_card(["! Version already current.", "", f"sophon {VERSION}"], final=True)
     else:
         try:
-            updated_version = (repo / "src" / "xernel" / "VERSION").read_text(encoding="utf-8").strip()
+            updated_version = (repo / "src" / "sophon" / "VERSION").read_text(encoding="utf-8").strip()
         except OSError:
             updated_version = "latest"
-        update_card(["Update complete", f"xernel {updated_version}", "Restart Xernel"], final=True)
+        update_card(["Update complete", f"sophon {updated_version}", "Restart Sophon"], final=True)
     return 0
 
 
 def run_session() -> int:
     clear_terminal()
-    show_welcome()
+    show_welcome(check_updates=True)
     while True:
         try:
             value = read_prompt(paint("  › ", GREEN)).strip()
@@ -383,23 +394,23 @@ def run_session() -> int:
             if command == "/update":
                 update()
             elif command == "/help":
-                card(None, ["/help     Show available commands", "/setup    Configure a provider", "/config   Show saved settings", "/clear    Redraw the welcome screen", "/version  Print the current version", "/update   Pull latest code safely", "/exit     Close Xernel"])
+                card(None, ["/help     Show available commands", "/setup    Configure a provider", "/config   Show saved settings", "/clear    Redraw the welcome screen", "/version  Print the current version", "/update   Pull latest code safely", "/exit     Close Sophon"])
             elif command == "/setup":
-                from xernel.setup_wizard import run_setup_wizard
+                from sophon.setup_wizard import run_setup_wizard
 
                 if run_setup_wizard() == 0:
                     show_welcome()
             elif command == "/config":
                 show_config()
             elif command == "/version":
-                card(None, [f"xernel {VERSION}"])
+                card(None, [f"sophon {VERSION}"])
             elif command == "/clear":
                 clear_terminal()
                 show_welcome()
             else:
                 card(
                     None,
-                    [f"{value} is not a Xernel command.", "Type /help to see available commands."],
+                    [f"{value} is not a Sophon command.", "Type /help to see available commands."],
                     border_color=NOTICE_BORDER,
                     text_color=NOTICE_TEXT,
                 )
@@ -415,12 +426,12 @@ def run_session() -> int:
 
 
 def init_config() -> int:
-    config = Path(".xernel.toml")
+    config = Path(".sophon.toml")
     if config.exists():
-        card(None, ["Configuration already exists", ".xernel.toml"])
+        card(None, ["Configuration already exists", ".sophon.toml"])
         return 1
     config.write_text('version = 1\n\n[ui]\ntheme = "dark"\n', encoding="utf-8")
-    card(None, ["Created .xernel.toml"])
+    card(None, ["Created .sophon.toml"])
     return 0
 
 
@@ -431,7 +442,7 @@ def show_config() -> int:
         card(None, ["Configuration is invalid or unreadable.", f"Path: {config_display_path()}"])
         return 1
     if data is None:
-        card(None, ["No provider is configured.", "Run xernel setup to connect one."])
+        card(None, ["No provider is configured.", "Run sophon setup to connect one."])
         return 0
 
     provider = data["provider"]
@@ -449,9 +460,9 @@ def show_config() -> int:
 
 def print_help() -> None:
     print(
-        "Usage: xernel [run|update|init|setup|config|agent|--version|--help]\n\n"
+        "Usage: sophon [run|update|init|setup|config|agent|--version|--help]\n\n"
         "Commands:\n"
-        "  run       Start the Xernel terminal interface\n"
+        "  run       Start the Sophon terminal interface\n"
         "  update    Safely fetch the latest version\n"
         "  init      Create a starter configuration\n"
         "  setup     Configure an AI provider\n"
@@ -465,7 +476,7 @@ def print_help() -> None:
 def main() -> int:
     args = sys.argv[1:]
     if args in (["--version"], ["-v"]):
-        print(f"xernel {VERSION}")
+        print(f"sophon {VERSION}")
         return 0
     if args in (["--help"], ["-h"]):
         print_help()
@@ -475,17 +486,17 @@ def main() -> int:
     if args == ["init"]:
         return init_config()
     if args == ["setup"]:
-        from xernel.setup_wizard import run_setup_wizard
+        from sophon.setup_wizard import run_setup_wizard
 
         return run_setup_wizard()
     if args == ["config"]:
         return show_config()
     if args and args[0] == "agent":
-        from xernel.agent import main as agent_main
+        from sophon.agent import main as agent_main
 
         return agent_main(args[1:])
     if not args or args == ["run"]:
         return run_session()
     print(f"Unknown command: {' '.join(args)}", file=sys.stderr)
-    print("Run 'xernel --help' for usage.", file=sys.stderr)
+    print("Run 'sophon --help' for usage.", file=sys.stderr)
     return 2

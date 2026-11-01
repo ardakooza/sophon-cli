@@ -6,8 +6,10 @@ import base64
 import codecs
 import json
 import os
+import platform
 import re
 import select
+import shlex
 import shutil
 import subprocess
 import sys
@@ -22,6 +24,7 @@ from sophon.config import (
     PROVIDERS,
     config_display_path,
     config_path,
+    detect_environment,
     ensure_environment_config,
     read_config,
     write_config,
@@ -593,14 +596,44 @@ def run_session() -> int:
             return 0
         if not value:
             continue
-        command = value.lower()
+        command, _, argument = value.partition(" ")
+        command = command.casefold()
+        argument = argument.strip()
         if command in {"/exit", "/quit", "q"}:
             break
         if command.startswith("/"):
             if command == "/update":
                 update()
             elif command == "/help":
-                card("Sophon commands", ["/help — Show available commands", "/setup — Configure a provider", "/config — Show saved settings", "/auto-update on|off — Automatic updates at startup", "/clear — Redraw the welcome screen", "/version — Print the current version", "/update — Update and restart if changed", "/restart — Restart Sophon", "/exit — Close Sophon"])
+                card(
+                    "Sophon Commands",
+                    [
+                        "/agent — Open Sophon Agent",
+                        "/auto-update on|off — Set startup updates",
+                        "/clear — Redraw the welcome screen",
+                        "/config — Show saved settings",
+                        "/help — Show available commands",
+                        "/identity — View or edit AGENT.md",
+                        "/restart — Restart Sophon",
+                        "/setup — Configure a provider",
+                        "/status — Inspect system and workspace health",
+                        "/update — Update and restart if changed",
+                        "/version — Show the current version",
+                        "/exit — Close Sophon",
+                    ],
+                )
+            elif command == "/agent":
+                from sophon.agent import main as agent_main
+
+                agent_main([])
+                if RESTART_REQUESTED:
+                    restart_sophon(RESTART_ARGS)
+                clear_terminal()
+                show_welcome()
+            elif command == "/status":
+                system_status()
+            elif command == "/identity":
+                manage_identity()
             elif command == "/setup":
                 from sophon.setup_wizard import run_setup_wizard
 
@@ -609,12 +642,10 @@ def run_session() -> int:
             elif command == "/config":
                 show_config()
             elif command.startswith("/auto-update"):
-                _, _, value = command.partition(" ")
-                value = value.strip()
-                if value in {"on", "off"}:
-                    set_auto_update(value == "on")
-                    card("Automatic updates", [f"Auto-update is {value}. Use /auto-update on|off."])
-                elif not value:
+                if argument in {"on", "off"}:
+                    set_auto_update(argument == "on")
+                    card("Automatic updates", [f"Auto-update is {argument}. Use /auto-update on|off."])
+                elif not argument:
                     status = "on" if auto_update_enabled() else "off"
                     card("Automatic updates", [f"Auto-update is {status}. Use /auto-update on|off."])
                 else:
@@ -824,6 +855,202 @@ def doctor() -> int:
     return int(bool(counts["WARN"] or counts["FAIL"]))
 
 
+def system_status() -> int:
+    warnings: list[str] = []
+    terminal_size = shutil.get_terminal_size((80, 24))
+    rows = [
+        f"Environment: {detect_environment()}",
+        f"Platform: {platform.system()} {platform.release()} · {platform.machine() or 'unknown architecture'}",
+        f"Python: {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+        f"Runtime: {sys.implementation.name} · PID {os.getpid()}",
+        f"Terminal: {'interactive' if sys.stdin.isatty() and sys.stdout.isatty() else 'non-interactive'} · {terminal_size.columns}×{terminal_size.lines}",
+        f"Encoding: {getattr(sys.stdout, 'encoding', None) or 'unknown'}",
+        f"Sophon: {VERSION}",
+        f"Executable: {display_home_paths(sys.executable)}",
+        "",
+    ]
+    if sys.version_info < (3, 10):
+        warnings.append("Python 3.10 or newer is required")
+
+    try:
+        config = read_config()
+    except (OSError, ValueError) as error:
+        config = None
+        warnings.append(f"Configuration could not be read: {error}")
+    if config is None:
+        rows.extend(["Provider: not configured", "Model: not selected"])
+        if not warnings:
+            warnings.append("No provider is configured")
+    else:
+        provider = str(config.get("provider", "unknown"))
+        rows.extend([
+            f"Provider: {PROVIDERS.get(provider, {}).get('label', provider)}",
+            f"Model: {config.get('model', 'unknown')}",
+            f"Auto-update: {'on' if config.get('auto_update') is True else 'off'}",
+        ])
+        reasoning = config.get("reasoning") if isinstance(config.get("reasoning"), dict) else {}
+        if reasoning.get("is_support") is not True:
+            rows.append("Reasoning: not supported")
+        else:
+            rows.append(f"Reasoning: {'on' if reasoning.get('enabled') is True else 'off'}")
+
+    config_file = config_path()
+    config_readable = config_file.is_file() and os.access(config_file, os.R_OK)
+    rows.append(f"Config: {display_home_paths(config_file)} · {'readable' if config_readable else 'not found or unreadable'}")
+    if not config_readable and config is not None:
+        warnings.append("The configured provider file is missing or unreadable")
+    if config_file.exists() and os.name != "nt":
+        try:
+            if config_file.stat().st_mode & 0o077:
+                warnings.append("Config permissions are broader than 600")
+        except OSError:
+            warnings.append("Config permissions could not be checked")
+
+    try:
+        from sophon.agent import LEGACY_SESSION_FILE, PROJECT_DIR, SESSION_FILE, WORKSPACE_ROOT
+        from sophon.agent import _instructions_file
+
+        workspace_state = (
+            "writable"
+            if PROJECT_DIR.is_dir() and os.access(PROJECT_DIR, os.W_OK)
+            else "not writable or not initialized"
+        )
+        rows.extend([
+            f"Active project: {display_home_paths(PROJECT_DIR)}",
+            f"Workspace storage: {workspace_state}",
+        ])
+        if workspace_state != "writable":
+            warnings.append("The active workspace is not writable")
+        instructions = _instructions_file(config or {})
+        identity_state = "readable" if instructions.is_file() and os.access(instructions, os.R_OK) else "not found"
+        rows.append(f"Agent identity: {display_home_paths(instructions)} · {identity_state}")
+        if identity_state != "readable":
+            warnings.append("AGENT.md is missing; it will be created when Agent mode starts")
+        session_file = SESSION_FILE
+        if not session_file.exists() and LEGACY_SESSION_FILE.exists():
+            session_file = LEGACY_SESSION_FILE
+        try:
+            raw_sessions = json.loads(session_file.read_text(encoding="utf-8"))
+            if not isinstance(raw_sessions, list) or any(not isinstance(item, dict) for item in raw_sessions):
+                raise ValueError("Saved sessions file has an invalid format")
+        except FileNotFoundError:
+            rows.append(f"Sessions: none yet · {display_home_paths(session_file)}")
+        except (OSError, UnicodeError, ValueError) as error:
+            warnings.append(f"Session history unavailable: {error}")
+            rows.append("Sessions: unavailable")
+        else:
+            rows.append(f"Sessions: {len(raw_sessions)} saved · {display_home_paths(session_file)}")
+        rows.append(f"Workspace root: {display_home_paths(WORKSPACE_ROOT)}")
+    except (ImportError, OSError, ValueError) as error:
+        warnings.append(f"Workspace status unavailable: {error}")
+
+    try:
+        free_bytes = shutil.disk_usage(Path.home()).free
+        rows.append(f"Home storage free: {free_bytes / (1024 ** 3):.1f} GiB")
+        if free_bytes < 512 * 1024 * 1024:
+            warnings.append("Less than 512 MiB of home storage is free")
+    except OSError:
+        rows.append("Home storage: unable to inspect free space")
+
+    utilities = [
+        f"{name}: {'available' if shutil.which(name) else 'not found'}"
+        for name in ("git", "curl", "nano", "vi")
+    ]
+    rows.extend(["", "Utilities: " + " · ".join(utilities)])
+    rows.extend(["", "Network reachability is not tested by /status."])
+    warning_count = len(warnings)
+    if warnings:
+        rows.extend(["", "Notes:", *[f"• {warning}" for warning in warnings]])
+        border_color, text_color, badge = UPDATE_BORDER, UPDATE_TEXT, f"{warning_count} notes"
+    else:
+        border_color, text_color, badge = GREEN, GREEN, "READY"
+    card(
+        "Sophon System Status",
+        rows,
+        border_color=border_color,
+        text_color=text_color,
+        top_right=badge,
+    )
+    return 0
+
+
+def manage_identity() -> int:
+    from sophon.agent import _instructions_file
+    from sophon.config import ensure_agent_instructions_file
+
+    try:
+        config = read_config() or {}
+    except (OSError, ValueError):
+        config = {}
+    try:
+        path = ensure_agent_instructions_file(_instructions_file(config))
+    except (OSError, ValueError) as error:
+        card(
+            "Agent Identity",
+            [f"Could not open AGENT.md: {error}"],
+            border_color=NOTICE_BORDER,
+            text_color=NOTICE_TEXT,
+        )
+        return 1
+
+    while True:
+        try:
+            content = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as error:
+            card(
+                "Agent Identity",
+                [f"Could not read AGENT.md: {error}"],
+                border_color=NOTICE_BORDER,
+                text_color=NOTICE_TEXT,
+            )
+            return 1
+        lines = content.splitlines() or ["(AGENT.md is empty)"]
+        lines.extend(["", f"File: {display_home_paths(path)}", "E — edit and save · Enter — return"])
+        card("Agent Identity", lines, top_right="AGENT.md")
+        try:
+            action = read_prompt("  › ").strip().casefold()
+        except (EOFError, KeyboardInterrupt):
+            return 0
+        if action not in {"e", "edit"}:
+            return 0
+
+        editor_spec = os.environ.get("VISUAL") or os.environ.get("EDITOR")
+        try:
+            editor = shlex.split(editor_spec) if editor_spec else []
+        except ValueError as error:
+            card("Editor unavailable", [str(error)], border_color=NOTICE_BORDER, text_color=NOTICE_TEXT)
+            return 1
+        if not editor:
+            found = next(
+                (candidate for name in ("nano", "micro", "vi", "vim") if (candidate := shutil.which(name))),
+                None,
+            )
+            if found:
+                editor = [found]
+        executable = shutil.which(editor[0]) if editor else None
+        if not executable:
+            card(
+                "Editor unavailable",
+                ["Set EDITOR or install nano, micro, vi, or vim to edit AGENT.md."],
+                border_color=NOTICE_BORDER,
+                text_color=NOTICE_TEXT,
+            )
+            return 1
+        try:
+            result = subprocess.run([executable, *editor[1:], str(path)], check=False)
+        except OSError as error:
+            card("Editor failed", [str(error)], border_color=NOTICE_BORDER, text_color=NOTICE_TEXT)
+            return 1
+        if result.returncode != 0:
+            card(
+                "Editor failed",
+                [f"Editor exited with status {result.returncode}."],
+                border_color=NOTICE_BORDER,
+                text_color=NOTICE_TEXT,
+            )
+            return result.returncode
+
+
 def print_help() -> None:
     card(
         "sophon --help",
@@ -871,14 +1098,19 @@ def main() -> int:
     if args == ["doctor"]:
         return doctor()
     if args and args[0] == "agent":
-        from sophon.agent import main as agent_main
+        from sophon.agent import EXIT_TO_TUI, main as agent_main
 
         result = agent_main(args[1:])
         if RESTART_REQUESTED:
             restart_sophon(RESTART_ARGS)
+        if result == EXIT_TO_TUI:
+            return run_session()
         return result
     if not args or args == ["run"]:
-        return run_session()
+        result = run_session()
+        if RESTART_REQUESTED:
+            restart_sophon(RESTART_ARGS)
+        return result
     print(f"Unknown command: {' '.join(args)}", file=sys.stderr)
     print("Run 'sophon --help' for usage.", file=sys.stderr)
     return 2

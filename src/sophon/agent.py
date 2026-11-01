@@ -50,13 +50,15 @@ from sophon.core import (
 SESSION_FILE = Path.home() / ".sophon" / "sessions" / "sessions.json"
 LEGACY_SESSION_FILE = Path.home() / ".xernel" / "sessions" / "sessions.json"
 WORKSPACE_ROOT = Path.home() / ".sophon" / "workspace"
-PROJECT_DIR = WORKSPACE_ROOT / "my-project"
+DEFAULT_PROJECT_DIR = WORKSPACE_ROOT / "my-project"
+PROJECT_DIR = DEFAULT_PROJECT_DIR
 INPUT_PLACEHOLDER = "Create something with sophon"
 ANIMATION_TICK = 0.075
+EXIT_TO_TUI = 42
 AGENT_MODES = {"chat", "plan", "build"}
 PLAN_BUILTIN_TOOLS = {"get_version", "is_update", "system_health", "workspace_list", "session_list", "get_time", "get_date"}
 SLASH_COMMANDS = (
-    "/auto-compression", "/auto-update", "/changelog", "/clear", "/compact", "/cwd", "/delete",
+    "/auto-compression", "/auto-update", "/cd", "/changelog", "/clear", "/compact", "/cwd", "/delete",
     "/exit", "/fork", "/help", "/mode", "/model", "/new", "/reasoning",
     "/reasoning-effort", "/rename", "/resume", "/review", "/sessions",
     "/threshold", "/undo", "/usage",
@@ -124,6 +126,18 @@ def _usage_values(usage: dict[str, object]) -> tuple[int, int, int]:
 
 class AgentInterrupted(RuntimeError):
     """Raised when the user explicitly cancels an active model request."""
+
+
+class AgentExitToTUI(RuntimeError):
+    """Raised when Escape returns from Agent mode to the Sophon terminal UI."""
+
+
+class ToggleReasoningView(RuntimeError):
+    """Raised when the user toggles the displayed reasoning details."""
+
+    def __init__(self, input_text: str = "") -> None:
+        super().__init__(input_text)
+        self.input_text = input_text
 
 
 class RequestCancellation:
@@ -374,7 +388,8 @@ def _system_message(
     return (
         f"{system_prompt}\n\n"
         f"Agent instructions (AGENT.md):\n{instructions}\n\n"
-        f"Active project directory: {PROJECT_DIR}\n"
+        f"Active project directory: {display_home_paths(PROJECT_DIR)}\n"
+        "Display workspace paths as plain text using `~` for the home directory; never wrap a directory path in a fenced code block.\n"
         f"Workspace guidance (WORKSPACE.md):\n{workspace_guidance}"
     )
 
@@ -964,6 +979,7 @@ def _new_session() -> dict[str, object]:
         "mode": "chat",
         "messages": [],
         "usage": _fresh_usage(),
+        "workspace_dir": str(PROJECT_DIR.resolve()),
     }
 
 
@@ -978,12 +994,45 @@ def _fork_session(source: dict[str, object]) -> dict[str, object]:
         "mode": "chat",
         "messages": [dict(message) for message in source.get("messages", [])],
         "usage": _fresh_usage(),
+        "workspace_dir": str(_session_workspace_path(source)),
     }
+
+
+def _validated_workspace_directory(value: str | Path, *, relative_to: Path | None = None) -> Path:
+    root = WORKSPACE_ROOT.resolve()
+    requested = Path(value).expanduser()
+    if not requested.is_absolute():
+        requested = (relative_to or PROJECT_DIR) / requested
+    candidate = requested.resolve()
+    if candidate == root or root not in candidate.parents:
+        raise RuntimeError("Choose a project directory inside the Sophon workspace; the workspace root is not a project.")
+    if not candidate.is_dir():
+        raise RuntimeError("The requested workspace directory does not exist.")
+    return candidate
+
+
+def _session_workspace_path(session: dict[str, object]) -> Path:
+    saved = session.get("workspace_dir")
+    if isinstance(saved, str) and saved.strip():
+        try:
+            return _validated_workspace_directory(saved, relative_to=WORKSPACE_ROOT)
+        except (OSError, RuntimeError, ValueError):
+            pass
+    return (WORKSPACE_ROOT / "my-project").resolve()
+
+
+def _activate_session_workspace(session: dict[str, object]) -> Path:
+    global PROJECT_DIR
+    PROJECT_DIR = _session_workspace_path(session)
+    session["workspace_dir"] = str(PROJECT_DIR)
+    return PROJECT_DIR
 
 
 def _workspace_location(command: str) -> tuple[str, str, bool]:
     if command == "cwd":
         return "Current directory", display_home_paths(Path.cwd().resolve()), False
+    if command == "cd":
+        return "Active project directory", display_home_paths(PROJECT_DIR.resolve()), False
     return "Unknown Agent command", "Use /cwd to show the current directory.", True
 
 
@@ -1018,6 +1067,7 @@ def _load_sessions() -> list[dict[str, object]]:
         item.setdefault("mode", "chat")
         if item.get("mode") not in AGENT_MODES:
             item["mode"] = "chat"
+        item["workspace_dir"] = str(_session_workspace_path(item))
         usage = item.get("usage")
         if not isinstance(usage, dict):
             item["usage"] = _fresh_usage()
@@ -1294,7 +1344,14 @@ def _message_rows(messages: list[dict[str, object]], columns: int) -> list[str]:
             else:
                 reasoning_text = message.get("reasoning")
                 if isinstance(reasoning_text, str) and reasoning_text.strip():
-                    rows.extend(_reasoning_rows(reasoning_text, columns, connect_to_answer=True))
+                    rows.extend(
+                        _reasoning_rows(
+                            reasoning_text,
+                            columns,
+                            connect_to_answer=True,
+                            expanded=message.get("reasoning_expanded") is True,
+                        )
+                    )
                 rows.extend(_agent_rows(content, columns))
         else:
             rows.extend(
@@ -1435,6 +1492,7 @@ def _draw_screen(
     context_window: int | None = None,
     mode: str = "chat",
     reasoning_state: str = "off",
+    reasoning_expanded: bool = False,
     display_message_start: int = 0,
     interrupt_warning: bool = False,
 ) -> tuple[int, int]:
@@ -1471,9 +1529,10 @@ def _draw_screen(
                 columns,
                 frame=None if streaming_text.strip() else animation_frame,
                 connect_to_answer=bool(streaming_text.strip()),
+                expanded=reasoning_expanded,
             ))
         elif answering and not streaming_text.strip():
-            label = "Reasoning" if reasoning_state not in {"off", "not supported"} else "Answering"
+            label = "Reasoning >" if reasoning_state not in {"off", "not supported"} else "Answering"
             feed.extend(_answering_rows(animation_frame, label))
         if streaming_text:
             feed.extend(_answering_rows(animation_frame, "Answering"))
@@ -1507,6 +1566,8 @@ def _read_key_raw(timeout: float | None = None) -> str:
         return "ENTER"
     if first == b"\x03":
         return "CANCEL"
+    if first == b"\x12":
+        return "TOGGLE_REASONING"
     if first in {b"\x08", b"\x7f"}:
         return "BACKSPACE"
     if first == b"\x1b":
@@ -1568,7 +1629,12 @@ def _input_key_reader(events: queue.Queue[str], stop_event: threading.Event) -> 
         termios.tcsetattr(fd, termios.TCSADRAIN, previous)
 
 
-def _input_bar(draw, placeholder: str = INPUT_PLACEHOLDER, *, prefill: str = "") -> str:
+def _input_bar(
+    draw,
+    placeholder: str = INPUT_PLACEHOLDER,
+    *,
+    prefill: str = "",
+) -> str:
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         return input(f"› {placeholder}: {prefill}").strip()
 
@@ -1609,7 +1675,7 @@ def _input_bar(draw, placeholder: str = INPUT_PLACEHOLDER, *, prefill: str = "")
                 raise EOFError
             if raw == b"\x1b":
                 if not select.select([fd], [], [], 0.08)[0]:
-                    raise EOFError
+                    raise AgentExitToTUI
                 sequence = bytearray()
                 while select.select([fd], [], [], 0.08)[0]:
                     sequence.extend(os.read(fd, 1))
@@ -1635,6 +1701,8 @@ def _input_bar(draw, placeholder: str = INPUT_PLACEHOLDER, *, prefill: str = "")
                     continue
                 redraw()
                 continue
+            if raw == b"\x12":
+                raise ToggleReasoningView("".join(characters))
             if raw in {b"\r", b"\n"}:
                 text = "".join(characters)
                 completed, new_cursor, did_complete = _accept_slash_completion(text, cursor, completion_index)
@@ -1939,18 +2007,22 @@ def _reasoning_rows(
     *,
     frame: int | None = None,
     connect_to_answer: bool = False,
+    expanded: bool = False,
 ) -> list[str]:
     text = display_home_paths(text)
-    rows = _answering_rows(frame, "Reasoning") if frame is not None else [paint("  • Reasoning", MUTED)]
+    disclosure = "<" if expanded else ">"
+    label = f"Reasoning {disclosure}"
+    rows = _answering_rows(frame, label) if frame is not None else [paint(f"  • {label}", MUTED)]
     width = max(20, columns - 8)
-    for paragraph in text.splitlines() or [text]:
-        if not paragraph:
-            rows.append(paint("  │", MUTED))
-            continue
-        rows.extend(
-            paint("  │  ", MUTED) + paint(line, MUTED)
-            for line in wrap_text(paragraph, max(1, width - 6))
-        )
+    if expanded:
+        for paragraph in text.splitlines() or [text]:
+            if not paragraph:
+                rows.append(paint("  │", MUTED))
+                continue
+            rows.extend(
+                paint("  │  ", MUTED) + paint(line, MUTED)
+                for line in wrap_text(paragraph, max(1, width - 6))
+            )
     if connect_to_answer:
         rows.append(paint("  │", MUTED))
     return rows
@@ -2081,12 +2153,23 @@ def _pick_item(
             selected_id = ""
 
 
-def _session_item(session: dict[str, object]) -> dict[str, object]:
+def _session_item(
+    session: dict[str, object],
+    fallback_context_window: int | None = None,
+) -> dict[str, object]:
     updated = str(session.get("updated_at", ""))
+    messages = session.get("messages", [])
+    messages = messages if isinstance(messages, list) else []
+    window = session.get("context_window")
+    if not isinstance(window, int) or window < 1:
+        window = fallback_context_window
+    context = f"~{_context_percentage(messages, window)}%" if isinstance(window, int) and window > 0 else "unknown context"
+    title = str(session.get("title") or "Session")
+    project = display_home_paths(_session_workspace_path(session))
     return {
         "id": str(session["id"]),
-        "title": str(session["title"]),
-        "label": f"{session['title']} · {len(session['messages'])} messages · {updated[:16].replace('T', ' ')}",
+        "title": title,
+        "label": f"{title} · Context {context} · {len(messages)} messages · {updated[:16].replace('T', ' ')} · {project}",
         "session": session,
     }
 
@@ -2112,6 +2195,31 @@ def _sessions_panel_rows(
         title = " ".join(str(item.get("title") or "Untitled").split())
         rows.append(f"{title} — Context {context} — {updated}")
     return rows
+
+
+def _workspace_directory_items() -> list[dict[str, object]]:
+    root = WORKSPACE_ROOT.resolve()
+    directories: list[Path] = []
+    try:
+        directories = sorted(
+            (path.resolve() for path in root.iterdir() if path.is_dir()),
+            key=lambda path: path.name.casefold(),
+        )
+    except OSError:
+        pass
+    current = PROJECT_DIR.resolve()
+    if current.is_dir() and current not in directories:
+        directories.append(current)
+    return [
+        {
+            "id": str(path),
+            "title": path.name or "Workspace root",
+            "label": f"{path.name or 'Workspace root'} · {display_home_paths(path)}",
+            "path": str(path),
+        }
+        for path in directories
+        if root in path.parents
+    ]
 
 
 def _restore_workspace_changes(changes: list[dict[str, object]]) -> str:
@@ -2294,6 +2402,7 @@ def _usage_panel_rows(session: dict[str, object], config: dict[str, object]) -> 
 
 
 def _interactive(config: dict[str, object]) -> int:
+    global PROJECT_DIR
     try:
         sessions = _load_sessions()
     except RuntimeError as error:
@@ -2317,7 +2426,7 @@ def _interactive(config: dict[str, object]) -> int:
             args=(config.copy(), context_state),
             daemon=True,
         ).start()
-    answering = {"active": False, "frame": 0, "text": "", "reasoning": ""}
+    answering = {"active": False, "frame": 0, "text": "", "reasoning": "", "reasoning_expanded": False}
 
     def draw(
         text: str,
@@ -2350,6 +2459,7 @@ def _interactive(config: dict[str, object]) -> int:
             context_window=context_state["window"] if isinstance(context_state["window"], int) else None,
             mode=str(session.get("mode", "chat")),
             reasoning_state=reasoning_state,
+            reasoning_expanded=bool(answering.get("reasoning_expanded")),
             display_message_start=display_message_start,
             interrupt_warning=bool(answering.get("interrupt_warning")),
         )
@@ -2373,6 +2483,25 @@ def _interactive(config: dict[str, object]) -> int:
             width=display_width(message),
         )
 
+    def toggle_saved_reasoning() -> None:
+        nonlocal notice_rows
+        message = next(
+            (
+                item
+                for item in reversed(session["messages"])
+                if item.get("role") == "assistant"
+                and isinstance(item.get("reasoning"), str)
+                and str(item.get("reasoning", "")).strip()
+            ),
+            None,
+        )
+        if message is None:
+            notice("Reasoning details", "No saved reasoning details are available in this session.")
+        else:
+            message["reasoning_expanded"] = message.get("reasoning_expanded") is not True
+            if save_current():
+                notice_rows = []
+
     def close_with_card() -> None:
         sys.stdout.write("\033[2J\033[H")
         sys.stdout.flush()
@@ -2381,6 +2510,7 @@ def _interactive(config: dict[str, object]) -> int:
     def save_current() -> bool:
         try:
             session["model"] = str(config["model"])
+            session["workspace_dir"] = str(PROJECT_DIR.resolve())
             window = context_state.get("window")
             if isinstance(window, int) and window > 0:
                 session["context_window"] = window
@@ -2451,6 +2581,12 @@ def _interactive(config: dict[str, object]) -> int:
             else:
                 prompt = _input_bar(draw, prefill="".join(prefill_characters))
                 prefill_characters.clear()
+        except AgentExitToTUI:
+            return EXIT_TO_TUI
+        except ToggleReasoningView as error:
+            prefill_characters[:] = list(error.input_text)
+            toggle_saved_reasoning()
+            continue
         except (EOFError, KeyboardInterrupt):
             close_with_card()
             return 0
@@ -2474,9 +2610,11 @@ def _interactive(config: dict[str, object]) -> int:
                     [
                         "/auto-compression on|off — Toggle automatic mode",
                         "/auto-update on|off — Toggle automatic startup updates",
+                        "/cd [path] — Select a project directory in the workspace",
                         "/changelog — Show latest changes",
                         "/clear — Clear the screen, keep this session",
                         "/compact — Summarize context at 50% or more",
+                        "Ctrl+R — Toggle reasoning details",
                         "/cwd — Show current directory",
                         "/delete — Delete a saved session",
                         "/exit or Q — Close Sophon Agent",
@@ -2490,7 +2628,7 @@ def _interactive(config: dict[str, object]) -> int:
                         "/rename [title] — Rename this session",
                         "/resume — Load a saved session",
                         "/review — Review the last Agent file changes",
-                        "/sessions — List sessions by title and context",
+                        "/sessions — Browse and open saved sessions",
                         "/threshold 30–95 — Set auto-compression threshold",
                         "/undo — Revert the last Agent file edits",
                         "/usage — Show session tokens and provider limits",
@@ -2505,6 +2643,11 @@ def _interactive(config: dict[str, object]) -> int:
                         f"Version: {VERSION}",
                         f"Last updated: {updated}",
                         "",
+                        "Added: /cd workspace selection, and main-TUI /agent, /status, and /identity commands.",
+                        "Improved: /sessions opens saved sessions; each session retains its project directory.",
+                        "Improved: reasoning details start folded; Ctrl+R toggles the muted disclosure.",
+                        "Improved: credential input is masked inside its card; setup ends with one completion card.",
+                        "Improved: provider, model, and session pickers share the arrow-and-dot selection style.",
                         "Added: /undo for safe last-edit rollback, /review for static change review, and /usage.",
                         "Improved: argument-aware command completion and clearer provider authentication errors.",
                         "Added: /sessions, /mode, /threshold and the single /cwd command.",
@@ -2515,6 +2658,39 @@ def _interactive(config: dict[str, object]) -> int:
                     ],
                     columns=shutil.get_terminal_size((80, 24)).columns,
                 )
+            elif command == "cd":
+                if not save_current():
+                    continue
+                old_directory = PROJECT_DIR
+                if argument:
+                    try:
+                        target_directory = _validated_workspace_directory(argument)
+                    except (OSError, RuntimeError, ValueError) as error:
+                        notice("Directory unchanged", str(error), error=True)
+                        continue
+                else:
+                    selected_directory = _pick_item(
+                        session,
+                        draw,
+                        _workspace_directory_items(),
+                        title="Change Directory",
+                        current_id=str(PROJECT_DIR.resolve()),
+                    )
+                    if selected_directory is None:
+                        notice("Directory selection cancelled", "The active project is unchanged.")
+                        continue
+                    try:
+                        target_directory = _validated_workspace_directory(str(selected_directory.get("path", "")))
+                    except (OSError, RuntimeError, ValueError) as error:
+                        notice("Directory unchanged", str(error), error=True)
+                        continue
+                PROJECT_DIR = target_directory
+                session["workspace_dir"] = str(PROJECT_DIR)
+                if not save_current():
+                    PROJECT_DIR = old_directory
+                    session["workspace_dir"] = str(old_directory)
+                    continue
+                notice("Active project directory", display_home_paths(PROJECT_DIR))
             elif command == "cwd":
                 title, message, error = _workspace_location(command)
                 notice(title, message, error=error)
@@ -2579,11 +2755,26 @@ def _interactive(config: dict[str, object]) -> int:
                     config.update(updated_config)
                     notice("Automatic updates", f"Auto-update is {value}. Use /auto-update on|off.")
             elif command == "sessions":
-                notice_rows = _card_rows(
-                    "Saved Sessions",
-                    _sessions_panel_rows(sessions, known_context_window()),
-                    columns=shutil.get_terminal_size((80, 24)).columns,
+                if not save_current():
+                    continue
+                session_items = sorted(
+                    sessions,
+                    key=lambda item: str(item.get("title", "")).casefold(),
                 )
+                selected_session = _pick_item(
+                    session,
+                    draw,
+                    [_session_item(item, known_context_window()) for item in session_items],
+                    title="Saved Sessions",
+                    current_id=str(session["id"]),
+                )
+                if selected_session:
+                    session = selected_session["session"]
+                    _activate_session_workspace(session)
+                    display_message_start = 0
+                    notice_rows = []
+                else:
+                    notice("Session selection cancelled", "The current session is still open.")
             elif command == "new":
                 session = _new_session()
                 display_message_start = 0
@@ -2594,7 +2785,17 @@ def _interactive(config: dict[str, object]) -> int:
                 sys.stdout.write("\033[2J\033[H")
                 sys.stdout.flush()
             elif command == "rename":
-                title = argument or _input_bar(draw, "Enter a session title")
+                if argument:
+                    title = argument
+                else:
+                    try:
+                        title = _input_bar(draw, "Enter a session title")
+                    except AgentExitToTUI:
+                        return EXIT_TO_TUI
+                    except ToggleReasoningView as error:
+                        prefill_characters[:] = list(error.input_text)
+                        toggle_saved_reasoning()
+                        continue
                 if title.strip():
                     session["title"] = title.strip()[:80]
                     if save_current():
@@ -2608,6 +2809,7 @@ def _interactive(config: dict[str, object]) -> int:
                 selected = _pick_item(session, draw, items, title="Resume Session", current_id=str(session["id"]))
                 if selected:
                     session = selected["session"]
+                    _activate_session_workspace(session)
                     display_message_start = 0
                     notice_rows = []
                 else:
@@ -2622,6 +2824,7 @@ def _interactive(config: dict[str, object]) -> int:
                     forked = _fork_session(source)
                     sessions.append(forked)
                     session = forked
+                    _activate_session_workspace(session)
                     display_message_start = 0
                     if save_current():
                         notice_plain(f"Forked session {source['title']} into a new session.")
@@ -2645,7 +2848,14 @@ def _interactive(config: dict[str, object]) -> int:
                     f'Type DELETE to remove "{selected["title"]}" permanently.',
                     error=True,
                 )
-                confirmation = _input_bar(draw, "Type DELETE to confirm")
+                try:
+                    confirmation = _input_bar(draw, "Type DELETE to confirm")
+                except AgentExitToTUI:
+                    return EXIT_TO_TUI
+                except ToggleReasoningView as error:
+                    prefill_characters[:] = list(error.input_text)
+                    toggle_saved_reasoning()
+                    continue
                 if confirmation != "DELETE":
                     notice("Delete cancelled", "No session was removed.")
                     continue
@@ -2862,6 +3072,7 @@ def _interactive(config: dict[str, object]) -> int:
         answering["frame"] = 0
         answering["text"] = ""
         answering["reasoning"] = ""
+        answering["reasoning_expanded"] = False
         answering["interrupt_warning"] = False
         request_started = time.monotonic()
         draw("", 0)
@@ -2937,6 +3148,8 @@ def _interactive(config: dict[str, object]) -> int:
                         break
                     if queued_key.startswith("CHAR:"):
                         prefill_characters.extend(list(queued_key[5:]))
+                    elif queued_key == "TOGGLE_REASONING":
+                        answering["reasoning_expanded"] = not bool(answering.get("reasoning_expanded"))
                     elif queued_key == "BACKSPACE" and prefill_characters:
                         prefill_characters.pop()
                     elif queued_key == "ENTER" and prefill_characters:
@@ -2960,6 +3173,8 @@ def _interactive(config: dict[str, object]) -> int:
                     break
                 elif key.startswith("CHAR:"):
                     prefill_characters.extend(list(key[5:]))
+                elif key == "TOGGLE_REASONING":
+                    answering["reasoning_expanded"] = not bool(answering.get("reasoning_expanded"))
                 elif key == "BACKSPACE" and prefill_characters:
                     prefill_characters.pop()
                 elif key == "ENTER" and prefill_characters:
@@ -2982,6 +3197,8 @@ def _interactive(config: dict[str, object]) -> int:
                 break
             if queued_key.startswith("CHAR:"):
                 prefill_characters.extend(list(queued_key[5:]))
+            elif queued_key == "TOGGLE_REASONING":
+                answering["reasoning_expanded"] = not bool(answering.get("reasoning_expanded"))
             elif queued_key == "BACKSPACE" and prefill_characters:
                 prefill_characters.pop()
             elif queued_key == "ENTER" and prefill_characters:
@@ -3011,10 +3228,11 @@ def _interactive(config: dict[str, object]) -> int:
             save_current()
             continue
         assert answer is not None
-        assistant_message: dict[str, str] = {"role": "assistant", "content": answer}
+        assistant_message: dict[str, object] = {"role": "assistant", "content": answer}
         reasoning_text = "".join(reasoning_parts).strip()
         if reasoning_text:
             assistant_message["reasoning"] = reasoning_text
+            assistant_message["reasoning_expanded"] = bool(answering.get("reasoning_expanded"))
         messages.append(assistant_message)
         if not save_current():
             notice("Session storage error", "The reply is visible but could not be saved.", error=True)

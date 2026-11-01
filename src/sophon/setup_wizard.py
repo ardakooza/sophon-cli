@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import getpass
+import codecs
 import os
 import select
 import sys
@@ -58,6 +58,57 @@ def _read_key() -> str:
         termios.tcsetattr(fd, termios.TCSADRAIN, previous)
 
 
+def _read_hidden_credential(
+    credential_label: str,
+    provider_label: str,
+    model: str,
+    *,
+    saved_key_exists: bool,
+) -> str | None:
+    import termios
+    import tty
+
+    fd = sys.stdin.fileno()
+    previous = termios.tcgetattr(fd)
+    decoder = codecs.getincrementaldecoder("utf-8")("ignore")
+    characters: list[str] = []
+
+    def redraw() -> None:
+        clear_terminal()
+        value = "•" * len(characters) if characters else "[hidden input]"
+        rows = [
+            f"Provider: {provider_label}",
+            f"Model: {model}",
+            "",
+            f"{credential_label}: {value}",
+            "",
+            "Enter to keep the saved credential." if saved_key_exists and not characters else "",
+            "Enter continue · Backspace edit · Esc cancel",
+        ]
+        card("Setup of Credentials", rows, top_right="3 of 4")
+
+    try:
+        tty.setraw(fd)
+        redraw()
+        while True:
+            raw = os.read(fd, 1)
+            if not raw or raw in {b"\x03", b"\x1b"}:
+                return None
+            if raw in {b"\r", b"\n"}:
+                return "".join(characters)
+            if raw in {b"\x08", b"\x7f"}:
+                if characters:
+                    characters.pop()
+                    redraw()
+                continue
+            character = decoder.decode(raw)
+            if character and character.isprintable():
+                characters.append(character)
+                redraw()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, previous)
+
+
 def _choose_provider() -> str | None:
     choices = ["openrouter", "cloudflare"]
     labels = [PROVIDERS[item]["label"] for item in choices]
@@ -85,10 +136,11 @@ def _choose_provider() -> str | None:
             [
                 "Choose a service for model requests.",
                 "",
-                f"{'›' if selected == 0 else ' '} {labels[0]}",
-                f"{'›' if selected == 1 else ' '} {labels[1]}",
+                f"{'❯' if selected == 0 else '·'} {labels[0]}",
                 "",
-                "←/→ previous/next   ↑/↓ move   Enter select   Q cancel",
+                f"{'❯' if selected == 1 else '·'} {labels[1]}",
+                "",
+                "←/→ previous/next · ↑/↓ move · Enter select · Esc cancel",
             ],
             top_right="1 of 4",
         )
@@ -115,9 +167,13 @@ def _choose_existing_action(existing: dict[str, object]) -> str | None:
             [
                 f"{PROVIDERS[provider]['label']} · {existing['model']}",
                 "",
-                f"{'›' if selected == 0 else ' '} {labels[0]}",
-                f"{'›' if selected == 1 else ' '} {labels[1]}",
+                f"{'❯' if selected == 0 else '·'} {labels[0]}",
+                "",
+                f"{'❯' if selected == 1 else '·'} {labels[1]}",
+                "",
+                "↑/↓ move · Enter select · Esc cancel",
             ],
+            top_right=f"{selected + 1} of {len(labels)}",
         )
         key = _read_key()
         if key in {"UP", "LEFT"}:
@@ -144,8 +200,11 @@ def _choose_model(provider: str, default_model: str, saved_model: str = "") -> s
             "Choose a preset or enter your own model ID.",
             "",
         ]
-        rows.extend(f"{'›' if index == selected else ' '} {label}" for index, (_, label) in enumerate(options))
-        rows.extend(["", "←/→ previous/next   ↑/↓ move   Enter select   Q cancel"])
+        for index, (_, label) in enumerate(options):
+            rows.append(f"{'❯' if index == selected else '·'} {label}")
+            if index + 1 < len(options):
+                rows.append("")
+        rows.extend(["", "↑/↓ move · Enter select · Esc cancel"])
         card("Setup of Model", rows, top_right="2 of 4")
         key = _read_key()
         if key in {"UP", "LEFT"}:
@@ -206,19 +265,17 @@ def run_setup_wizard() -> int:
         model = model_choice
 
     old_key = (existing or {}).get("api_key", "") if same_provider else ""
-    key_hint = "leave blank to keep saved key" if old_key else "required"
     credential_label = "API key" if provider == "openrouter" else "API token (Workers AI Read + Edit)"
-    card(
-        "Setup of Credentials",
-        [
-            f"Provider: {spec['label']}",
-            f"Model: {model}",
-            "",
-            f"{credential_label}: [hidden input]",
-        ],
-        top_right="3 of 4",
+    api_key = _read_hidden_credential(
+        credential_label,
+        spec["label"],
+        model,
+        saved_key_exists=bool(old_key),
     )
-    api_key = getpass.getpass(f"Credential input (hidden; {key_hint}): ").strip()
+    if api_key is None:
+        card(None, ["Setup cancelled."], width=16)
+        return 1
+    api_key = api_key.strip()
     if not api_key:
         api_key = old_key
     if not api_key:
@@ -274,9 +331,8 @@ def run_setup_wizard() -> int:
         summary.append(f"Account ID: {data['account_id']}")
     summary.extend([f"Config: {config_display_path()}", "", "Press Enter to save, or Q to cancel."])
     card(
-        "Review Setup",
+        "Setup Complete",
         summary,
-        top_right="4 of 4",
         text_color=MUTED,
         title_color=WHITE,
         highlight_terms=("Provider:", "Model:", "Credential:", "Config:"),
@@ -297,16 +353,4 @@ def run_setup_wizard() -> int:
     except (OSError, ValueError) as error:
         card("Sophon", ["Could not save configuration.", str(error)])
         return 1
-    card(
-        "Setup Complete",
-        [
-            f"Provider: {spec['label']}",
-            f"Model: {model}",
-            f"Saved: {config_display_path()}",
-            f"{'API key' if provider == 'openrouter' else 'API token'}: hidden",
-        ],
-        text_color=MUTED,
-        title_color=WHITE,
-        highlight_terms=("Provider:", "Model:", "Saved:", "API key:", "API token:"),
-    )
     return 0

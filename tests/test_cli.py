@@ -132,15 +132,17 @@ def test_review_and_complete_card_titles_and_provider_labels_are_white(tmp_path)
         patch("sophon.setup_wizard._choose_provider", return_value="openrouter"),
         patch("sophon.setup_wizard._choose_model", return_value="test-model"),
         patch("sophon.agent._detect_reasoning_support", return_value=False),
-        patch("sophon.setup_wizard.getpass.getpass", return_value="test-secret"),
+        patch("sophon.setup_wizard._read_hidden_credential", return_value="test-secret"),
         patch("sophon.setup_wizard._read_key", return_value="ENTER"),
         patch("sophon.setup_wizard.write_config", return_value=tmp_path / "config.json"),
         patch("sophon.setup_wizard.ensure_agent_instructions_file"),
     ):
         assert run_setup_wizard() == 0
     text = output.getvalue()
-    assert re.search(r"\033\[38;5;255m\s*Review Setup", text)
     assert re.search(r"\033\[38;5;255m\s*Setup Complete", text)
+    assert "Review Setup" not in text
+    assert "4 of 4" not in text
+    assert text.count("Setup Complete") == 1
     assert "\033[38;5;255mProvider:\033[0m" in text
     assert "test-secret" not in text
 
@@ -162,16 +164,46 @@ def test_setup_credentials_card_contains_the_hidden_api_key_field(tmp_path):
         patch("sophon.setup_wizard._choose_provider", return_value="openrouter"),
         patch("sophon.setup_wizard._choose_model", return_value="test-model"),
         patch("sophon.agent._detect_reasoning_support", return_value=False),
-        patch("sophon.setup_wizard.getpass.getpass", return_value="test-secret"),
+        patch("sophon.setup_wizard._read_hidden_credential", return_value="test-secret") as credential_reader,
         patch("sophon.setup_wizard._read_key", return_value="ENTER"),
         patch("sophon.setup_wizard.write_config", return_value=tmp_path / "config.json"),
         patch("sophon.setup_wizard.ensure_agent_instructions_file"),
     ):
         assert run_setup_wizard() == 0
     text = output.getvalue()
-    assert "Setup of Credentials" in text
-    assert "API key: [hidden input]" in text
+    credential_reader.assert_called_once_with("API key", "OpenRouter", "test-model", saved_key_exists=False)
     assert "test-secret" not in text
+
+
+def test_hidden_credential_is_masked_inside_the_setup_card():
+    import pty
+    import threading
+    import time
+
+    from sophon.setup_wizard import _read_hidden_credential
+
+    class TerminalBuffer(StringIO):
+        def isatty(self):
+            return True
+
+    master, slave = pty.openpty()
+    terminal_input = os.fdopen(slave, "r", encoding="utf-8", closefd=False)
+    output = TerminalBuffer()
+    try:
+        writer = threading.Thread(target=lambda: (time.sleep(0.05), os.write(master, b"secret\n")), daemon=True)
+        writer.start()
+        with patch("sys.stdin", terminal_input), patch("sys.stdout", output):
+            assert _read_hidden_credential("API key", "OpenRouter", "test-model", saved_key_exists=False) == "secret"
+        writer.join(timeout=1)
+    finally:
+        terminal_input.close()
+        os.close(master)
+        os.close(slave)
+    rendered = output.getvalue()
+    assert "Setup of Credentials" in rendered
+    assert "API key: [hidden input]" in rendered
+    assert "API key: •" in rendered
+    assert "secret" not in rendered
 
 
 def test_plain_words_are_not_commands():
@@ -764,7 +796,7 @@ def test_reasoning_display_is_muted_and_precedes_the_agent_answer():
 
     with patch("sys.stdout", TerminalBuffer()):
         rows = _message_rows(
-            [{"role": "assistant", "content": "Final answer", "reasoning": "Reasoning details"}],
+            [{"role": "assistant", "content": "Final answer", "reasoning": "Reasoning details", "reasoning_expanded": True}],
             80,
         )
     rendered = "\n".join(rows)
@@ -1289,10 +1321,22 @@ def test_reasoning_transcript_uses_a_vertical_connector_to_the_answer():
     from sophon.agent import _message_rows
 
     rendered = "\n".join(_message_rows([
-        {"role": "assistant", "content": "The answer", "reasoning": "First inspect the request."},
+        {"role": "assistant", "content": "The answer", "reasoning": "First inspect the request.", "reasoning_expanded": True},
     ], 80))
     plain = re.sub(r"\x1b\[[0-9;]*m", "", rendered)
     assert plain.index("Reasoning") < plain.index("│") < plain.index("The answer")
+
+
+def test_reasoning_transcript_is_collapsed_by_default():
+    from sophon.agent import _message_rows
+
+    rendered = "\n".join(_message_rows([
+        {"role": "assistant", "content": "The answer", "reasoning": "Private thought details."},
+    ], 80))
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", rendered)
+    assert "Reasoning >" in plain
+    assert "Private thought details." not in plain
+    assert "The answer" in plain
 
 
 def test_slash_completion_is_a_suffix_and_only_completes_at_input_end():
@@ -1571,3 +1615,256 @@ def test_plan_mode_blocks_unexpected_mutating_tool_calls():
         )
     assert answer == "Plan only."
     assert "disabled in plan mode" in captured["messages"][-1]["content"]
+
+
+def test_agent_cd_changes_only_to_workspace_directories_and_persists_path(tmp_path):
+    from sophon import agent
+
+    workspace = tmp_path / "workspace"
+    current = workspace / "my-project"
+    target = workspace / "CaseSensitiveProject"
+    outside = tmp_path / "outside"
+    current.mkdir(parents=True)
+    target.mkdir()
+    outside.mkdir()
+    sessions_file = tmp_path / "sessions" / "sessions.json"
+    commands = iter([f"/cd {target}", "/rename switched", f"/cd {outside}", "/exit"])
+
+    with (
+        patch("sophon.agent.WORKSPACE_ROOT", workspace),
+        patch("sophon.agent.PROJECT_DIR", current),
+        patch("sophon.agent.SESSION_FILE", sessions_file),
+        patch("sophon.agent.LEGACY_SESSION_FILE", tmp_path / "legacy.json"),
+        patch("sophon.agent._input_bar", side_effect=lambda *args, **kwargs: next(commands)),
+        patch("sophon.agent._draw_screen"),
+    ):
+        assert agent._interactive({"provider": "openrouter", "model": "test", "context_window": 1024}) == 0
+        saved = agent._load_sessions()
+        assert agent.PROJECT_DIR == target
+
+    assert saved[0]["workspace_dir"] == str(target.resolve())
+
+
+def test_sessions_picker_uses_fork_style_and_opens_selected_workspace(tmp_path):
+    from sophon import agent
+
+    workspace = tmp_path / "workspace"
+    current = workspace / "current"
+    selected_directory = workspace / "selected"
+    current.mkdir(parents=True)
+    selected_directory.mkdir()
+    sessions_file = tmp_path / "sessions" / "sessions.json"
+    saved_session = {
+        "id": "saved123456",
+        "title": "Alpha project",
+        "created_at": "2026-10-30T10:00:00+03:00",
+        "updated_at": "2026-10-31T10:00:00+03:00",
+        "messages": [{"role": "user", "content": "continue"}],
+        "context_window": 4096,
+        "workspace_dir": str(selected_directory),
+    }
+    prompts = iter(["/sessions", "/exit"])
+    picked = {}
+
+    def choose(*args, **kwargs):
+        picked["title"] = kwargs["title"]
+        picked["items"] = args[2]
+        return {"session": saved_session}
+
+    def read_prompt(*args, **kwargs):
+        prompt = next(prompts)
+        if prompt == "/exit":
+            picked["directory"] = agent.PROJECT_DIR
+        return prompt
+
+    with (
+        patch("sophon.agent.WORKSPACE_ROOT", workspace),
+        patch("sophon.agent.PROJECT_DIR", current),
+        patch("sophon.agent.SESSION_FILE", sessions_file),
+        patch("sophon.agent.LEGACY_SESSION_FILE", tmp_path / "legacy.json"),
+        patch("sophon.agent._input_bar", side_effect=read_prompt),
+        patch("sophon.agent._pick_item", side_effect=choose),
+        patch("sophon.agent._draw_screen"),
+    ):
+        agent._write_sessions([saved_session.copy()])
+        assert agent._interactive({"provider": "openrouter", "model": "test", "context_window": 4096}) == 0
+
+    assert picked["title"] == "Saved Sessions"
+    assert "Alpha project" in picked["items"][0]["label"]
+    assert "Context" in picked["items"][0]["label"]
+    assert "2026-10-31" in picked["items"][0]["label"]
+    assert picked["directory"] == selected_directory
+
+
+def test_idle_agent_escape_returns_to_sophon_tui():
+    from sophon import agent
+
+    with (
+        patch("sophon.agent._load_sessions", return_value=[]),
+        patch("sophon.agent._input_bar", side_effect=agent.AgentExitToTUI),
+        patch("sophon.agent._draw_screen"),
+    ):
+        assert agent._interactive({"provider": "openrouter", "model": "test", "context_window": 1024}) == agent.EXIT_TO_TUI
+
+
+def test_interactive_agent_command_returns_to_welcome_after_agent_exit():
+    from sophon import core
+    from sophon.agent import EXIT_TO_TUI
+
+    with (
+        patch("sophon.core.clear_terminal"),
+        patch("sophon.core.show_welcome") as welcome,
+        patch("sophon.core.auto_update_enabled", return_value=False),
+        patch("sophon.core.read_prompt", side_effect=["/agent", "/exit"]),
+        patch("sophon.agent.main", return_value=EXIT_TO_TUI) as agent_main,
+        patch("sophon.core.card"),
+        patch.object(core, "RESTART_REQUESTED", False),
+    ):
+        assert core.run_session() == 0
+    agent_main.assert_called_once_with([])
+    assert welcome.call_count == 2
+
+
+def test_agent_escape_from_cli_enters_interactive_tui():
+    from sophon import core
+    from sophon.agent import EXIT_TO_TUI
+
+    with (
+        patch("sophon.core.ensure_environment_config"),
+        patch("sophon.core.sys.argv", ["sophon", "agent"]),
+        patch("sophon.agent.main", return_value=EXIT_TO_TUI),
+        patch("sophon.core.run_session", return_value=0) as run_session,
+        patch.object(core, "RESTART_REQUESTED", False),
+    ):
+        assert core.main() == 0
+    run_session.assert_called_once_with()
+
+
+def test_system_status_is_detailed_and_does_not_show_provider_secrets(tmp_path):
+    from sophon import agent, core
+
+    workspace = tmp_path / "workspace"
+    project = workspace / "project"
+    project.mkdir(parents=True)
+    identity = tmp_path / "AGENT.md"
+    identity.write_text("# Instructions\n", encoding="utf-8")
+    session_file = tmp_path / "sessions.json"
+    legacy_session_file = tmp_path / "legacy-sessions.json"
+    output = StringIO()
+    config = {
+        "schema_version": 1,
+        "provider": "openrouter",
+        "model": "test-model",
+        "api_key": "must-not-appear",
+        "agent_instructions_path": str(identity),
+        "reasoning": {"is_support": True, "enabled": False, "effort": "medium"},
+    }
+    with (
+        patch.dict(os.environ, {"XDG_CONFIG_HOME": str(tmp_path / "config-home")}),
+        patch("sophon.core.detect_environment", return_value="Test Linux"),
+        patch("sophon.core.read_config", return_value=config),
+        patch("sophon.agent.WORKSPACE_ROOT", workspace),
+        patch("sophon.agent.PROJECT_DIR", project),
+        patch("sophon.agent.SESSION_FILE", session_file),
+        patch("sophon.agent.LEGACY_SESSION_FILE", legacy_session_file),
+        patch("sys.stdout", output),
+    ):
+        assert core.system_status() == 0
+    rendered = output.getvalue()
+    assert "Sophon System Status" in rendered
+    assert "Environment: Test Linux" in rendered
+    assert "Active project:" in rendered
+    assert "Home storage free:" in rendered
+    assert "Utilities:" in rendered
+    assert "must-not-appear" not in rendered
+    assert "Sophon Doctor" not in rendered
+    assert not session_file.exists() and not legacy_session_file.exists()
+
+
+def test_identity_command_displays_and_saves_agent_instructions(tmp_path):
+    from sophon import core
+    from sophon.config import agent_instructions_path
+
+    output = StringIO()
+    prompts = iter(["e", ""])
+
+    def fake_editor(arguments, check):
+        Path(arguments[-1]).write_text("# Updated Identity\nBe careful.\n", encoding="utf-8")
+        return subprocess.CompletedProcess(arguments, 0)
+
+    with (
+        patch.dict(os.environ, {"XDG_CONFIG_HOME": str(tmp_path), "EDITOR": "fake-editor --wait"}),
+        patch("sophon.core.read_config", return_value=None),
+        patch("sophon.core.read_prompt", side_effect=lambda *args, **kwargs: next(prompts)),
+        patch("sophon.core.shutil.which", return_value="/usr/bin/fake-editor"),
+        patch("sophon.core.subprocess.run", side_effect=fake_editor) as run_editor,
+        patch("sys.stdout", output),
+    ):
+        assert core.manage_identity() == 0
+        path = agent_instructions_path()
+    assert path.read_text(encoding="utf-8") == "# Updated Identity\nBe careful.\n"
+    assert "Agent Identity" in output.getvalue()
+    assert "# Updated Identity" in output.getvalue()
+    run_editor.assert_called_once()
+
+
+def test_system_prompt_requests_plain_unfenced_workspace_paths():
+    from sophon.agent import _system_message
+
+    prompt = _system_message({})
+    assert "plain text using `~`" in prompt
+    assert "never wrap a directory path in a fenced code block" in prompt
+
+
+def test_interactive_tui_routes_status_and_identity_commands():
+    from sophon import core
+
+    with (
+        patch("sophon.core.clear_terminal"),
+        patch("sophon.core.show_welcome"),
+        patch("sophon.core.auto_update_enabled", return_value=False),
+        patch("sophon.core.read_prompt", side_effect=["/status", "/identity", "/exit"]),
+        patch("sophon.core.system_status", return_value=0) as status,
+        patch("sophon.core.manage_identity", return_value=0) as identity,
+        patch("sophon.core.card"),
+        patch.object(core, "RESTART_REQUESTED", False),
+    ):
+        assert core.run_session() == 0
+    status.assert_called_once_with()
+    identity.assert_called_once_with()
+
+
+def test_ctrl_r_key_maps_to_reasoning_disclosure_toggle():
+    from sophon.agent import _read_key_raw
+
+    read_fd, write_fd = os.pipe()
+    terminal_input = os.fdopen(read_fd, "r", encoding="utf-8", closefd=False)
+    try:
+        os.write(write_fd, b"\x12")
+        with patch("sys.stdin", terminal_input):
+            assert _read_key_raw() == "TOGGLE_REASONING"
+    finally:
+        terminal_input.close()
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+def test_escape_from_nested_agent_prompt_returns_to_tui():
+    from sophon import agent
+
+    calls = 0
+
+    def input_bar(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return "/rename"
+        raise agent.AgentExitToTUI
+
+    with (
+        patch("sophon.agent._load_sessions", return_value=[]),
+        patch("sophon.agent._input_bar", side_effect=input_bar),
+        patch("sophon.agent._draw_screen"),
+    ):
+        assert agent._interactive({"provider": "openrouter", "model": "test", "context_window": 1024}) == agent.EXIT_TO_TUI
+    assert calls == 2

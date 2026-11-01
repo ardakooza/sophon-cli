@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import codecs
 import datetime as dt
+import difflib
 import json
 import math
 import os
 import queue
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -54,10 +56,70 @@ ANIMATION_TICK = 0.075
 AGENT_MODES = {"chat", "plan", "build"}
 PLAN_BUILTIN_TOOLS = {"get_version", "is_update", "system_health", "workspace_list", "session_list", "get_time", "get_date"}
 SLASH_COMMANDS = (
-    "/auto-compression", "/changelog", "/clear", "/compact", "/cwd", "/delete",
+    "/auto-compression", "/auto-update", "/changelog", "/clear", "/compact", "/cwd", "/delete",
     "/exit", "/fork", "/help", "/mode", "/model", "/new", "/reasoning",
-    "/reasoning-effort", "/rename", "/resume", "/sessions", "/threshold",
+    "/reasoning-effort", "/rename", "/resume", "/review", "/sessions",
+    "/threshold", "/undo", "/usage",
 )
+
+ARGUMENT_COMPLETIONS = {
+    "auto-compression": ("off", "on"),
+    "auto-update": ("off", "on"),
+    "mode": ("build", "chat", "plan"),
+    "reasoning": ("off", "on"),
+    "reasoning-effort": ("high", "low", "medium"),
+}
+
+
+def _fresh_usage() -> dict[str, object]:
+    return {"requests": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "estimated": False}
+
+
+def _merge_usage(target: dict[str, object], addition: dict[str, object]) -> None:
+    for field in ("requests", "prompt_tokens", "completion_tokens", "total_tokens"):
+        current = target.get(field, 0)
+        increment = addition.get(field, 0)
+        if isinstance(current, int) and isinstance(increment, int):
+            target[field] = current + increment
+    target["estimated"] = target.get("estimated") is True or addition.get("estimated") is True
+
+
+def _merge_session_usage(session: dict[str, object], addition: dict[str, object]) -> None:
+    usage = session.get("usage")
+    if not isinstance(usage, dict):
+        usage = _fresh_usage()
+        session["usage"] = usage
+    _merge_usage(usage, addition)
+
+
+def _auth_token(config: dict[str, object]) -> str:
+    token = str(config.get("api_key", "")).strip()
+    if token[:7].casefold() == "bearer ":
+        token = token[7:].strip()
+    return token
+
+
+def _response_usage(result: object) -> dict[str, object] | None:
+    if not isinstance(result, dict):
+        return None
+    value = result.get("usage")
+    if not isinstance(value, dict) and isinstance(result.get("result"), dict):
+        value = result["result"].get("usage")
+    return value if isinstance(value, dict) else None
+
+
+def _usage_values(usage: dict[str, object]) -> tuple[int, int, int]:
+    def first_integer(*names: str) -> int | None:
+        for name in names:
+            value = usage.get(name)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                return value
+        return None
+
+    prompt = first_integer("prompt_tokens", "input_tokens") or 0
+    completion = first_integer("completion_tokens", "output_tokens") or 0
+    total = first_integer("total_tokens")
+    return prompt, completion, total if total is not None else prompt + completion
 
 
 class AgentInterrupted(RuntimeError):
@@ -417,7 +479,12 @@ def _workspace_file(relative_path: str, *, allow_root: bool = False) -> Path:
     return candidate
 
 
-def _execute_workspace_tool(name: str, arguments: object) -> str:
+def _execute_workspace_tool(
+    name: str,
+    arguments: object,
+    *,
+    change_log: list[dict[str, object]] | None = None,
+) -> str:
     if isinstance(arguments, str):
         try:
             arguments = json.loads(arguments)
@@ -453,11 +520,36 @@ def _execute_workspace_tool(name: str, arguments: object) -> str:
             raise RuntimeError("File content must be text.")
         if len(content.encode("utf-8")) > 1_000_000:
             raise RuntimeError("Workspace files must be smaller than 1 MB to write.")
+        before_exists = path.exists()
+        try:
+            before = path.read_bytes() if before_exists else None
+            if before is not None and len(before) > 10_000_000:
+                raise RuntimeError("Files larger than 10 MB cannot be overwritten because undo safety cannot be guaranteed.")
+            before_mode = stat.S_IMODE(path.stat().st_mode) if before_exists else None
+        except OSError as error:
+            raise RuntimeError(f"Could not snapshot the existing file before writing: {error}") from None
         path.parent.mkdir(parents=True, exist_ok=True)
         try:
             path.write_text(content, encoding="utf-8")
         except OSError as error:
             raise RuntimeError(f"Could not write workspace file: {error}") from None
+        if change_log is not None:
+            relative_path = str(path.relative_to(PROJECT_DIR.resolve()))
+            after = content.encode("utf-8")
+            previous_change = next(
+                (change for change in change_log if change.get("path") == relative_path),
+                None,
+            )
+            if previous_change is None:
+                change_log.append({
+                    "path": relative_path,
+                    "before_exists": before_exists,
+                    "before": before,
+                    "before_mode": before_mode,
+                    "after": after,
+                })
+            else:
+                previous_change["after"] = after
         return f"Wrote {path.relative_to(PROJECT_DIR.resolve())}."
     raise RuntimeError(f"Unknown workspace tool: {name}")
 
@@ -556,6 +648,7 @@ def _request(
     *,
     tools_enabled: bool = True,
     on_reasoning: Callable[[str], None] | None = None,
+    usage_out: dict[str, object] | None = None,
     mode: str = "chat",
     cancellation: RequestCancellation | None = None,
 ) -> str:
@@ -583,18 +676,25 @@ def _request(
         endpoint_for(config),
         data=json.dumps(payload).encode("utf-8"),
         headers={
-            "Authorization": f"Bearer {config['api_key']}",
+            "Authorization": f"Bearer {_auth_token(config)}",
             "Content-Type": "application/json",
         },
         method="POST",
     )
+    if usage_out is not None:
+        usage_out["requests"] = int(usage_out.get("requests", 0)) + 1
     chunks: list[str] = []
     openrouter_tools: dict[int, dict[str, str]] = {}
     cloudflare_tools: list[dict[str, object]] = []
+    response_usage: dict[str, object] | None = None
 
     def collect_tool_calls(result: object) -> None:
+        nonlocal response_usage
         if not isinstance(result, dict):
             return
+        usage = _response_usage(result)
+        if usage is not None:
+            response_usage = usage
         if provider == "openrouter":
             choices = result.get("choices")
             choice = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
@@ -675,9 +775,24 @@ def _request(
                 tool_calls_out=tool_calls_out,
                 tools_enabled=False,
                 on_reasoning=on_reasoning,
+                usage_out=usage_out,
                 mode=mode,
                 cancellation=cancellation,
             )
+        if error.code == 401:
+            try:
+                error_data = json.loads(detail)
+            except json.JSONDecodeError:
+                error_data = {}
+            provider_error = error_data.get("error") if isinstance(error_data, dict) else None
+            message = provider_error.get("message") if isinstance(provider_error, dict) else None
+            if not isinstance(message, str) or not message.strip():
+                message = detail or str(error.reason)
+            if provider == "openrouter":
+                guidance = "OpenRouter rejected the key/account. Verify it is active and belongs to OpenRouter, then replace it with `sophon setup`."
+            else:
+                guidance = "Cloudflare rejected the token. Verify the Account ID and an active API token with Workers AI permissions, then replace it with `sophon setup`."
+            raise RuntimeError(f"{guidance}\nProvider detail: {message}") from None
         raise RuntimeError(f"Provider returned HTTP {error.code}: {detail or error.reason}") from None
     except (OSError, TimeoutError, URLError, UnicodeError, json.JSONDecodeError, ValueError) as error:
         if cancellation is not None and cancellation.cancelled:
@@ -711,6 +826,23 @@ def _request(
     content = "".join(chunks).strip()
     if not content and not tool_calls_out:
         raise RuntimeError("The provider returned an empty response.")
+    if usage_out is not None:
+        if response_usage is not None:
+            prompt_tokens, completion_tokens, total_tokens = _usage_values(response_usage)
+        else:
+            prompt_text = json.dumps(messages, ensure_ascii=False)
+            completion_text = "".join(chunks)
+            if openrouter_tools:
+                completion_text += json.dumps(openrouter_tools, ensure_ascii=False)
+            if cloudflare_tools:
+                completion_text += json.dumps(cloudflare_tools, ensure_ascii=False)
+            prompt_tokens = max(1, math.ceil(len(prompt_text) / 4))
+            completion_tokens = math.ceil(len(completion_text) / 4)
+            total_tokens = prompt_tokens + completion_tokens
+            usage_out["estimated"] = True
+        usage_out["prompt_tokens"] = int(usage_out.get("prompt_tokens", 0)) + prompt_tokens
+        usage_out["completion_tokens"] = int(usage_out.get("completion_tokens", 0)) + completion_tokens
+        usage_out["total_tokens"] = int(usage_out.get("total_tokens", 0)) + total_tokens
     return content
 
 
@@ -735,6 +867,8 @@ def _complete_turn(
     custom_system_prompt: str | None = None,
     mode: str = "chat",
     cancellation: RequestCancellation | None = None,
+    usage_out: dict[str, object] | None = None,
+    change_log: list[dict[str, object]] | None = None,
 ) -> str:
     messages: list[dict[str, object]] = [
         {"role": "system", "content": _system_message(config, custom_system_prompt, mode)},
@@ -754,6 +888,7 @@ def _complete_turn(
             on_chunk=on_chunk,
             tool_calls_out=tool_calls,
             on_reasoning=on_reasoning,
+            usage_out=usage_out,
             mode=mode,
             cancellation=cancellation,
         )
@@ -773,7 +908,11 @@ def _complete_turn(
                 if name in {tool["function"]["name"] for tool in BUILTIN_TOOLS}:
                     result = _execute_builtin_tool(name, function.get("arguments", "{}"))
                 else:
-                    result = _execute_workspace_tool(name, function.get("arguments", "{}"))
+                    result = _execute_workspace_tool(
+                        name,
+                        function.get("arguments", "{}"),
+                        change_log=change_log,
+                    )
             except (RuntimeError, OSError, ValueError) as error:
                 result = f"Tool error: {error}"
             messages.append({
@@ -824,6 +963,7 @@ def _new_session() -> dict[str, object]:
         "updated_at": now,
         "mode": "chat",
         "messages": [],
+        "usage": _fresh_usage(),
     }
 
 
@@ -837,6 +977,7 @@ def _fork_session(source: dict[str, object]) -> dict[str, object]:
         "updated_at": now,
         "mode": "chat",
         "messages": [dict(message) for message in source.get("messages", [])],
+        "usage": _fresh_usage(),
     }
 
 
@@ -877,6 +1018,14 @@ def _load_sessions() -> list[dict[str, object]]:
         item.setdefault("mode", "chat")
         if item.get("mode") not in AGENT_MODES:
             item["mode"] = "chat"
+        usage = item.get("usage")
+        if not isinstance(usage, dict):
+            item["usage"] = _fresh_usage()
+        else:
+            defaults = _fresh_usage()
+            for field, value in defaults.items():
+                if field not in usage:
+                    usage[field] = value
         sessions.append(item)
     sessions.sort(key=lambda item: str(item.get("updated_at", "")), reverse=True)
     if source == LEGACY_SESSION_FILE:
@@ -937,6 +1086,7 @@ def _compact_history(
     config: dict[str, object],
     messages: list[dict[str, object]],
     context_window: int,
+    usage_out: dict[str, object] | None = None,
 ) -> tuple[list[dict[str, object]], str]:
     if len(messages) < 2:
         raise RuntimeError("There is not enough conversation to compact yet.")
@@ -979,6 +1129,7 @@ def _compact_history(
             {"role": "user", "content": transcript},
         ],
         tools_enabled=False,
+        usage_out=usage_out,
     ).strip()
     if not summary:
         raise RuntimeError("The provider returned an empty context summary.")
@@ -1182,11 +1333,47 @@ def _editor_layout(
     return lines, cursor_row, cursor_col
 
 
-def _slash_command_completion(text: str, cursor: int) -> str:
-    if not text.startswith("/") or cursor != len(text) or any(char.isspace() for char in text):
-        return ""
-    candidate = next((command for command in SLASH_COMMANDS if command.startswith(text) and command != text), None)
-    return candidate[len(text):] if candidate else ""
+def _slash_completion_choices(text: str, cursor: int) -> list[str]:
+    if not text.startswith("/") or cursor != len(text):
+        return []
+    if not any(char.isspace() for char in text):
+        prefix = text.casefold()
+        choices = []
+        for command in sorted(SLASH_COMMANDS):
+            if command.startswith(prefix) and command != prefix:
+                suffix = command[len(text):]
+                if command[1:] in ARGUMENT_COMPLETIONS or command in {"/model", "/rename", "/threshold"}:
+                    suffix += " "
+                choices.append(suffix)
+        if prefix in SLASH_COMMANDS and (
+            prefix[1:] in ARGUMENT_COMPLETIONS or prefix in {"/model", "/rename", "/threshold"}
+        ):
+            choices.append(" ")
+        return choices
+    command, _, argument_text = text[1:].partition(" ")
+    options = ARGUMENT_COMPLETIONS.get(command.casefold())
+    if options is None:
+        return []
+    prefix = argument_text.rsplit(" ", 1)[-1].casefold()
+    if " " in argument_text:
+        return []
+    return [value[len(prefix):] for value in options if value.startswith(prefix) and value != prefix]
+
+
+def _slash_command_completion(text: str, cursor: int, choice_index: int = 0) -> str:
+    choices = _slash_completion_choices(text, cursor)
+    return choices[choice_index % len(choices)] if choices else ""
+
+
+def _accept_slash_completion(
+    text: str,
+    cursor: int,
+    choice_index: int = 0,
+) -> tuple[str, int, bool]:
+    completion = _slash_command_completion(text, cursor, choice_index)
+    if not completion:
+        return text, cursor, False
+    return text[:cursor] + completion + text[cursor:], cursor + len(completion), True
 
 
 def _input_box_rows(lines: list[str], width: int, *, placeholder: bool, text_length: int = 0) -> list[str]:
@@ -1394,11 +1581,17 @@ def _input_bar(draw, placeholder: str = INPUT_PLACEHOLDER, *, prefill: str = "")
     decoder = codecs.getincrementaldecoder(sys.stdin.encoding or "utf-8")()
     characters: list[str] = list(prefill)
     cursor = len(characters)
+    completion_index = 0
     last_size = shutil.get_terminal_size((80, 24))
 
     def redraw() -> None:
         text = "".join(characters)
-        draw(text, cursor, placeholder=placeholder, suggestion=_slash_command_completion(text, cursor))
+        draw(
+            text,
+            cursor,
+            placeholder=placeholder,
+            suggestion=_slash_command_completion(text, cursor, completion_index),
+        )
 
     try:
         tty.setraw(fd)
@@ -1425,52 +1618,90 @@ def _input_bar(draw, placeholder: str = INPUT_PLACEHOLDER, *, prefill: str = "")
                 key = bytes(sequence[-1:])
                 if key == b"D":
                     cursor = max(0, cursor - 1)
+                    completion_index = 0
                 elif key == b"C":
                     cursor = min(len(characters), cursor + 1)
+                    completion_index = 0
+                elif key in {b"A", b"B"}:
+                    choices = _slash_completion_choices("".join(characters), cursor)
+                    if choices:
+                        if key == b"A":
+                            completion_index = (completion_index - 1) % len(choices)
+                        else:
+                            completion_index = (completion_index + 1) % len(choices)
+                    redraw()
+                    continue
                 else:
                     continue
                 redraw()
                 continue
             if raw in {b"\r", b"\n"}:
                 text = "".join(characters)
-                completion = _slash_command_completion(text, cursor)
-                return (text + completion).strip()
+                completed, new_cursor, did_complete = _accept_slash_completion(text, cursor, completion_index)
+                if did_complete:
+                    characters[:] = list(completed)
+                    cursor = new_cursor
+                    completion_index = 0
+                    redraw()
+                    continue
+                return text.strip()
             if raw == b"\x03":
                 raise KeyboardInterrupt
             if raw in {b"\x08", b"\x7f"}:
                 if cursor:
                     characters.pop(cursor - 1)
                     cursor -= 1
+                    completion_index = 0
                     redraw()
                 continue
             if raw == b"\x04":
                 if cursor < len(characters):
                     characters.pop(cursor)
+                    completion_index = 0
                     redraw()
                 continue
             if raw == b"\t":
-                completion = _slash_command_completion("".join(characters), cursor)
-                if completion:
-                    characters[cursor:cursor] = list(completion)
-                    cursor += len(completion)
+                completed, new_cursor, did_complete = _accept_slash_completion(
+                    "".join(characters), cursor, completion_index
+                )
+                if did_complete:
+                    characters[:] = list(completed)
+                    cursor = new_cursor
+                    completion_index = 0
                     redraw()
                 continue
             character = decoder.decode(raw)
             if character and character.isprintable():
                 characters[cursor:cursor] = list(character)
                 cursor += len(character)
+                completion_index = 0
                 redraw()
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, previous)
 
 
 def _model_request(url: str, token: str, *, timeout: float = 30) -> dict[str, object]:
+    token = token.strip()
+    if token[:7].casefold() == "bearer ":
+        token = token[7:].strip()
     request = Request(url, headers={"Authorization": f"Bearer {token}"})
     try:
         with urlopen(request, timeout=timeout) as response:
             result = json.loads(response.read().decode("utf-8"))
     except HTTPError as error:
         detail = error.read(2048).decode("utf-8", errors="replace").strip()
+        if error.code == 401:
+            try:
+                payload = json.loads(detail)
+            except json.JSONDecodeError:
+                payload = {}
+            error_data = payload.get("error") if isinstance(payload, dict) else None
+            message = error_data.get("message") if isinstance(error_data, dict) else None
+            if not isinstance(message, str) or not message.strip():
+                message = detail or str(error.reason)
+            raise RuntimeError(
+                f"Provider rejected the saved credential (HTTP 401). Verify it is active, then replace it with `sophon setup`. Provider detail: {message}"
+            ) from None
         raise RuntimeError(f"Model list request failed (HTTP {error.code}): {detail or error.reason}") from None
     except (OSError, TimeoutError, URLError, UnicodeError, json.JSONDecodeError) as error:
         raise RuntimeError(f"Could not load models: {error}") from None
@@ -1525,7 +1756,7 @@ def _detect_reasoning_support(config: dict[str, object]) -> bool:
             base = f"https://api.cloudflare.com/client/v4/accounts/{config['account_id']}/ai/models/search"
             result = _model_request(
                 base + "?" + urlencode({"per_page": "100", "page": "1", "search": model_id}),
-                str(config["api_key"]),
+                _auth_token(config),
                 timeout=8,
             )
             items = result.get("result")
@@ -1561,7 +1792,7 @@ def _list_models(
     config: dict[str, object], search: str = "", *, timeout: float = 30
 ) -> list[dict[str, object]]:
     provider = str(config["provider"])
-    token = str(config["api_key"])
+    token = _auth_token(config)
     if provider == "openrouter":
         result = _model_request("https://openrouter.ai/api/v1/models", token, timeout=timeout)
         data = result.get("data")
@@ -1676,8 +1907,7 @@ def _footer_rows(
         directory = display_home_paths(PROJECT_DIR)
     body = [
         _truncate_display("Model: " + model, inner),
-        _truncate_display("Reasoning: " + reasoning, inner),
-        _truncate_display(f"Mode: {mode} · {context_label}", inner),
+        _truncate_display(f"Reasoning: {reasoning} · Mode: {mode} · {context_label}", inner),
         _truncate_display("Directory: " + directory, inner),
     ]
     return _card_rows(
@@ -1884,6 +2114,185 @@ def _sessions_panel_rows(
     return rows
 
 
+def _restore_workspace_changes(changes: list[dict[str, object]]) -> str:
+    plans: list[tuple[Path, dict[str, object]]] = []
+    conflicts: list[str] = []
+    for change in changes:
+        relative = str(change.get("path", ""))
+        path = _workspace_file(relative)
+        after = change.get("after")
+        before_exists = change.get("before_exists") is True
+        if not isinstance(after, bytes):
+            raise RuntimeError(f"Undo data for {relative} is invalid.")
+        try:
+            current = path.read_bytes() if path.exists() else None
+        except OSError as error:
+            raise RuntimeError(f"Could not check {relative} before undo: {error}") from None
+        if current != after:
+            conflicts.append(relative)
+        plans.append((path, change))
+    if conflicts:
+        raise RuntimeError(
+            "Undo stopped because these files changed after the Agent edit: "
+            + ", ".join(conflicts)
+            + ". Review them manually to avoid overwriting newer work."
+        )
+    restored = 0
+    for path, change in plans:
+        relative = str(change["path"])
+        if change.get("before_exists") is not True:
+            path.unlink()
+            restored += 1
+            continue
+        before = change.get("before")
+        if not isinstance(before, bytes):
+            raise RuntimeError(f"Undo data for {relative} is invalid.")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(prefix=".sophon-undo-", dir=path.parent)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(before)
+            mode = change.get("before_mode")
+            if isinstance(mode, int):
+                os.chmod(temporary, mode)
+            os.replace(temporary, path)
+        except BaseException:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+            raise
+        restored += 1
+    return f"Undid the last Agent edit in {restored} file{'s' if restored != 1 else ''}."
+
+
+def _change_diff(changes: list[dict[str, object]], max_chars: int = 24_000) -> str:
+    sections: list[str] = []
+    for change in changes:
+        relative = str(change.get("path", "unknown"))
+        before = change.get("before") if change.get("before_exists") is True else b""
+        after = change.get("after")
+        if not isinstance(before, bytes) or not isinstance(after, bytes):
+            continue
+        old_text = before.decode("utf-8", errors="replace")
+        new_text = after.decode("utf-8", errors="replace")
+        if old_text == new_text:
+            continue
+        diff = "\n".join(difflib.unified_diff(
+            old_text.splitlines(),
+            new_text.splitlines(),
+            fromfile=f"a/{relative}" if change.get("before_exists") is True else "/dev/null",
+            tofile=f"b/{relative}",
+            lineterm="",
+        ))
+        if diff:
+            sections.append(diff)
+    output = "\n\n".join(sections)
+    if len(output) > max_chars:
+        output = output[:max_chars] + "\n[Diff truncated to keep the review request bounded.]"
+    return output
+
+
+def _review_changes(
+    config: dict[str, object],
+    task: str,
+    changes: list[dict[str, object]],
+    usage_out: dict[str, object] | None = None,
+) -> str:
+    diff = _change_diff(changes)
+    if not diff:
+        raise RuntimeError("The last Agent edit contains no text changes to review.")
+    return _request(
+        config,
+        [
+            {
+                "role": "system",
+                "content": (
+                    "Review the provided code diff for concrete bugs, regressions, security issues, and missing edge cases. "
+                    "Do not edit files or call tools. Report only actionable findings, ordered by severity, with file and line "
+                    "references where possible. If you find none, say no actionable issue was found and note that this is a "
+                    "static review, not a test run."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"Original task:\n{task or '(not available)'}\n\nReview this last Agent change:\n```diff\n{diff}\n```",
+            },
+        ],
+        tools_enabled=False,
+        usage_out=usage_out,
+    )
+
+
+def _provider_limit_rows(config: dict[str, object]) -> list[str]:
+    if config.get("provider") != "openrouter":
+        return [
+            "Cloudflare Workers AI: 10,000 free Neurons/day; check current use in the Workers AI dashboard.",
+            "Remaining quota is not available from the inference token; daily allocation resets at 00:00 UTC.",
+        ]
+    request = Request(
+        "https://openrouter.ai/api/v1/key",
+        headers={"Authorization": f"Bearer {_auth_token(config)}"},
+        method="GET",
+    )
+    try:
+        with urlopen(request, timeout=8) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except HTTPError as error:
+        if error.code == 401:
+            return ["OpenRouter limits unavailable: the saved credential was rejected; verify it with `sophon setup`."]
+        return [f"OpenRouter limits unavailable (HTTP {error.code})."]
+    except (OSError, TimeoutError, URLError, UnicodeError, json.JSONDecodeError, ValueError):
+        return ["OpenRouter limits unavailable; check your network and try /usage again."]
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict):
+        return ["OpenRouter did not return current-key limit data."]
+    rows: list[str] = []
+    remaining = data.get("limit_remaining")
+    limit = data.get("limit")
+    if isinstance(remaining, (int, float)) and not isinstance(remaining, bool):
+        rows.append(f"OpenRouter key credit limit remaining: ${remaining:,.2f}.")
+    elif limit is None:
+        rows.append("OpenRouter per-key credit cap: none reported.")
+    budget = data.get("effective_budget")
+    if isinstance(budget, dict) and isinstance(budget.get("remaining_usd"), (int, float)):
+        row = f"Effective budget remaining: ${budget['remaining_usd']:,.2f}"
+        resets_at = budget.get("resets_at")
+        if isinstance(resets_at, str) and resets_at:
+            row += f" · resets {resets_at}"
+        rows.append(row + ".")
+    free_requests = data.get("free_model_daily_requests")
+    if isinstance(free_requests, dict):
+        left = free_requests.get("remaining")
+        maximum = free_requests.get("limit")
+        if isinstance(left, int) and isinstance(maximum, int):
+            rows.append(f"Free-model requests remaining today: {left} of {maximum}.")
+    if not rows:
+        rows.append("OpenRouter returned no per-key remaining-limit fields.")
+    return rows
+
+
+def _usage_panel_rows(session: dict[str, object], config: dict[str, object]) -> list[str]:
+    usage = session.get("usage")
+    if not isinstance(usage, dict):
+        usage = _fresh_usage()
+    requests = usage.get("requests", 0)
+    prompt = usage.get("prompt_tokens", 0)
+    completion = usage.get("completion_tokens", 0)
+    total = usage.get("total_tokens", 0)
+    requests = requests if isinstance(requests, int) else 0
+    prompt = prompt if isinstance(prompt, int) else 0
+    completion = completion if isinstance(completion, int) else 0
+    total = total if isinstance(total, int) else 0
+    token_note = " (some counts estimated)" if usage.get("estimated") is True else ""
+    return [
+        f"Model requests in this session: {requests:,}.",
+        f"Tokens: {total:,} total · {prompt:,} prompt · {completion:,} completion{token_note}.",
+        "",
+        *_provider_limit_rows(config),
+    ]
+
+
 def _interactive(config: dict[str, object]) -> int:
     try:
         sessions = _load_sessions()
@@ -1891,6 +2300,7 @@ def _interactive(config: dict[str, object]) -> int:
         card("Session storage error", [str(error)], border_color=NOTICE_BORDER, text_color=NOTICE_TEXT)
         return 1
     session = _new_session()
+    last_changes_by_session: dict[str, list[dict[str, object]]] = {}
     notice_rows: list[str] = []
     display_message_start = 0
     pending_prompts: list[str] = []
@@ -2017,13 +2427,17 @@ def _interactive(config: dict[str, object]) -> int:
         if window is None or _context_percentage(messages, window) < threshold:
             return
         before = _context_percentage(messages, window)
+        compression_usage = _fresh_usage()
         notice("Auto-compression", "Summarizing earlier conversation…")
         draw("", 0)
         try:
-            compressed, _ = _compact_history(config, messages, window)
+            compressed, _ = _compact_history(config, messages, window, usage_out=compression_usage)
         except (RuntimeError, OSError, ValueError) as error:
+            _merge_session_usage(session, compression_usage)
+            save_current()
             notice("Auto-compression failed", str(error), error=True)
             return
+        _merge_session_usage(session, compression_usage)
         messages[:] = compressed
         display_message_start = min(display_message_start, len(messages))
         if save_current():
@@ -2058,24 +2472,28 @@ def _interactive(config: dict[str, object]) -> int:
                 notice_rows = _card_rows(
                     "Agent Commands",
                     [
+                        "/auto-compression on|off — Toggle automatic mode",
+                        "/auto-update on|off — Toggle automatic startup updates",
+                        "/changelog — Show latest changes",
+                        "/clear — Clear the screen, keep this session",
+                        "/compact — Summarize context at 50% or more",
+                        "/cwd — Show current directory",
+                        "/delete — Delete a saved session",
+                        "/exit or Q — Close Sophon Agent",
+                        "/fork — Fork a saved session",
                         "/help — Show available commands",
+                        "/mode plan|build|chat — Set the Agent mode",
                         "/model [search] — Choose a model",
                         "/new — Start a new session",
-                        "/rename [title] — Rename this session",
-                        "/resume — Load a saved session",
-                        "/fork — Fork a saved session",
-                        "/sessions — List sessions by title and context",
-                        "/delete — Delete a saved session",
-                        "/compact — Summarize context at 50% or more",
-                        "/auto-compression on|off — Toggle automatic mode",
-                        "/threshold 30–95 — Set auto-compression threshold",
-                        "/mode plan|build|chat — Set the Agent mode",
-                        "/changelog — Show latest changes",
                         "/reasoning on|off — Toggle model reasoning",
                         "/reasoning-effort low|medium|high — Set effort",
-                        "/cwd — Show current directory",
-                        "/clear — Clear the screen, keep this session",
-                        "/exit or Q — Close Sophon Agent",
+                        "/rename [title] — Rename this session",
+                        "/resume — Load a saved session",
+                        "/review — Review the last Agent file changes",
+                        "/sessions — List sessions by title and context",
+                        "/threshold 30–95 — Set auto-compression threshold",
+                        "/undo — Revert the last Agent file edits",
+                        "/usage — Show session tokens and provider limits",
                     ],
                     columns=shutil.get_terminal_size((80, 24)).columns,
                 )
@@ -2087,6 +2505,8 @@ def _interactive(config: dict[str, object]) -> int:
                         f"Version: {VERSION}",
                         f"Last updated: {updated}",
                         "",
+                        "Added: /undo for safe last-edit rollback, /review for static change review, and /usage.",
+                        "Improved: argument-aware command completion and clearer provider authentication errors.",
                         "Added: /sessions, /mode, /threshold and the single /cwd command.",
                         "Added: default chat sessions, read-only planning, and build approval flow.",
                         "Added: auto-compression at 30–95%; /compact unlocks at 50% context.",
@@ -2098,6 +2518,66 @@ def _interactive(config: dict[str, object]) -> int:
             elif command == "cwd":
                 title, message, error = _workspace_location(command)
                 notice(title, message, error=error)
+            elif command == "usage":
+                notice_rows = _card_rows(
+                    "Session Usage",
+                    _usage_panel_rows(session, config),
+                    columns=shutil.get_terminal_size((80, 24)).columns,
+                )
+            elif command == "review":
+                changes = last_changes_by_session.get(str(session.get("id")), [])
+                if not changes:
+                    notice("Change Review", "No recent Agent file changes are available to review.")
+                    continue
+                task = next(
+                    (str(item.get("content", "")) for item in reversed(session["messages"]) if item.get("role") == "user"),
+                    "",
+                )
+                review_usage = _fresh_usage()
+                notice("Change Review", "Reviewing the last Agent diff…")
+                draw("", 0)
+                try:
+                    review = _review_changes(config.copy(), task, changes, review_usage)
+                except (RuntimeError, OSError, ValueError) as error:
+                    _merge_session_usage(session, review_usage)
+                    save_current()
+                    notice("Review unavailable", str(error), error=True)
+                else:
+                    _merge_session_usage(session, review_usage)
+                    save_current()
+                    notice_rows = _card_rows(
+                        "Change Review",
+                        review.splitlines() or ["The reviewer returned no text."],
+                        columns=shutil.get_terminal_size((80, 24)).columns,
+                    )
+            elif command == "undo":
+                session_changes = last_changes_by_session.get(str(session.get("id")), [])
+                if not session_changes:
+                    notice("Undo unavailable", "No Agent file edit is available to undo.", error=True)
+                    continue
+                try:
+                    result = _restore_workspace_changes(session_changes)
+                except (RuntimeError, OSError) as error:
+                    notice("Undo stopped", str(error), error=True)
+                    continue
+                last_changes_by_session.pop(str(session.get("id")), None)
+                save_current()
+                notice_plain(result)
+            elif command == "auto-update":
+                value = argument.casefold()
+                if value not in {"on", "off"}:
+                    status = "on" if config.get("auto_update") is True else "off"
+                    notice("Automatic updates", f"Auto-update is {status}. Use /auto-update on|off.")
+                    continue
+                updated_config = config.copy()
+                updated_config["auto_update"] = value == "on"
+                try:
+                    write_config(updated_config)
+                except (OSError, ValueError) as error:
+                    notice("Automatic updates", str(error), error=True)
+                else:
+                    config.update(updated_config)
+                    notice("Automatic updates", f"Auto-update is {value}. Use /auto-update on|off.")
             elif command == "sessions":
                 notice_rows = _card_rows(
                     "Saved Sessions",
@@ -2244,11 +2724,20 @@ def _interactive(config: dict[str, object]) -> int:
                     continue
                 notice("Context compression", "Summarizing earlier conversation…")
                 draw("", 0)
+                compact_usage = _fresh_usage()
                 try:
-                    compacted, _ = _compact_history(config, session["messages"], window)
+                    compacted, _ = _compact_history(
+                        config,
+                        session["messages"],
+                        window,
+                        usage_out=compact_usage,
+                    )
                 except (RuntimeError, OSError, ValueError) as error:
+                    _merge_session_usage(session, compact_usage)
+                    save_current()
                     notice("Context not compacted", str(error), error=True)
                     continue
+                _merge_session_usage(session, compact_usage)
                 session["messages"][:] = compacted
                 display_message_start = min(display_message_start, len(session["messages"]))
                 if save_current():
@@ -2379,6 +2868,9 @@ def _interactive(config: dict[str, object]) -> int:
         events: queue.Queue[tuple[str, object]] = queue.Queue()
         cancellation = RequestCancellation()
         turn_mode = str(session.get("mode", "chat"))
+        turn_session_id = str(session.get("id", ""))
+        turn_usage = _fresh_usage()
+        turn_changes: list[dict[str, object]] = []
         request_messages = [
             item for item in messages if item["role"] in {"user", "assistant"}
         ]
@@ -2392,6 +2884,8 @@ def _interactive(config: dict[str, object]) -> int:
                     on_reasoning=lambda chunk: events.put(("reasoning", chunk)),
                     mode=turn_mode,
                     cancellation=cancellation,
+                    usage_out=turn_usage,
+                    change_log=turn_changes,
                 )
             except Exception as error:
                 events.put(("error", error))
@@ -2497,6 +2991,9 @@ def _interactive(config: dict[str, object]) -> int:
         answering["text"] = ""
         answering["reasoning"] = ""
         answering["interrupt_warning"] = False
+        _merge_session_usage(session, turn_usage)
+        if turn_changes:
+            last_changes_by_session[turn_session_id] = turn_changes
         refresh_sessions_after_tools()
         if interrupted_by_user:
             partial = "".join(parts).strip()

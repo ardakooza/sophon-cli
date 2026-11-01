@@ -85,6 +85,37 @@ def test_setup_progress_uses_lowercase_of_and_white_text():
     assert "\033[38;5;255m" in text
 
 
+def test_previous_next_hint_is_limited_to_numbered_setup_steps():
+    from sophon.setup_wizard import _choose_existing_action, _choose_provider
+
+    class TerminalBuffer(StringIO):
+        def isatty(self):
+            return True
+
+    fake_input = type("TerminalInput", (), {"isatty": lambda self: True})()
+    output = TerminalBuffer()
+    with (
+        patch("sys.stdout", output),
+        patch("sys.stdin", fake_input),
+        patch("sophon.setup_wizard.clear_terminal"),
+        patch("sophon.setup_wizard._read_key", return_value="CANCEL"),
+    ):
+        assert _choose_provider() is None
+    assert "1 of 4" in output.getvalue()
+    assert "←/→ previous/next" in output.getvalue()
+
+    output = TerminalBuffer()
+    with (
+        patch("sys.stdout", output),
+        patch("sys.stdin", fake_input),
+        patch("sophon.setup_wizard.clear_terminal"),
+        patch("sophon.setup_wizard._read_key", return_value="CANCEL"),
+    ):
+        assert _choose_existing_action({"provider": "openrouter", "model": "test"}) is None
+    assert "Current Provider" in output.getvalue()
+    assert "←/→ previous/next" not in output.getvalue()
+
+
 def test_review_and_complete_card_titles_and_provider_labels_are_white(tmp_path):
     from sophon.setup_wizard import run_setup_wizard
 
@@ -377,6 +408,25 @@ def test_run_session_shows_welcome_before_deferred_update_check():
     assert events[:3] == ["clear", "welcome", "update"]
 
 
+def test_automatic_update_status_card_is_one_line():
+    from sophon import core
+
+    cards = []
+    with (
+        patch("sophon.core.clear_terminal"),
+        patch("sophon.core.show_welcome"),
+        patch("sophon.core.auto_update_enabled", return_value=False),
+        patch("sophon.core.set_auto_update") as set_update,
+        patch("sophon.core.read_prompt", side_effect=["/auto-update on", "/exit"]),
+        patch("sophon.core.card", side_effect=lambda title, lines, **kwargs: cards.append((title, lines))),
+        patch.object(core, "RESTART_REQUESTED", False),
+    ):
+        assert core.run_session() == 0
+    update_cards = [lines for title, lines in cards if title == "Automatic updates"]
+    assert update_cards == [["Auto-update is on. Use /auto-update on|off."]]
+    set_update.assert_called_once_with(True)
+
+
 def test_agent_exposes_required_builtin_tools_on_every_provider_request():
     import json
 
@@ -398,7 +448,7 @@ def test_agent_exposes_required_builtin_tools_on_every_provider_request():
             return False
 
         def read(self):
-            return b'{"choices":[{"message":{"content":"ok"}}]}'
+            return b'{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":12,"completion_tokens":3,"total_tokens":15}}'
 
     captured = {}
 
@@ -412,11 +462,48 @@ def test_agent_exposes_required_builtin_tools_on_every_provider_request():
         "api_key": "test-key",
         "endpoint": "https://openrouter.ai/api/v1/chat/completions",
     }
+    usage = {"requests": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "estimated": False}
     with patch("sophon.agent.urlopen", side_effect=fake_urlopen):
-        assert _request(config, [{"role": "user", "content": "hello"}]) == "ok"
+        assert _request(config, [{"role": "user", "content": "hello"}], usage_out=usage) == "ok"
     sent_names = {tool["function"]["name"] for tool in captured["payload"]["tools"]}
     assert names <= sent_names
     assert {"list_files", "read_file", "write_file"} <= sent_names
+    assert usage == {"requests": 1, "prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15, "estimated": False}
+
+
+def test_openrouter_user_not_found_401_has_actionable_auth_guidance():
+    from io import BytesIO
+    from urllib.error import HTTPError
+    from sophon.agent import _request
+
+    captured = {}
+
+    def reject(request, timeout):
+        captured["authorization"] = request.get_header("Authorization")
+        raise HTTPError(
+            request.full_url,
+            401,
+            "Unauthorized",
+            hdrs=None,
+            fp=BytesIO(b'{"error":{"message":"User not found.","code":401}}'),
+        )
+
+    config = {
+        "provider": "openrouter",
+        "model": "test-model",
+        "api_key": "Bearer valid-looking-key",
+        "endpoint": "https://openrouter.ai/api/v1/chat/completions",
+    }
+    try:
+        with patch("sophon.agent.urlopen", side_effect=reject):
+            _request(config, [{"role": "user", "content": "hello"}])
+    except RuntimeError as error:
+        assert "OpenRouter rejected the key/account" in str(error)
+        assert "sophon setup" in str(error)
+        assert "User not found." in str(error)
+    else:
+        raise AssertionError("The provider's 401 response must be surfaced")
+    assert captured["authorization"] == "Bearer valid-looking-key"
 
 
 def test_agent_executes_builtin_tool_calls_and_returns_results_to_the_model():
@@ -923,7 +1010,7 @@ def test_manual_compact_requires_threshold_and_saves_summary(tmp_path):
     ):
         agent._write_sessions([saved_session])
         commands = iter(["/resume", "/compact", "/exit"])
-        def compacted(config, messages, window):
+        def compacted(config, messages, window, usage_out=None):
             return ([{"role": "assistant", "content": "Earlier conversation summary:\nSummary", "summary": True}, *messages[-2:]], "Summary")
         with (
             patch("sophon.agent._input_bar", side_effect=lambda *args, **kwargs: next(commands)),
@@ -965,8 +1052,10 @@ def test_changelog_shows_release_and_last_updated_date():
     assert "Sophon Changelog" in rendered
     assert "Last updated:" in rendered
     assert "/sessions" in rendered
+    assert "/undo" in rendered and "/review" in rendered and "/usage" in rendered
     assert "double-Esc" in rendered
     assert "30–95%" in rendered
+    assert "argument-aware command completion" in rendered
 
 
 def test_config_reasoning_labels_only_show_effort_when_supported_and_on(tmp_path):
@@ -988,6 +1077,8 @@ def test_config_reasoning_labels_only_show_effort_when_supported_and_on(tmp_path
         assert "Reasoning: not supported" in output.getvalue()
         assert "Reasoning effort:" not in output.getvalue()
         assert "Auto-compression" not in output.getvalue()
+        config_text = re.sub(r"\x1b\[[0-9;]*m", "", output.getvalue())
+        assert config_text.index("API key: hidden") < config_text.index("Environment:")
         output = StringIO()
         with patch("sys.stdout", output):
             write_config({**base, "reasoning": {"is_support": True, "enabled": False, "effort": "high"}})
@@ -1067,7 +1158,7 @@ def test_auto_compression_runs_before_sending_when_threshold_is_reached(tmp_path
         agent._write_sessions([saved_session])
         commands = iter(["/resume", "Continue", "/exit"])
 
-        def compacted(config, messages, window):
+        def compacted(config, messages, window, usage_out=None):
             captured["compact_count"] = captured.get("compact_count", 0) + 1
             return (
                 [{"role": "assistant", "content": "Earlier conversation summary:\nSummary", "summary": True}, *messages[-2:]],
@@ -1184,13 +1275,14 @@ def test_new_and_forked_agent_sessions_default_to_chat_mode():
     assert forked["mode"] == "chat"
 
 
-def test_footer_reasoning_and_mode_are_stacked_below_model():
+def test_footer_reasoning_mode_and_context_share_one_line_below_model():
     from sophon.agent import _footer_rows
 
     rendered = "\n".join(_footer_rows("test/model", [], 4096, 100, mode="build", reasoning="high"))
     plain = re.sub(r"\x1b\[[0-9;]*m", "", rendered)
     assert plain.index("Model:") < plain.index("Reasoning: high") < plain.index("Mode: build")
-    assert "Context:" in plain
+    status_line = next(line for line in plain.splitlines() if "Reasoning:" in line)
+    assert "Mode:" in status_line and "Context:" in status_line
 
 
 def test_reasoning_transcript_uses_a_vertical_connector_to_the_answer():
@@ -1204,11 +1296,144 @@ def test_reasoning_transcript_uses_a_vertical_connector_to_the_answer():
 
 
 def test_slash_completion_is_a_suffix_and_only_completes_at_input_end():
-    from sophon.agent import _slash_command_completion
+    from sophon.agent import (
+        _accept_slash_completion,
+        _slash_command_completion,
+        _slash_completion_choices,
+    )
 
     assert _slash_command_completion("/sess", 5) == "ions"
     assert _slash_command_completion("/sess", 3) == ""
     assert _slash_command_completion("/sessions ", 10) == ""
+    assert _slash_completion_choices("/mo", 3) == ["de ", "del "]
+    assert _slash_command_completion("/", 1) == "auto-compression "
+    assert _slash_completion_choices("/mode ", 6) == ["build", "chat", "plan"]
+    assert _slash_command_completion("/reasoning o", 12, 1) == "n"
+    assert _slash_command_completion("/model", 6) == " "
+    assert _slash_command_completion("/model ", 7) == ""
+    completed, cursor, did_complete = _accept_slash_completion("/mode ", 6)
+    assert (completed, cursor, did_complete) == ("/mode build", 11, True)
+    submitted, cursor, did_complete = _accept_slash_completion(completed, cursor)
+    assert (submitted, cursor, did_complete) == ("/mode build", 11, False)
+
+
+def test_undo_restores_agent_file_changes_and_refuses_external_overwrites(tmp_path):
+    from sophon.agent import _execute_workspace_tool, _restore_workspace_changes
+
+    project = tmp_path / "project"
+    project.mkdir()
+    target = project / "notes.txt"
+    target.write_text("before\n", encoding="utf-8")
+    changes = []
+    with patch("sophon.agent.PROJECT_DIR", project):
+        _execute_workspace_tool("write_file", {"path": "notes.txt", "content": "after\n"}, change_log=changes)
+        assert target.read_text(encoding="utf-8") == "after\n"
+        assert "1 file" in _restore_workspace_changes(changes)
+        assert target.read_text(encoding="utf-8") == "before\n"
+
+        changes = []
+        _execute_workspace_tool("write_file", {"path": "notes.txt", "content": "agent edit\n"}, change_log=changes)
+        target.write_text("newer manual work\n", encoding="utf-8")
+        try:
+            _restore_workspace_changes(changes)
+        except RuntimeError as error:
+            assert "changed after the Agent edit" in str(error)
+        else:
+            raise AssertionError("Undo must not overwrite changes made after the Agent edit")
+        assert target.read_text(encoding="utf-8") == "newer manual work\n"
+
+
+def test_review_sends_only_a_bounded_diff_without_tools():
+    from sophon.agent import _review_changes
+
+    changes = [{
+        "path": "app.py",
+        "before_exists": True,
+        "before": b"def value():\n    return 1\n",
+        "after": b"def value():\n    return 2\n",
+    }]
+    with patch("sophon.agent._request", return_value="No actionable issue found.") as request:
+        result = _review_changes({"provider": "openrouter", "model": "reviewer"}, "change value", changes)
+    assert result == "No actionable issue found."
+    assert request.call_args.kwargs["tools_enabled"] is False
+    review_prompt = request.call_args.args[1][1]["content"]
+    assert "Original task:\nchange value" in review_prompt
+    assert "-    return 1" in review_prompt and "+    return 2" in review_prompt
+
+
+def test_usage_panel_reports_session_totals_and_openrouter_remaining_limits():
+    import json
+    from io import BytesIO
+    from sophon.agent import _provider_limit_rows, _usage_panel_rows
+
+    payload = {"data": {
+        "limit": 20,
+        "limit_remaining": 12.5,
+        "effective_budget": {"remaining_usd": 4.25, "resets_at": "2026-11-02T00:00:00Z"},
+        "free_model_daily_requests": {"remaining": 8, "limit": 50},
+    }}
+    def fake_urlopen(request, timeout):
+        assert request.full_url == "https://openrouter.ai/api/v1/key"
+        assert request.get_header("Authorization") == "Bearer key-value"
+        return BytesIO(json.dumps(payload).encode("utf-8"))
+
+    session = {"usage": {"requests": 3, "prompt_tokens": 30, "completion_tokens": 12, "total_tokens": 42, "estimated": False}}
+    with patch("sophon.agent.urlopen", side_effect=fake_urlopen):
+        rows = _usage_panel_rows(session, {"provider": "openrouter", "api_key": "Bearer key-value"})
+    joined = "\n".join(rows)
+    assert "3" in rows[0] and "42 total" in rows[1]
+    assert "$12.50" in joined and "$4.25" in joined and "8 of 50" in joined
+    cloudflare_rows = _provider_limit_rows({"provider": "cloudflare"})
+    assert any("10,000 free Neurons/day" in row for row in cloudflare_rows)
+    assert any("not available from the inference token" in row for row in cloudflare_rows)
+
+
+def test_agent_undo_and_review_commands_follow_the_last_workspace_edit(tmp_path):
+    from sophon import agent
+
+    project = tmp_path / "project"
+    project.mkdir()
+    sessions_file = tmp_path / "sessions" / "sessions.json"
+    commands = iter(["Create a file", "/review", "/undo", "/exit"])
+    review_calls = []
+
+    def complete(config, messages, **kwargs):
+        agent._execute_workspace_tool(
+            "write_file",
+            {"path": "created.txt", "content": "hello\n"},
+            change_log=kwargs["change_log"],
+        )
+        return "Created the file."
+
+    def fake_review(config, task, changes, usage_out):
+        review_calls.append((task, changes))
+        usage_out["requests"] = 1
+        return "No actionable issue found."
+
+    def fake_input(draw, *args, **kwargs):
+        draw("", 0)
+        return next(commands)
+
+    with (
+        patch("sophon.agent._load_sessions", return_value=[]),
+        patch("sophon.agent.SESSION_FILE", sessions_file),
+        patch("sophon.agent.PROJECT_DIR", project),
+        patch("sophon.agent._input_bar", side_effect=fake_input),
+        patch("sophon.agent._complete_turn", side_effect=complete),
+        patch("sophon.agent._review_changes", side_effect=fake_review),
+        patch("sophon.agent._draw_screen"),
+    ):
+        assert agent._interactive({
+            "provider": "openrouter",
+            "model": "test",
+            "context_window": 4096,
+            "auto_compression": False,
+        }) == 0
+
+    assert len(review_calls) == 1
+    assert review_calls[0][0] == "Create a file"
+    assert review_calls[0][1][0]["path"] == "created.txt"
+    assert not (project / "created.txt").exists()
 
 
 def test_sessions_panel_sorts_by_title_and_shows_context_and_date():

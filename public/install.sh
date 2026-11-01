@@ -49,7 +49,7 @@ is_sophon_package_launcher() {
     grep -Eq 'from sophon\.core import main|sophon\.core:main' "$TARGET"
 }
 
-is_managed_legacy_xernel() {
+is_managed_legacy_cli() {
     if [ -L "$LEGACY_TARGET" ]; then
         LEGACY_LINK=$(readlink "$LEGACY_TARGET") || return 1
         case "$LEGACY_LINK" in
@@ -64,8 +64,8 @@ is_managed_legacy_xernel() {
     return 1
 }
 
-remove_managed_legacy_xernel() {
-    if is_managed_legacy_xernel; then
+remove_managed_legacy_cli() {
+    if is_managed_legacy_cli; then
         rm -f "$LEGACY_TARGET"
     fi
 }
@@ -102,7 +102,7 @@ fi
 if [ "$MANAGED_INSTALL" -eq 1 ] && [ -n "$REMOTE_VERSION" ]; then
     INSTALLED_VERSION=$("$INSTALL_DIR/venv/bin/python" -c 'from sophon import __version__; print(__version__)' 2>/dev/null || true)
     if [ "$INSTALLED_VERSION" = "$REMOTE_VERSION" ]; then
-        remove_managed_legacy_xernel
+        remove_managed_legacy_cli
         "$INSTALL_DIR/venv/bin/python" -c 'from sophon.config import ensure_environment_config; ensure_environment_config()' || true
         echo "Sophon is already up to date ($REMOTE_VERSION)."
         exit 0
@@ -187,7 +187,7 @@ EOF
     mv "$WRAPPER" "$TARGET"
 fi
 
-remove_managed_legacy_xernel
+remove_managed_legacy_cli
 
 if [ -n "$REMOTE_VERSION" ]; then
     echo "Sophon $REMOTE_VERSION installed. Run 'sophon' to start."

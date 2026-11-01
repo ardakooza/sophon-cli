@@ -117,8 +117,6 @@ def _choose_existing_action(existing: dict[str, object]) -> str | None:
                 "",
                 f"{'›' if selected == 0 else ' '} {labels[0]}",
                 f"{'›' if selected == 1 else ' '} {labels[1]}",
-                "",
-                "←/→ previous/next   ↑/↓ move   Enter select   Q cancel",
             ],
         )
         key = _read_key()

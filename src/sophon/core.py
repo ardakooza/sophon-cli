@@ -613,12 +613,12 @@ def run_session() -> int:
                 value = value.strip()
                 if value in {"on", "off"}:
                     set_auto_update(value == "on")
-                    card("Automatic updates", [f"Auto-update is {value}."])
+                    card("Automatic updates", [f"Auto-update is {value}. Use /auto-update on|off."])
                 elif not value:
                     status = "on" if auto_update_enabled() else "off"
-                    card("Automatic updates", [f"Auto-update is {status}.", "Use /auto-update on or /auto-update off."])
+                    card("Automatic updates", [f"Auto-update is {status}. Use /auto-update on|off."])
                 else:
-                    card("Automatic updates", ["Use /auto-update on or /auto-update off."], border_color=NOTICE_BORDER, text_color=NOTICE_TEXT)
+                    card("Automatic updates", ["Auto-update is unchanged. Use /auto-update on|off."], border_color=NOTICE_BORDER, text_color=NOTICE_TEXT)
             elif command == "/restart":
                 card(None, ["Restarting Sophon..."])
                 restart_sophon()
@@ -676,8 +676,8 @@ def show_config() -> int:
     lines = [
         f"Provider: {PROVIDERS[provider]['label']}",
         f"Model: {data['model']}",
-        f"Environment: {data.get('Environment', 'unknown')}",
         "API key: hidden",
+        f"Environment: {data.get('Environment', 'unknown')}",
         f"Auto-update: {'on' if data.get('auto_update') is True else 'off'}",
     ]
     reasoning = data.get("reasoning") if isinstance(data.get("reasoning"), dict) else {}

@@ -26,6 +26,21 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from sophon import intelligent_ui
+from sophon.tool_calling import (
+    ASK_TOOL,
+    BUILTIN_TOOLS,
+    CODE_EXECUTION_TOOL,
+    EXECUTION_TOOLS,
+    FILE_MANAGE_TOOL_NAMES,
+    FILE_MANAGE_TOOLS,
+    PLANNING_TOOL,
+    PLAN_BUILTIN_TOOLS,
+    PLAN_FILE_TOOLS,
+    WORKSPACE_TOOLS,
+    dispatch_tool,
+    tools_for_mode,
+)
 from sophon.config import (
     PROVIDERS,
     agent_instructions_path,
@@ -56,11 +71,9 @@ WORKSPACE_ROOT = Path.home() / ".sophon" / "workspace"
 DEFAULT_PROJECT_DIR = WORKSPACE_ROOT / "my-project"
 PROJECT_DIR = DEFAULT_PROJECT_DIR
 INPUT_PLACEHOLDER = "Create something with sophon"
-ANIMATION_TICK = 0.075
+ANIMATION_TICK = intelligent_ui.animation_interval()
 EXIT_TO_TUI = 42
 AGENT_MODES = {"chat", "plan", "build"}
-PLAN_BUILTIN_TOOLS = {"get_version", "is_update", "system_health", "workspace_list", "session_list", "get_time", "get_date"}
-PLAN_FILE_TOOLS = {"list_files", "read_file", "file_read", "tree_view"}
 SLASH_COMMANDS = (
     "/auto-compression", "/auto-update", "/cd", "/changelog", "/clear", "/compact", "/cwd", "/delete",
     "/exit", "/fork", "/help", "/history", "/mode", "/model", "/new", "/reasoning",
@@ -193,265 +206,11 @@ class QuestionHandoff:
 SYSTEM_PROMPT = (
     "You are Sophon, a concise and practical development assistant. "
     "Use the File Manage tools to inspect and edit files in the active project or explicitly configured allowed_path entries. "
-    "Do not access project files outside those boundaries or claim to have run arbitrary shell commands. "
+    "Do not access project files outside those boundaries. "
     "Use built-in tools for supported system operations and report their results accurately. "
+    "Use code_execution for task-related terminal commands; it runs in the active project with a time and output limit. "
     "Keep newly created project files inside the active project unless the user explicitly configured another allowed_path."
 )
-
-WORKSPACE_TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "list_files",
-            "description": "File Manage: List files and folders in the active project or an explicitly allowed path.",
-            "parameters": {
-                "type": "object",
-                "properties": {"path": {"type": "string", "description": "Project-relative folder path; defaults to ."}},
-                "additionalProperties": False,
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "read_file",
-            "description": "File Manage: Read a UTF-8 text file in the active project or an explicitly allowed path.",
-            "parameters": {
-                "type": "object",
-                "properties": {"path": {"type": "string", "description": "Project-relative file path"}},
-                "required": ["path"],
-                "additionalProperties": False,
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "write_file",
-            "description": "File Manage: Create or replace a UTF-8 text file in the active project or an explicitly allowed path.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Project-relative file path"},
-                    "content": {"type": "string", "description": "Complete file contents"},
-                },
-                "required": ["path", "content"],
-                "additionalProperties": False,
-            },
-        },
-    },
-]
-
-
-def _function_tool(
-    name: str,
-    category: str,
-    description: str,
-    properties: dict[str, object],
-    required: tuple[str, ...] = (),
-) -> dict[str, object]:
-    parameters: dict[str, object] = {
-        "type": "object",
-        "properties": properties,
-        "additionalProperties": False,
-    }
-    if required:
-        parameters["required"] = list(required)
-    return {
-        "type": "function",
-        "function": {
-            "name": name,
-            "description": f"{category}: {description}",
-            "parameters": parameters,
-        },
-    }
-
-
-def _path_property(description: str) -> dict[str, str]:
-    return {"type": "string", "description": description}
-
-
-FILE_MANAGE_TOOL_NAMES = {
-    "list_files", "read_file", "write_file", "file_create", "file_edit", "file_read",
-    "file_delete", "file_rename", "file_copy", "file_move", "folder_create",
-    "folder_rename", "tree_view", "folder_copy", "folder_move", "zip", "extract",
-}
-
-FILE_MANAGE_TOOLS = [
-    _function_tool("file_create", "File Manage", "Create a new UTF-8 text file; fail if it already exists.", {
-        "path": _path_property("Project-relative path or an explicitly allowed absolute path"),
-        "content": {"type": "string", "description": "Complete UTF-8 file contents"},
-    }, ("path", "content")),
-    _function_tool("file_edit", "File Manage", "Replace the contents of an existing UTF-8 text file.", {
-        "path": _path_property("Project-relative path or an explicitly allowed absolute path"),
-        "new_content": {"type": "string", "description": "Complete replacement contents"},
-    }, ("path", "new_content")),
-    _function_tool("file_read", "File Manage", "Read a UTF-8 text file.", {
-        "path": _path_property("File path inside the active project or an allowed path"),
-    }, ("path",)),
-    _function_tool("file_delete", "File Manage", "Delete a regular file, never a directory.", {
-        "path": _path_property("File path inside the active project or an allowed path"),
-    }, ("path",)),
-    _function_tool("file_rename", "File Manage", "Rename a file within its current folder.", {
-        "path": _path_property("Existing file path"),
-        "new_name": _path_property("New file name only; must not include a directory"),
-    }, ("path", "new_name")),
-    _function_tool("file_copy", "File Manage", "Copy a regular file to a new path.", {
-        "source_path": _path_property("Existing source file path"),
-        "destination_path": _path_property("New destination file path"),
-    }, ("source_path", "destination_path")),
-    _function_tool("file_move", "File Manage", "Move a regular file to a new path.", {
-        "source_path": _path_property("Existing source file path"),
-        "destination_path": _path_property("New destination file path"),
-    }, ("source_path", "destination_path")),
-    _function_tool("folder_create", "File Manage", "Create a folder and any missing parents.", {
-        "path": _path_property("New folder path"),
-    }, ("path",)),
-    _function_tool("folder_rename", "File Manage", "Rename a folder within its current parent.", {
-        "path": _path_property("Existing folder path"),
-        "new_name": _path_property("New folder name only; must not include a directory"),
-    }, ("path", "new_name")),
-    _function_tool("tree_view", "File Manage", "Show a bounded directory tree up to five levels deep.", {
-        "path": _path_property("Folder path; defaults to the active project root"),
-    }),
-    _function_tool("folder_copy", "File Manage", "Copy a folder tree without overwriting an existing destination.", {
-        "source_path": _path_property("Existing source folder path"),
-        "destination_path": _path_property("New destination folder path"),
-    }, ("source_path", "destination_path")),
-    _function_tool("folder_move", "File Manage", "Move a folder tree to a new path.", {
-        "source_path": _path_property("Existing source folder path"),
-        "destination_path": _path_property("New destination folder path"),
-    }, ("source_path", "destination_path")),
-    _function_tool("zip", "File Manage", "Create a bounded ZIP archive from a file or folder.", {
-        "path": _path_property("File or folder to archive"),
-        "archive_path": _path_property("Optional destination archive path"),
-    }, ("path",)),
-    _function_tool("extract", "File Manage", "Safely extract a ZIP archive without path traversal or overwrite.", {
-        "path": _path_property("ZIP archive path"),
-        "destination_path": _path_property("Optional new destination folder; defaults beside the archive"),
-    }, ("path",)),
-]
-
-WORKSPACE_TOOLS.extend(FILE_MANAGE_TOOLS)
-
-PLANNING_TOOL = _function_tool("planning", "Planning", "Create or update TODO.md in the active project, or mark a numbered step complete.", {
-    "action": {"type": "string", "enum": ["create", "update", "complete"]},
-    "goal": {"type": "string", "description": "Short task goal for create/update"},
-    "steps": {"type": "array", "items": {"type": "string"}, "maxItems": 40, "description": "Ordered actionable steps for create/update"},
-    "step": {"type": "integer", "minimum": 1, "description": "One-based step number to mark complete"},
-}, ("action",))
-
-ASK_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "ask",
-        "description": "Ask the user 1–6 clarifying questions during planning/build or to resolve a blocker. Each question can have up to three suggested answers.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "questions": {
-                    "type": "array",
-                    "minItems": 1,
-                    "maxItems": 6,
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "question": {"type": "string", "description": "One concise question"},
-                            "options": {"type": "array", "items": {"type": "string"}, "maxItems": 3},
-                        },
-                        "required": ["question"],
-                        "additionalProperties": False,
-                    },
-                },
-            },
-            "required": ["questions"],
-            "additionalProperties": False,
-        },
-    },
-}
-
-BUILTIN_TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "get_version",
-            "description": "Get the installed Sophon CLI version.",
-            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "is_update",
-            "description": "Check whether a newer Sophon CLI version is available.",
-            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "update",
-            "description": "Update Sophon CLI to the latest version. Sophon will restart after the current agent response.",
-            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "system_health",
-            "description": "Run Sophon doctor and return the system health report.",
-            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "workspace_list",
-            "description": "List project folders in the Sophon workspace.",
-            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "session_list",
-            "description": "List saved Sophon Agent sessions with IDs, titles and message counts.",
-            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "session_rename",
-            "description": "Rename a saved session by its ID.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "session_id": {"type": "string", "description": "ID (or unique ID prefix) of the saved session"},
-                    "title": {"type": "string", "description": "New session title"},
-                },
-                "required": ["session_id", "title"],
-                "additionalProperties": False,
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_time",
-            "description": "Get the current local time and time zone.",
-            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_date",
-            "description": "Get the current local date.",
-            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
-        },
-    },
-]
 
 
 def _ensure_workspace() -> Path:
@@ -519,8 +278,8 @@ def _system_message(
     system_prompt = SYSTEM_PROMPT
     mode_instruction = {
         "chat": "Mode: Chat. Focus on general conversation and advice. Do not change project files unless the user clearly asks for implementation.",
-        "plan": "Mode: Plan. Inspect read-only and use the planning tool only to maintain the active project's TODO.md; do not modify other files. Ask clarifying questions with ask when needed, then present a concise plan. The user can approve implementation with /mode build.",
-        "build": "Mode: Build. Implement the user's requested changes directly, use available workspace tools, and verify the result. For multi-step work, create or update TODO.md with planning first and mark each numbered step complete only after it is verified.",
+        "plan": "Mode: Plan. Inspect read-only. code_execution is limited to pwd, ls, rg, and read-only git inspection; use the planning tool only to maintain the active project's TODO.md. Do not modify other files. Ask clarifying questions with ask when needed, then present a concise plan. The user can approve implementation with /mode build.",
+        "build": "Mode: Build. Implement the user's requested changes directly. Use File Manage for scoped edits and code_execution for relevant terminal commands in the active project. For multi-step work, create or update TODO.md and mark steps complete only after verification.",
     }.get(mode, "")
     if mode_instruction:
         system_prompt += "\n\n" + mode_instruction
@@ -539,20 +298,7 @@ def _system_message(
 
 
 def _tools_for_mode(mode: str, config: dict[str, object] | None = None) -> list[dict[str, object]]:
-    all_tools = [*BUILTIN_TOOLS, *WORKSPACE_TOOLS]
-    if mode in {"plan", "build"}:
-        all_tools.extend([ASK_TOOL, PLANNING_TOOL])
-    if mode == "plan":
-        allowed = PLAN_BUILTIN_TOOLS | PLAN_FILE_TOOLS | {"ask", "planning"}
-        tools = [tool for tool in all_tools if tool["function"]["name"] in allowed]
-    else:
-        tools = all_tools
-    mode_config = (config or {}).get("mode")
-    configured = mode_config.get(mode) if isinstance(mode_config, dict) else None
-    if isinstance(configured, list) and configured:
-        requested = {item for item in configured if isinstance(item, str)}
-        tools = [tool for tool in tools if tool["function"]["name"] in requested]
-    return tools
+    return tools_for_mode(mode, config)
 
 
 def _event_data(response) -> Iterator[str]:
@@ -1212,7 +958,9 @@ def _history_safe_arguments(value: object) -> dict[str, object]:
     for key, item in arguments.items():
         name = str(key)
         normalized = re.sub(r"[^a-z0-9]", "", name.casefold())
-        if any(marker in normalized for marker in ("apikey", "token", "secret", "password", "credential", "authorization", "privatekey")):
+        if name.casefold() == "command" and isinstance(item, str):
+            safe[name] = f"[command omitted · {len(item)} characters]"
+        elif any(marker in normalized for marker in ("apikey", "token", "secret", "password", "credential", "authorization", "privatekey")):
             safe[name] = "[redacted]"
         elif normalized in {"content", "newcontent", "prompt", "text", "goal"} and isinstance(item, str):
             lines = len(item.splitlines())
@@ -1308,6 +1056,9 @@ def _tool_result_summary(name: str, result: str) -> str:
         return "Collected answers to the user's clarification questions." if "User responses" in result else "The user cancelled the clarification card."
     if name == "planning":
         return "Updated the active project's TODO.md plan."
+    if name == "code_execution":
+        first_line = result.splitlines()[0] if result else ""
+        return f"Terminal command · {first_line}"[:400]
     if name in {"read_file", "file_read"}:
         encoded = result.encode("utf-8")
         return f"Read file · {len(encoded)} bytes · {len(result.splitlines())} lines."
@@ -1605,7 +1356,7 @@ def _complete_turn(
             status = "ok"
             try:
                 if name not in allowed_tool_names:
-                    if mode == "plan" and name in {tool["function"]["name"] for tool in [*BUILTIN_TOOLS, *WORKSPACE_TOOLS]}:
+                    if mode == "plan" and name in {tool["function"]["name"] for tool in [*BUILTIN_TOOLS, *WORKSPACE_TOOLS, *EXECUTION_TOOLS]}:
                         raise RuntimeError("This tool is disabled in plan mode; switch to /mode build after approval.")
                     raise RuntimeError(f"The {name or 'requested'} tool is not enabled for {mode} mode.")
                 if name == "ask":
@@ -1633,15 +1384,26 @@ def _complete_turn(
                     else:
                         if on_planning is not None:
                             on_planning("TODO.md updated")
-                elif name in {tool["function"]["name"] for tool in BUILTIN_TOOLS}:
-                    result = _execute_builtin_tool(name, raw_arguments)
                 else:
-                    result = _execute_workspace_tool(
+                    result = dispatch_tool(
                         name,
                         raw_arguments,
-                        change_log=change_log,
-                        config=config,
+                        workspace=PROJECT_DIR,
+                        cancellation=cancellation,
+                        mode=mode,
+                        builtin_executor=lambda: _execute_builtin_tool(name, raw_arguments),
+                        workspace_executor=lambda: _execute_workspace_tool(
+                            name,
+                            raw_arguments,
+                            change_log=change_log,
+                            config=config,
+                        ),
                     )
+                if name == "code_execution":
+                    result_status = result.partition("\n")[0]
+                    nonzero_exit = result_status.startswith("Exit code: ") and result_status != "Exit code: 0"
+                    if result.startswith("Command timed out") or nonzero_exit:
+                        status = "error"
             except AgentInterrupted:
                 raise
             except (RuntimeError, OSError, ValueError, KeyError, TypeError) as error:
@@ -1993,7 +1755,7 @@ def _card_rows(
     lines = [display_home_paths(line) for line in lines]
     top_left = display_home_paths(top_left) if top_left is not None else None
     top_right = display_home_paths(top_right) if top_right is not None else None
-    inner = min(width, max(3, columns - 8)) if width is not None else min(68, max(20, columns - 8))
+    inner = min(width, intelligent_ui.card_width(columns)) if width is not None else intelligent_ui.card_width(columns)
     top = "  ╭" + "─" * (inner + 2) + "╮"
     bottom = "  ╰" + "─" * (inner + 2) + "╯"
     rows = [paint(top, border_color)]
@@ -2280,9 +2042,10 @@ def _draw_screen(
     display_message_start: int = 0,
     interrupt_warning: bool = False,
 ) -> tuple[int, int]:
-    size = shutil.get_terminal_size((80, 24))
-    columns, height = size.columns, max(8, size.lines)
-    width = min(68, max(20, columns - 8))
+    layout = intelligent_ui.terminal_layout()
+    animation_frame = intelligent_ui.animation_frame(animation_frame)
+    columns, height = layout.columns, max(8, layout.rows)
+    width = intelligent_ui.card_width(columns)
     header = [] if session["messages"] else _card_rows(
         "Sophon Agent",
         ["Ask about code, debugging, and development."],
@@ -2298,7 +2061,7 @@ def _draw_screen(
     )
     visible_messages = session["messages"][max(0, display_message_start):]
     editor_lines, cursor_row, cursor_col = _editor_layout(text, cursor, width, placeholder, suggestion)
-    max_editor_lines = max(1, min(5, height - len(header) - len(footer) - 3))
+    max_editor_lines = max(1, min(4 if layout.compact else 5, height - len(header) - len(footer) - 3))
     visible_start = max(0, min(cursor_row, len(editor_lines) - max_editor_lines))
     visible_lines = editor_lines[visible_start : visible_start + max_editor_lines]
     box = _input_box_rows(visible_lines, width, placeholder=not text, text_length=len(text))
@@ -2325,7 +2088,7 @@ def _draw_screen(
             feed.extend(_answering_rows(animation_frame, "Answering"))
             feed.extend(_agent_rows(streaming_text, columns))
     warning_rows = _interrupt_warning_rows(columns) if interrupt_warning else []
-    room = max(0, height - len(header) - len(box) - len(footer) - len(warning_rows))
+    room = intelligent_ui.available_rows(height, len(header), len(box), len(footer), len(warning_rows))
     visible_feed = feed[-room:] if room else []
     if panel_rows is not None and room >= 2 and len(panel_rows) > room:
         visible_feed = [panel_rows[0], *panel_rows[1 : room - 1], panel_rows[-1]]
@@ -2729,7 +2492,7 @@ def _estimated_context_tokens(messages: list[dict[str, object]]) -> int:
         for message in messages
         if message.get("role") in {"user", "assistant"}
     ]
-    tool_schema = json.dumps([*BUILTIN_TOOLS, *WORKSPACE_TOOLS], ensure_ascii=False)
+    tool_schema = json.dumps([*BUILTIN_TOOLS, *WORKSPACE_TOOLS, *EXECUTION_TOOLS], ensure_ascii=False)
     return (
         sum(max(1, math.ceil(len(text) / 3)) + 4 for text in content)
         + math.ceil(len(_system_message()) / 3)
@@ -2792,6 +2555,8 @@ def _footer_rows(
 
 
 def _answering_rows(frame: int, label: str = "Answering") -> list[str]:
+    if not intelligent_ui.motion_enabled():
+        return [paint(f"  • {label}", MUTED)]
     center = (frame // 2) % (len(label) + 6) - 3
     shimmer = ""
     for index, character in enumerate(label):

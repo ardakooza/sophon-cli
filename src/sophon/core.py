@@ -20,6 +20,7 @@ from pathlib import Path
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
+from sophon import intelligent_ui
 from sophon.config import (
     PROVIDERS,
     config_display_path,
@@ -48,7 +49,7 @@ CONFIG_BACKUP_PATH = Path.home() / ".sophon" / "backup" / "config_backup.json"
 
 
 def paint(text: str, color: str) -> str:
-    return f"{color}{text}{RESET}" if sys.stdout.isatty() else text
+    return f"{color}{text}{RESET}" if intelligent_ui.color_enabled() else text
 
 
 def display_home_paths(value: str | Path) -> str:
@@ -189,8 +190,8 @@ def card(
 ) -> None:
     title = display_home_paths(title) if title is not None else None
     lines = [display_home_paths(line) for line in lines]
-    terminal_width = shutil.get_terminal_size((80, 24)).columns
-    inner = min(width or 68, max(20, terminal_width - 8))
+    terminal_width = intelligent_ui.terminal_layout().columns
+    inner = min(width, intelligent_ui.card_width(terminal_width)) if width is not None else intelligent_ui.card_width(terminal_width)
     centered_lines = centered_lines or set()
     top_border = "  ╭" + "─" * (inner + 2) + "╮"
     print(paint(top_border, border_color))
@@ -391,7 +392,7 @@ def update_card(lines: list[str], *, initial: bool = False, final: bool = False)
     if initial:
         card(None, lines)
         return
-    inner = min(68, max(20, shutil.get_terminal_size((80, 24)).columns - 8))
+    inner = intelligent_ui.card_width(intelligent_ui.terminal_layout().columns)
     for index, line in enumerate(lines):
         # Update status rows in place; the fixed progress copy fits narrow cards.
         text = wrap_text(line, inner)[0]

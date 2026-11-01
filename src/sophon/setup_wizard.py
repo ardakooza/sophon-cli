@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import codecs
+import json
 import os
 import select
 import sys
@@ -11,6 +12,7 @@ from sophon.config import (
     PROVIDERS,
     agent_instructions_path,
     config_display_path,
+    config_path,
     detect_environment,
     ensure_agent_instructions_file,
     read_config,
@@ -223,11 +225,18 @@ def run_setup_wizard(*, reconfigure: bool = False) -> int:
         return 1
     try:
         existing = read_config()
+        if existing is None:
+            try:
+                raw_preferences = json.loads(config_path().read_text(encoding="utf-8"))
+            except (OSError, ValueError, json.JSONDecodeError):
+                raw_preferences = None
+            if isinstance(raw_preferences, dict) and raw_preferences.get("provider") is None:
+                existing = raw_preferences
     except (OSError, ValueError) as error:
         card("Sophon", ["Existing configuration could not be read.", str(error)])
         return 1
 
-    if existing is not None and not reconfigure:
+    if existing is not None and existing.get("provider") is not None and not reconfigure:
         action = _choose_existing_action(existing)
         if action == "keep":
             card(
@@ -244,7 +253,7 @@ def run_setup_wizard(*, reconfigure: bool = False) -> int:
             return 1
 
     provider = _choose_provider(
-        str(existing.get("provider")) if reconfigure and existing else None,
+        str(existing.get("provider")) if reconfigure and existing and existing.get("provider") else None,
         title="Reconfiguration" if reconfigure else "Setup of Provider",
     )
     if provider is None:
@@ -296,6 +305,8 @@ def run_setup_wizard(*, reconfigure: bool = False) -> int:
         "auto_update": auto_update_enabled(),
         "auto_compression": auto_compression,
         "auto_compression_threshold": auto_compression_threshold,
+        "allowed_path": (existing or {}).get("allowed_path", []),
+        "mode": (existing or {}).get("mode", {"plan": [], "build": [], "chat": []}),
     }
     if provider == "openrouter":
         data["endpoint"] = spec["endpoint"]

@@ -635,7 +635,7 @@ def _validate_backup_payload(data: dict[str, object]) -> None:
     if provider is None:
         allowed = {
             "schema_version", "auto_update", "agent_instructions_path", "reasoning",
-            "auto_compression", "auto_compression_threshold", "Environment",
+            "auto_compression", "auto_compression_threshold", "Environment", "allowed_path", "mode",
         }
         if set(data) - allowed:
             raise ValueError("Backup contains unsupported preferences-only fields.")
@@ -955,6 +955,33 @@ def doctor() -> int:
     else:
         detail = f"Session history · {len(sessions)} saved" if sessions else "Session history · none yet"
         record("PASS", detail)
+    model_list_check = None
+    try:
+        from sophon.agent import FILE_MANAGE_TOOL_NAMES, _list_models, _tools_for_mode
+
+        model_list_check = _list_models
+        build_tools = _tools_for_mode("build", {})
+        tool_names = [tool["function"]["name"] for tool in build_tools]
+        required_tools = {"ask", "planning", "file_create", "file_edit", "file_read", "file_delete", "tree_view", "zip", "extract"}
+        if len(tool_names) != len(set(tool_names)) or not required_tools.issubset(set(tool_names)):
+            record("FAIL", "Agent tool registry is incomplete or has duplicate names")
+        else:
+            record("PASS", f"Agent tool registry · {len(tool_names)} tools · {len(FILE_MANAGE_TOOL_NAMES)} File Manage tools")
+    except (ImportError, KeyError, TypeError, ValueError) as error:
+        record("FAIL", f"Agent tool registry could not load · {error}")
+    if data is not None and model_list_check is not None:
+        try:
+            models = model_list_check(data, str(data.get("model", "")), timeout=6)
+            if any(model.get("id") == data.get("model") for model in models if isinstance(model, dict)):
+                record("PASS", "Agent provider endpoint and model catalog")
+            else:
+                record("WARN", "Agent model is not listed by the provider catalog · verify the model ID")
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
+            message = str(error)
+            api_key = data.get("api_key")
+            if isinstance(api_key, str) and api_key:
+                message = message.replace(api_key, "[redacted]")
+            record("WARN", f"Agent provider check failed · {message[:180]}")
     check_writable("Session", session_file.parent)
     check_writable("Workspace", workspace_root)
     instructions_path = Path((data or {}).get("agent_instructions_path") or agent_instructions_path())

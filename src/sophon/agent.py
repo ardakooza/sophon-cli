@@ -1,10 +1,11 @@
-"""Chat-only AI agent backed by the configured Sophon provider."""
+"""Interactive development agent backed by the configured Sophon provider."""
 
 from __future__ import annotations
 
 import codecs
 import datetime as dt
 import difflib
+import hashlib
 import json
 import math
 import os
@@ -18,7 +19,8 @@ import tempfile
 import threading
 import time
 import uuid
-from pathlib import Path
+import zipfile
+from pathlib import Path, PurePosixPath
 from typing import Callable, Iterator
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -58,6 +60,7 @@ ANIMATION_TICK = 0.075
 EXIT_TO_TUI = 42
 AGENT_MODES = {"chat", "plan", "build"}
 PLAN_BUILTIN_TOOLS = {"get_version", "is_update", "system_health", "workspace_list", "session_list", "get_time", "get_date"}
+PLAN_FILE_TOOLS = {"list_files", "read_file", "file_read", "tree_view"}
 SLASH_COMMANDS = (
     "/auto-compression", "/auto-update", "/cd", "/changelog", "/clear", "/compact", "/cwd", "/delete",
     "/exit", "/fork", "/help", "/history", "/mode", "/model", "/new", "/reasoning",
@@ -178,12 +181,21 @@ class RequestCancellation:
             except OSError:
                 pass
 
+
+class QuestionHandoff:
+    """Synchronize a worker-thread ask tool with the interactive TUI thread."""
+
+    def __init__(self) -> None:
+        self.ready = threading.Event()
+        self.response = ""
+
+
 SYSTEM_PROMPT = (
     "You are Sophon, a concise and practical development assistant. "
-    "Use the provided file tools to inspect and edit project files in the active workspace. "
-    "Do not access project files outside that workspace or claim to have run arbitrary shell commands. "
+    "Use the File Manage tools to inspect and edit files in the active project or explicitly configured allowed_path entries. "
+    "Do not access project files outside those boundaries or claim to have run arbitrary shell commands. "
     "Use built-in tools for supported system operations and report their results accurately. "
-    "Keep all project files inside the active project folder."
+    "Keep newly created project files inside the active project unless the user explicitly configured another allowed_path."
 )
 
 WORKSPACE_TOOLS = [
@@ -191,7 +203,7 @@ WORKSPACE_TOOLS = [
         "type": "function",
         "function": {
             "name": "list_files",
-            "description": "List files and folders in the active project workspace.",
+            "description": "File Manage: List files and folders in the active project or an explicitly allowed path.",
             "parameters": {
                 "type": "object",
                 "properties": {"path": {"type": "string", "description": "Project-relative folder path; defaults to ."}},
@@ -203,7 +215,7 @@ WORKSPACE_TOOLS = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read a UTF-8 text file inside the active project workspace.",
+            "description": "File Manage: Read a UTF-8 text file in the active project or an explicitly allowed path.",
             "parameters": {
                 "type": "object",
                 "properties": {"path": {"type": "string", "description": "Project-relative file path"}},
@@ -216,7 +228,7 @@ WORKSPACE_TOOLS = [
         "type": "function",
         "function": {
             "name": "write_file",
-            "description": "Create or replace a UTF-8 text file inside the active project workspace.",
+            "description": "File Manage: Create or replace a UTF-8 text file in the active project or an explicitly allowed path.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -229,6 +241,134 @@ WORKSPACE_TOOLS = [
         },
     },
 ]
+
+
+def _function_tool(
+    name: str,
+    category: str,
+    description: str,
+    properties: dict[str, object],
+    required: tuple[str, ...] = (),
+) -> dict[str, object]:
+    parameters: dict[str, object] = {
+        "type": "object",
+        "properties": properties,
+        "additionalProperties": False,
+    }
+    if required:
+        parameters["required"] = list(required)
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": f"{category}: {description}",
+            "parameters": parameters,
+        },
+    }
+
+
+def _path_property(description: str) -> dict[str, str]:
+    return {"type": "string", "description": description}
+
+
+FILE_MANAGE_TOOL_NAMES = {
+    "list_files", "read_file", "write_file", "file_create", "file_edit", "file_read",
+    "file_delete", "file_rename", "file_copy", "file_move", "folder_create",
+    "folder_rename", "tree_view", "folder_copy", "folder_move", "zip", "extract",
+}
+
+FILE_MANAGE_TOOLS = [
+    _function_tool("file_create", "File Manage", "Create a new UTF-8 text file; fail if it already exists.", {
+        "path": _path_property("Project-relative path or an explicitly allowed absolute path"),
+        "content": {"type": "string", "description": "Complete UTF-8 file contents"},
+    }, ("path", "content")),
+    _function_tool("file_edit", "File Manage", "Replace the contents of an existing UTF-8 text file.", {
+        "path": _path_property("Project-relative path or an explicitly allowed absolute path"),
+        "new_content": {"type": "string", "description": "Complete replacement contents"},
+    }, ("path", "new_content")),
+    _function_tool("file_read", "File Manage", "Read a UTF-8 text file.", {
+        "path": _path_property("File path inside the active project or an allowed path"),
+    }, ("path",)),
+    _function_tool("file_delete", "File Manage", "Delete a regular file, never a directory.", {
+        "path": _path_property("File path inside the active project or an allowed path"),
+    }, ("path",)),
+    _function_tool("file_rename", "File Manage", "Rename a file within its current folder.", {
+        "path": _path_property("Existing file path"),
+        "new_name": _path_property("New file name only; must not include a directory"),
+    }, ("path", "new_name")),
+    _function_tool("file_copy", "File Manage", "Copy a regular file to a new path.", {
+        "source_path": _path_property("Existing source file path"),
+        "destination_path": _path_property("New destination file path"),
+    }, ("source_path", "destination_path")),
+    _function_tool("file_move", "File Manage", "Move a regular file to a new path.", {
+        "source_path": _path_property("Existing source file path"),
+        "destination_path": _path_property("New destination file path"),
+    }, ("source_path", "destination_path")),
+    _function_tool("folder_create", "File Manage", "Create a folder and any missing parents.", {
+        "path": _path_property("New folder path"),
+    }, ("path",)),
+    _function_tool("folder_rename", "File Manage", "Rename a folder within its current parent.", {
+        "path": _path_property("Existing folder path"),
+        "new_name": _path_property("New folder name only; must not include a directory"),
+    }, ("path", "new_name")),
+    _function_tool("tree_view", "File Manage", "Show a bounded directory tree up to five levels deep.", {
+        "path": _path_property("Folder path; defaults to the active project root"),
+    }),
+    _function_tool("folder_copy", "File Manage", "Copy a folder tree without overwriting an existing destination.", {
+        "source_path": _path_property("Existing source folder path"),
+        "destination_path": _path_property("New destination folder path"),
+    }, ("source_path", "destination_path")),
+    _function_tool("folder_move", "File Manage", "Move a folder tree to a new path.", {
+        "source_path": _path_property("Existing source folder path"),
+        "destination_path": _path_property("New destination folder path"),
+    }, ("source_path", "destination_path")),
+    _function_tool("zip", "File Manage", "Create a bounded ZIP archive from a file or folder.", {
+        "path": _path_property("File or folder to archive"),
+        "archive_path": _path_property("Optional destination archive path"),
+    }, ("path",)),
+    _function_tool("extract", "File Manage", "Safely extract a ZIP archive without path traversal or overwrite.", {
+        "path": _path_property("ZIP archive path"),
+        "destination_path": _path_property("Optional new destination folder; defaults beside the archive"),
+    }, ("path",)),
+]
+
+WORKSPACE_TOOLS.extend(FILE_MANAGE_TOOLS)
+
+PLANNING_TOOL = _function_tool("planning", "Planning", "Create or update TODO.md in the active project, or mark a numbered step complete.", {
+    "action": {"type": "string", "enum": ["create", "update", "complete"]},
+    "goal": {"type": "string", "description": "Short task goal for create/update"},
+    "steps": {"type": "array", "items": {"type": "string"}, "maxItems": 40, "description": "Ordered actionable steps for create/update"},
+    "step": {"type": "integer", "minimum": 1, "description": "One-based step number to mark complete"},
+}, ("action",))
+
+ASK_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "ask",
+        "description": "Ask the user 1–6 clarifying questions during planning/build or to resolve a blocker. Each question can have up to three suggested answers.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "questions": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 6,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "question": {"type": "string", "description": "One concise question"},
+                            "options": {"type": "array", "items": {"type": "string"}, "maxItems": 3},
+                        },
+                        "required": ["question"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["questions"],
+            "additionalProperties": False,
+        },
+    },
+}
 
 BUILTIN_TOOLS = [
     {
@@ -379,8 +519,8 @@ def _system_message(
     system_prompt = SYSTEM_PROMPT
     mode_instruction = {
         "chat": "Mode: Chat. Focus on general conversation and advice. Do not change project files unless the user clearly asks for implementation.",
-        "plan": "Mode: Plan. Inspect and reason read-only, then present a concise implementation plan and ask for approval. Do not modify files or run mutating tools. The user can approve implementation with /mode build.",
-        "build": "Mode: Build. Implement the user's requested changes directly, use available workspace tools, and verify the result.",
+        "plan": "Mode: Plan. Inspect read-only and use the planning tool only to maintain the active project's TODO.md; do not modify other files. Ask clarifying questions with ask when needed, then present a concise plan. The user can approve implementation with /mode build.",
+        "build": "Mode: Build. Implement the user's requested changes directly, use available workspace tools, and verify the result. For multi-step work, create or update TODO.md with planning first and mark each numbered step complete only after it is verified.",
     }.get(mode, "")
     if mode_instruction:
         system_prompt += "\n\n" + mode_instruction
@@ -390,23 +530,29 @@ def _system_message(
         f"{system_prompt}\n\n"
         f"Agent instructions (AGENT.md):\n{instructions}\n\n"
         f"Active project directory: {display_home_paths(PROJECT_DIR)}\n"
+        "Additional allowed paths: "
+        + (", ".join(display_home_paths(path) for path in _allowed_roots(config)[1:]) or "none")
+        + "\n"
         "Display workspace paths as plain text using `~` for the home directory; never wrap a directory path in a fenced code block.\n"
         f"Workspace guidance (WORKSPACE.md):\n{workspace_guidance}"
     )
 
 
-def _tools_for_mode(mode: str) -> list[dict[str, object]]:
-    if mode != "plan":
-        return [*BUILTIN_TOOLS, *WORKSPACE_TOOLS]
-    builtins = [
-        tool for tool in BUILTIN_TOOLS
-        if tool["function"]["name"] in PLAN_BUILTIN_TOOLS
-    ]
-    workspace = [
-        tool for tool in WORKSPACE_TOOLS
-        if tool["function"]["name"] in {"list_files", "read_file"}
-    ]
-    return [*builtins, *workspace]
+def _tools_for_mode(mode: str, config: dict[str, object] | None = None) -> list[dict[str, object]]:
+    all_tools = [*BUILTIN_TOOLS, *WORKSPACE_TOOLS]
+    if mode in {"plan", "build"}:
+        all_tools.extend([ASK_TOOL, PLANNING_TOOL])
+    if mode == "plan":
+        allowed = PLAN_BUILTIN_TOOLS | PLAN_FILE_TOOLS | {"ask", "planning"}
+        tools = [tool for tool in all_tools if tool["function"]["name"] in allowed]
+    else:
+        tools = all_tools
+    mode_config = (config or {}).get("mode")
+    configured = mode_config.get(mode) if isinstance(mode_config, dict) else None
+    if isinstance(configured, list) and configured:
+        requested = {item for item in configured if isinstance(item, str)}
+        tools = [tool for tool in tools if tool["function"]["name"] in requested]
+    return tools
 
 
 def _event_data(response) -> Iterator[str]:
@@ -482,17 +628,66 @@ def _response_reasoning(result: object, provider: str) -> str | None:
     return None
 
 
-def _workspace_file(relative_path: str, *, allow_root: bool = False) -> Path:
-    root = PROJECT_DIR.resolve()
-    requested = Path(relative_path or ".")
-    if requested.is_absolute():
-        raise RuntimeError("Workspace tool paths must be project-relative.")
-    candidate = (root / requested).resolve()
-    if candidate != root and root not in candidate.parents:
-        raise RuntimeError("Workspace tool paths must stay inside the active project.")
-    if candidate == root and not allow_root:
-        raise RuntimeError("Choose a file path inside the active project.")
+def _allowed_roots(config: dict[str, object] | None = None) -> list[Path]:
+    roots = [PROJECT_DIR.expanduser().resolve()]
+    configured = (config or {}).get("allowed_path", [])
+    if isinstance(configured, list):
+        for value in configured:
+            if not isinstance(value, str) or not value.strip():
+                continue
+            candidate = Path(value).expanduser()
+            if not candidate.is_absolute():
+                candidate = PROJECT_DIR / candidate
+            try:
+                resolved = candidate.resolve()
+            except OSError:
+                continue
+            if resolved not in roots:
+                roots.append(resolved)
+    return roots
+
+
+def _workspace_file(
+    relative_path: str | Path,
+    *,
+    allow_root: bool = False,
+    config: dict[str, object] | None = None,
+) -> Path:
+    requested = Path(relative_path or ".").expanduser()
+    lexical = requested if requested.is_absolute() else PROJECT_DIR / requested
+    if lexical.is_symlink():
+        raise RuntimeError("Symbolic links are not supported by File Manage tools.")
+    try:
+        candidate = lexical.resolve()
+    except OSError as error:
+        raise RuntimeError(f"Could not resolve the requested path: {error}") from None
+    roots = _allowed_roots(config)
+    project_root = PROJECT_DIR.expanduser().resolve()
+    authorized = False
+    for root in roots:
+        if candidate == root:
+            authorized = True
+            break
+        if root.is_dir() and root in candidate.parents:
+            authorized = True
+            break
+        if not root.exists() and root in candidate.parents:
+            authorized = True
+            break
+    if not authorized:
+        raise RuntimeError("File Manage paths must stay inside the active project or a configured allowed_path.")
+    if candidate == project_root and not allow_root:
+        raise RuntimeError("Choose a file or subfolder inside the active project.")
     return candidate
+
+
+def _workspace_reference(path: Path) -> str:
+    resolved = path.resolve()
+    project_root = PROJECT_DIR.expanduser().resolve()
+    try:
+        return resolved.relative_to(project_root).as_posix()
+    except ValueError:
+        return str(resolved)
 
 
 def _execute_workspace_tool(
@@ -500,6 +695,7 @@ def _execute_workspace_tool(
     arguments: object,
     *,
     change_log: list[dict[str, object]] | None = None,
+    config: dict[str, object] | None = None,
 ) -> str:
     if isinstance(arguments, str):
         try:
@@ -508,65 +704,410 @@ def _execute_workspace_tool(
             raise RuntimeError("The workspace tool arguments were not valid JSON.") from None
     if not isinstance(arguments, dict):
         raise RuntimeError("The workspace tool arguments must be an object.")
-    if name == "list_files":
-        folder = _workspace_file(str(arguments.get("path") or "."), allow_root=True)
-        if not folder.is_dir():
-            raise RuntimeError("The requested workspace path is not a folder.")
-        entries = sorted(folder.iterdir(), key=lambda item: (not item.is_dir(), item.name.casefold()))
-        if not entries:
-            return "This folder is empty."
-        return "\n".join(
-            (item.name + ("/" if item.is_dir() else ""))
-            for item in entries[:200]
-        )
-    if name == "read_file":
-        path = _workspace_file(str(arguments.get("path", "")))
+    def text_argument(key: str, *, optional: bool = False, default: str = "") -> str:
+        value = arguments.get(key, default)
+        if optional and value is None:
+            return default
+        if not isinstance(value, str) or (not optional and not value.strip()):
+            raise RuntimeError(f"{key} must be a non-empty string.")
+        return value.strip() if not optional else value.strip()
+
+    def record(change: dict[str, object]) -> None:
+        if change_log is not None:
+            change_log.append(change)
+
+    def creation_change_index(reference: str, *, is_folder: bool) -> int | None:
+        if change_log is None:
+            return None
+        for index in range(len(change_log) - 1, -1, -1):
+            entry = change_log[index]
+            if entry.get("path") != reference:
+                continue
+            kind = entry.get("kind")
+            if is_folder and kind == "created_folder":
+                return index
+            if not is_folder and (
+                kind in {"created_file", "created_file_digest"}
+                or (kind == "write_file" and entry.get("before_exists") is False)
+            ):
+                return index
+        return None
+
+    def remap_change_paths(source: str, destination: str, start_index: int) -> None:
+        if change_log is None:
+            return
+        source_prefix = source.rstrip("/\\")
+        for entry in change_log[start_index:]:
+            for key in ("path", "destination"):
+                value = entry.get(key)
+                if not isinstance(value, str):
+                    continue
+                if value == source:
+                    entry[key] = destination
+                elif value.startswith(source_prefix + "/") or value.startswith(source_prefix + "\\"):
+                    entry[key] = destination.rstrip("/\\") + value[len(source_prefix):]
+
+    def snapshot_file(path: Path) -> tuple[bytes, int]:
+        try:
+            data = path.read_bytes()
+            mode = stat.S_IMODE(path.stat().st_mode)
+        except OSError as error:
+            raise RuntimeError(f"Could not safely snapshot {display_home_paths(path)}: {error}") from None
+        if len(data) > 10_000_000:
+            raise RuntimeError("Files larger than 10 MB cannot be changed because undo safety cannot be guaranteed.")
+        return data, mode
+
+    def digest_path(path: Path) -> str:
+        digest = hashlib.sha256()
+        if path.is_file():
+            digest.update(path.read_bytes())
+            return digest.hexdigest()
+        for item in sorted(path.rglob("*"), key=lambda entry: entry.relative_to(path).as_posix()):
+            relative = item.relative_to(path).as_posix()
+            digest.update(relative.encode("utf-8", errors="replace"))
+            if item.is_symlink():
+                digest.update(b"symlink")
+                digest.update(os.readlink(item).encode("utf-8", errors="replace"))
+            elif item.is_file():
+                with item.open("rb") as stream:
+                    for chunk in iter(lambda: stream.read(64 * 1024), b""):
+                        digest.update(chunk)
+        return digest.hexdigest()
+
+    def bounded_tree_entries(path: Path) -> list[Path]:
+        entries = [path, *path.rglob("*")]
+        if len(entries) > 2000 or sum(
+            item.stat().st_size for item in entries if item.is_file() and not item.is_symlink()
+        ) > 100_000_000:
+            raise RuntimeError("Folder operations are limited to 2,000 entries and 100 MB.")
+        return entries
+
+    def create_parent_folders(parent_path: Path) -> None:
+        missing: list[Path] = []
+        parent = parent_path
+        while not parent.exists() and parent != parent.parent:
+            missing.append(parent)
+            parent = parent.parent
+        parent_path.mkdir(parents=True, exist_ok=True)
+        for created_parent in reversed(missing):
+            reference = _workspace_reference(created_parent)
+            if any(
+                entry.get("kind") == "created_folder" and entry.get("path") == reference
+                for entry in (change_log or [])
+            ):
+                continue
+            record({"kind": "created_folder", "path": reference, "after_digest": digest_path(created_parent)})
+
+    def read_text_file(path: Path) -> str:
         if not path.is_file():
-            raise RuntimeError("The requested workspace file does not exist.")
+            raise RuntimeError("The requested path is not a file.")
         if path.stat().st_size > 500_000:
-            raise RuntimeError("Workspace files must be smaller than 500 KB to read.")
+            raise RuntimeError("Text files must be smaller than 500 KB to read.")
         try:
             return path.read_text(encoding="utf-8")
         except (OSError, UnicodeError) as error:
-            raise RuntimeError(f"Could not read workspace file: {error}") from None
-    if name == "write_file":
-        path = _workspace_file(str(arguments.get("path", "")))
-        content = arguments.get("content")
+            raise RuntimeError(f"Could not read the requested file: {error}") from None
+
+    def write_text_file(path: Path, content: object) -> str:
         if not isinstance(content, str):
             raise RuntimeError("File content must be text.")
-        if len(content.encode("utf-8")) > 1_000_000:
-            raise RuntimeError("Workspace files must be smaller than 1 MB to write.")
+        encoded = content.encode("utf-8")
+        if len(encoded) > 1_000_000:
+            raise RuntimeError("Text files must be smaller than 1 MB to write.")
         before_exists = path.exists()
+        before = None
+        before_mode = None
+        if before_exists:
+            before, before_mode = snapshot_file(path)
+            if not path.is_file():
+                raise RuntimeError("Only regular files can be edited.")
+        create_parent_folders(path.parent)
         try:
-            before = path.read_bytes() if before_exists else None
-            if before is not None and len(before) > 10_000_000:
-                raise RuntimeError("Files larger than 10 MB cannot be overwritten because undo safety cannot be guaranteed.")
-            before_mode = stat.S_IMODE(path.stat().st_mode) if before_exists else None
+            path.write_bytes(encoded)
         except OSError as error:
-            raise RuntimeError(f"Could not snapshot the existing file before writing: {error}") from None
-        path.parent.mkdir(parents=True, exist_ok=True)
+            raise RuntimeError(f"Could not write file: {error}") from None
+        reference = _workspace_reference(path)
+        previous = next((
+            item for item in reversed(change_log or [])
+            if item.get("path") == reference and item.get("kind") in {"write_file", "created_file"}
+        ), None)
+        if previous is None:
+            record({
+                "kind": "write_file",
+                "path": reference,
+                "before_exists": before_exists,
+                "before": before,
+                "before_mode": before_mode,
+                "after": encoded,
+            })
+        else:
+            previous["after"] = encoded
+        verb = "Created" if name == "file_create" else "Wrote"
+        return f"{verb} {display_home_paths(reference)}."
+
+    if name in {"list_files", "tree_view"}:
+        folder = _workspace_file(text_argument("path", optional=True, default="."), allow_root=True, config=config)
+        if not folder.is_dir():
+            raise RuntimeError("The requested path is not a folder.")
+        if name == "list_files":
+            entries = sorted(folder.iterdir(), key=lambda item: (not item.is_dir(), item.name.casefold()))
+            return "\n".join(item.name + ("/" if item.is_dir() else "") for item in entries[:200]) or "This folder is empty."
+        rows = [folder.name + "/"]
+        limit = 500
+        def visit(directory: Path, depth: int, prefix: str) -> None:
+            if depth >= 5 or len(rows) >= limit:
+                return
+            try:
+                entries = sorted(directory.iterdir(), key=lambda item: (not item.is_dir(), item.name.casefold()))
+            except OSError:
+                return
+            for index, item in enumerate(entries):
+                if len(rows) >= limit:
+                    rows.append("… more entries omitted")
+                    return
+                last = index == len(entries) - 1
+                branch = "└── " if last else "├── "
+                is_directory = item.is_dir() and not item.is_symlink()
+                rows.append(prefix + branch + item.name + ("/" if is_directory else ""))
+                if is_directory:
+                    visit(item, depth + 1, prefix + ("    " if last else "│   "))
+        visit(folder, 0, "")
+        return "\n".join(rows)
+
+    if name in {"read_file", "file_read"}:
+        return read_text_file(_workspace_file(text_argument("path"), config=config))
+
+    if name in {"write_file", "file_create", "file_edit"}:
+        path = _workspace_file(text_argument("path"), config=config)
+        if name == "file_create" and path.exists():
+            raise RuntimeError("The file already exists; file_create never overwrites.")
+        if name == "file_edit" and not path.is_file():
+            raise RuntimeError("file_edit requires an existing regular file.")
+        content_key = "new_content" if name == "file_edit" else "content"
+        return write_text_file(path, arguments.get(content_key))
+
+    if name == "file_delete":
+        path = _workspace_file(text_argument("path"), config=config)
+        if not path.is_file():
+            raise RuntimeError("file_delete only removes an existing regular file.")
+        before, before_mode = snapshot_file(path)
+        reference = _workspace_reference(path)
+        path.unlink()
+        previous = next((
+            item for item in reversed(change_log or [])
+            if item.get("path") == reference and item.get("kind") in {"write_file", "created_file", "created_file_digest"}
+        ), None)
+        if previous is not None and (previous.get("before_exists") is not True or previous.get("kind") in {"created_file", "created_file_digest"}):
+            change_log.remove(previous)
+        else:
+            record({"kind": "delete_file", "path": reference, "before_exists": True, "before": before, "before_mode": before_mode, "after": None})
+        return f"Deleted {display_home_paths(reference)}."
+
+    if name in {"file_rename", "folder_rename"}:
+        source = _workspace_file(text_argument("path"), config=config)
+        new_name = text_argument("new_name")
+        if new_name in {".", ".."} or "/" in new_name or "\\" in new_name or ":" in new_name or "\x00" in new_name:
+            raise RuntimeError("new_name must be a single safe file or folder name.")
+        is_folder = name == "folder_rename"
+        if is_folder and (not source.is_dir() or source in _allowed_roots(config)):
+            raise RuntimeError("folder_rename requires a non-root folder.")
+        if not is_folder and not source.is_file():
+            raise RuntimeError("file_rename requires an existing regular file.")
+        destination = _workspace_file(source.parent / new_name, config=config)
+        if destination.exists():
+            raise RuntimeError("The rename destination already exists.")
+        if is_folder:
+            bounded_tree_entries(source)
+            before = None
+            before_mode = None
+        else:
+            before, before_mode = snapshot_file(source)
+        original_digest = digest_path(source)
+        source_reference = _workspace_reference(source)
+        destination_reference = _workspace_reference(destination)
+        creation_index = creation_change_index(source_reference, is_folder=is_folder)
+        created_before = creation_index is not None
         try:
-            path.write_text(content, encoding="utf-8")
+            source.rename(destination)
         except OSError as error:
-            raise RuntimeError(f"Could not write workspace file: {error}") from None
-        if change_log is not None:
-            relative_path = str(path.relative_to(PROJECT_DIR.resolve()))
-            after = content.encode("utf-8")
-            previous_change = next(
-                (change for change in change_log if change.get("path") == relative_path),
-                None,
-            )
-            if previous_change is None:
-                change_log.append({
-                    "path": relative_path,
-                    "before_exists": before_exists,
-                    "before": before,
-                    "before_mode": before_mode,
-                    "after": after,
-                })
+            raise RuntimeError(f"Could not rename path: {error}") from None
+        if created_before:
+            remap_change_paths(source_reference, destination_reference, creation_index)
+        else:
+            record({"kind": "move_folder" if is_folder else "move_file", "path": source_reference, "destination": destination_reference, "before_exists": True, "before": before, "before_mode": before_mode, "after_digest": original_digest})
+        return f"Renamed {display_home_paths(source_reference)} to {display_home_paths(destination_reference)}."
+
+    if name in {"file_copy", "file_move", "folder_copy", "folder_move"}:
+        source = _workspace_file(text_argument("source_path"), config=config)
+        destination = _workspace_file(text_argument("destination_path"), config=config)
+        is_folder = name.startswith("folder_")
+        is_move = name.endswith("move")
+        if is_folder and is_move and source in _allowed_roots(config):
+            raise RuntimeError("An authorized workspace root cannot be moved.")
+        if is_folder != source.is_dir() or (not is_folder and not source.is_file()):
+            raise RuntimeError("The source path type does not match the requested file/folder operation.")
+        if destination.exists():
+            raise RuntimeError("The destination already exists; File Manage tools never overwrite destinations.")
+        if is_folder and (source == destination or source in destination.parents):
+            raise RuntimeError("A folder cannot be copied or moved into itself.")
+        if is_folder:
+            bounded_tree_entries(source)
+        if not destination.parent.is_dir():
+            raise RuntimeError("The destination's parent folder must already exist.")
+        before = None
+        before_mode = None
+        if not is_folder:
+            before, before_mode = snapshot_file(source)
+        original_digest = digest_path(source)
+        source_reference = _workspace_reference(source)
+        destination_reference = _workspace_reference(destination)
+        creation_index = creation_change_index(source_reference, is_folder=is_folder)
+        created_before = creation_index is not None
+        try:
+            if is_folder:
+                if is_move:
+                    shutil.move(str(source), str(destination))
+                else:
+                    shutil.copytree(source, destination, symlinks=True)
+            elif is_move:
+                shutil.move(str(source), str(destination))
             else:
-                previous_change["after"] = after
-        return f"Wrote {path.relative_to(PROJECT_DIR.resolve())}."
+                shutil.copy2(source, destination)
+        except (OSError, shutil.Error) as error:
+            raise RuntimeError(f"File operation failed: {error}") from None
+        if is_move:
+            if created_before:
+                remap_change_paths(source_reference, destination_reference, creation_index)
+            else:
+                record({"kind": "move_folder" if is_folder else "move_file", "path": source_reference, "destination": destination_reference, "before_exists": True, "before": before, "before_mode": before_mode, "after_digest": original_digest})
+        elif is_folder:
+            record({"kind": "created_folder", "path": destination_reference, "after_digest": digest_path(destination)})
+        else:
+            copied, copied_mode = snapshot_file(destination)
+            record({"kind": "created_file", "path": destination_reference, "before_exists": False, "before": None, "after": copied, "before_mode": copied_mode})
+        verb = "Moved" if is_move else "Copied"
+        return f"{verb} {display_home_paths(source_reference)} to {display_home_paths(destination_reference)}."
+
+    if name == "folder_create":
+        path = _workspace_file(text_argument("path"), config=config)
+        if path.exists():
+            raise RuntimeError("The folder already exists.")
+        create_parent_folders(path.parent)
+        path.mkdir(exist_ok=False)
+        record({"kind": "created_folder", "path": _workspace_reference(path), "after_digest": digest_path(path)})
+        return f"Created folder {display_home_paths(_workspace_reference(path))}."
+
+    if name == "zip":
+        source = _workspace_file(text_argument("path"), allow_root=True, config=config)
+        if not source.exists() or not (source.is_file() or source.is_dir()):
+            raise RuntimeError("zip requires an existing regular file or folder.")
+        default_archive = source / f"{source.name or 'archive'}.zip" if source.is_dir() else source.with_suffix(source.suffix + ".zip")
+        archive = _workspace_file(text_argument("archive_path", optional=True, default=str(default_archive)), config=config)
+        if archive.exists() or archive == source:
+            raise RuntimeError("The ZIP destination already exists or conflicts with the source.")
+        entries = [source] if source.is_file() else [item for item in bounded_tree_entries(source) if not item.is_symlink()]
+        file_entries = [item for item in entries if item.is_file()]
+        if len(entries) > 2000 or sum(item.stat().st_size for item in file_entries) > 100_000_000:
+            raise RuntimeError("ZIP input is too large (limit: 2,000 entries and 100 MB uncompressed).")
+        create_parent_folders(archive.parent)
+        try:
+            with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as stream:
+                for item in entries:
+                    if item == archive:
+                        continue
+                    if item == source:
+                        arcname = source.name + ("/" if source.is_dir() else "")
+                    else:
+                        arcname = (Path(source.name) / item.relative_to(source)).as_posix()
+                    if item.is_dir():
+                        stream.writestr(arcname.rstrip("/") + "/", "")
+                    else:
+                        stream.write(item, arcname)
+        except (OSError, zipfile.BadZipFile) as error:
+            archive.unlink(missing_ok=True)
+            raise RuntimeError(f"Could not create ZIP archive: {error}") from None
+        record({"kind": "created_file_digest", "path": _workspace_reference(archive), "after_digest": digest_path(archive)})
+        return f"Created ZIP archive {display_home_paths(_workspace_reference(archive))}."
+
+    if name == "extract":
+        archive = _workspace_file(text_argument("path"), config=config)
+        if not archive.is_file() or archive.stat().st_size > 100_000_000:
+            raise RuntimeError("extract requires an existing ZIP file smaller than 100 MB.")
+        default_destination = archive.parent / archive.stem
+        destination = _workspace_file(text_argument("destination_path", optional=True, default=str(default_destination)), config=config)
+        if destination.exists():
+            raise RuntimeError("The extraction destination already exists; extraction never overwrites.")
+        try:
+            with zipfile.ZipFile(archive, "r") as stream:
+                entries = stream.infolist()
+                if len(entries) > 2000 or sum(item.file_size for item in entries) > 100_000_000:
+                    raise RuntimeError("ZIP archive is too large (limit: 2,000 entries and 100 MB uncompressed).")
+                members: list[tuple[zipfile.ZipInfo, Path]] = []
+                for item in entries:
+                    member = PurePosixPath(item.filename)
+                    mode = item.external_attr >> 16
+                    if member.is_absolute() or ".." in member.parts or "\\" in item.filename or ":" in item.filename or "\x00" in item.filename or (mode & 0o170000) == stat.S_IFLNK:
+                        raise RuntimeError("ZIP archive contains an unsafe path or symbolic link.")
+                    target = (destination / Path(*member.parts)).resolve()
+                    if target != destination.resolve() and destination.resolve() not in target.parents:
+                        raise RuntimeError("ZIP archive path escapes the extraction folder.")
+                    members.append((item, target))
+                create_parent_folders(destination.parent)
+                destination.mkdir(exist_ok=False)
+                for item, target in members:
+                    if item.is_dir():
+                        target.mkdir(parents=True, exist_ok=True)
+                        continue
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with stream.open(item, "r") as source_stream, target.open("xb") as target_stream:
+                        shutil.copyfileobj(source_stream, target_stream, length=64 * 1024)
+        except RuntimeError:
+            if destination.exists():
+                shutil.rmtree(destination, ignore_errors=True)
+            raise
+        except (OSError, zipfile.BadZipFile, RuntimeError) as error:
+            if destination.exists():
+                shutil.rmtree(destination, ignore_errors=True)
+            raise RuntimeError(f"Could not safely extract ZIP archive: {error}") from None
+        record({"kind": "created_folder", "path": _workspace_reference(destination), "after_digest": digest_path(destination)})
+        return f"Extracted archive to {display_home_paths(_workspace_reference(destination))}."
+
+    if name == "planning":
+        action = text_argument("action").casefold()
+        todo = PROJECT_DIR / "TODO.md"
+        if action in {"create", "update"}:
+            goal = text_argument("goal")
+            steps = arguments.get("steps")
+            if not isinstance(steps, list) or not 1 <= len(steps) <= 40 or any(not isinstance(step, str) or not step.strip() for step in steps):
+                raise RuntimeError("Planning create/update requires 1–40 non-empty steps.")
+            clean_steps = [step.strip().replace("\n", " ")[:300] for step in steps]
+            completed: set[str] = set()
+            if action == "create" and todo.exists():
+                raise RuntimeError("TODO.md already exists; use planning action=update to revise it.")
+            if action == "update" and todo.exists():
+                previous = read_text_file(_workspace_file("TODO.md", config=config))
+                completed = {match.group(2).strip() for match in re.finditer(r"^- \[x\] (\d+)\. (.+)$", previous, re.MULTILINE | re.IGNORECASE)}
+            rows = ["# Task Plan", "", f"Goal: {goal.strip()[:500]}", ""]
+            rows.extend(f"- [{'x' if step in completed else ' '}] {index}. {step}" for index, step in enumerate(clean_steps, 1))
+            content = "\n".join(rows) + "\n"
+            write_text_file(_workspace_file("TODO.md", config=config), content)
+            return f"{action.title()}d TODO.md with {len(clean_steps)} tracked steps."
+        if action == "complete":
+            step_number = arguments.get("step")
+            if not isinstance(step_number, int) or isinstance(step_number, bool) or step_number < 1:
+                raise RuntimeError("Planning complete requires a one-based integer step.")
+            path = _workspace_file("TODO.md", config=config)
+            content = read_text_file(path)
+            pattern = re.compile(rf"^- \[ \] {step_number}\. (.+)$", re.MULTILINE)
+            updated, count = pattern.subn(r"- [x] " + str(step_number) + r". \1", content, count=1)
+            if not count:
+                if re.search(rf"^- \[x\] {step_number}\. ", content, re.MULTILINE | re.IGNORECASE):
+                    return f"Step {step_number} is already complete in TODO.md."
+                raise RuntimeError(f"TODO.md has no open step {step_number}.")
+            write_text_file(path, updated)
+            return f"Marked step {step_number} complete in TODO.md."
+        raise RuntimeError("Planning action must be create, update, or complete.")
+
     raise RuntimeError(f"Unknown workspace tool: {name}")
 
 
@@ -673,7 +1214,7 @@ def _history_safe_arguments(value: object) -> dict[str, object]:
         normalized = re.sub(r"[^a-z0-9]", "", name.casefold())
         if any(marker in normalized for marker in ("apikey", "token", "secret", "password", "credential", "authorization", "privatekey")):
             safe[name] = "[redacted]"
-        elif normalized in {"content", "prompt", "text"} and isinstance(item, str):
+        elif normalized in {"content", "newcontent", "prompt", "text", "goal"} and isinstance(item, str):
             lines = len(item.splitlines())
             safe[name] = f"[omitted · {len(item.encode('utf-8'))} bytes · {lines} lines]"
         elif isinstance(item, (str, int, float, bool)) or item is None:
@@ -704,38 +1245,73 @@ def _tool_change_details(
     arguments: dict[str, object],
     change_log: list[dict[str, object]] | None,
     previous_state: dict[str, bytes | None],
+    config: dict[str, object] | None = None,
 ) -> list[dict[str, object]]:
-    if name != "write_file" or change_log is None:
+    if name not in FILE_MANAGE_TOOL_NAMES | {"planning"} or change_log is None:
         return []
-    try:
-        path = _workspace_file(str(arguments.get("path", "")))
-        relative_path = path.relative_to(PROJECT_DIR.resolve()).as_posix()
-    except (OSError, RuntimeError, ValueError):
-        return []
-    change = next((item for item in change_log if item.get("path") == relative_path), None)
-    if not isinstance(change, dict) or not isinstance(change.get("after"), bytes):
-        return []
-    before = previous_state.get(relative_path, change.get("before") if change.get("before_exists") else None)
-    before_bytes = len(before) if isinstance(before, bytes) else 0
-    after = change["after"]
-    added, removed = _change_line_counts(before if isinstance(before, bytes) else None, after)
-    return [{
-        "path": relative_path,
-        "operation": "created" if not change.get("before_exists") and relative_path not in previous_state else "updated",
-        "before_bytes": before_bytes,
-        "after_bytes": len(after),
-        "added_lines": added,
-        "removed_lines": removed,
-    }]
+    references: set[str] = set()
+    candidate_values = [arguments.get(key) for key in ("path", "source_path", "destination_path", "archive_path")]
+    if name == "planning":
+        candidate_values.append("TODO.md")
+    for value in candidate_values:
+        if not isinstance(value, str) or not value:
+            continue
+        try:
+            references.add(_workspace_reference(_workspace_file(value, allow_root=True, config=config)))
+        except (OSError, RuntimeError, ValueError):
+            continue
+    details: list[dict[str, object]] = []
+    for change in reversed(change_log):
+        if not isinstance(change, dict):
+            continue
+        path = str(change.get("path", ""))
+        destination = str(change.get("destination", ""))
+        matching = [reference for reference in (path, destination) if reference and reference in references]
+        if not matching and not (name == "zip" and change.get("kind") == "created_file_digest"):
+            continue
+        after = change.get("after")
+        before = change.get("before")
+        for reference in matching or [path]:
+            if not reference:
+                continue
+            before_value = previous_state.get(reference, before if change.get("before_exists") else None)
+            before_bytes = len(before_value) if isinstance(before_value, bytes) else 0
+            after_bytes = len(after) if isinstance(after, bytes) else 0
+            added, removed = _change_line_counts(before_value if isinstance(before_value, bytes) else None, after) if isinstance(after, bytes) else (0, 0)
+            kind = str(change.get("kind", name))
+            operation = {
+                "write_file": "updated" if change.get("before_exists") else "created",
+                "delete_file": "deleted",
+                "move_file": "moved",
+                "move_folder": "moved",
+                "created_file": "copied",
+                "created_file_digest": "archived",
+                "created_folder": "created/extracted",
+            }.get(kind, name)
+            details.append({
+                "path": reference,
+                "operation": operation,
+                "before_bytes": before_bytes,
+                "after_bytes": after_bytes,
+                "added_lines": added,
+                "removed_lines": removed,
+            })
+        if details:
+            break
+    return details
 
 
 def _tool_result_summary(name: str, result: str) -> str:
     if result.startswith("Tool error:"):
         return result[:400]
-    if name == "read_file":
+    if name == "ask":
+        return "Collected answers to the user's clarification questions." if "User responses" in result else "The user cancelled the clarification card."
+    if name == "planning":
+        return "Updated the active project's TODO.md plan."
+    if name in {"read_file", "file_read"}:
         encoded = result.encode("utf-8")
         return f"Read file · {len(encoded)} bytes · {len(result.splitlines())} lines."
-    if name == "list_files":
+    if name in {"list_files", "tree_view"}:
         count = 0 if result == "This folder is empty." else len(result.splitlines())
         return f"Listed {count} entries."
     if name == "session_list":
@@ -774,7 +1350,7 @@ def _request(
         else:
             payload["reasoning"] = {"effort": reasoning["effort"]}
     if tools_enabled:
-        all_tools = _tools_for_mode(mode)
+        all_tools = _tools_for_mode(mode, config)
         payload["tools"] = all_tools if provider == "openrouter" else [
             tool["function"] for tool in all_tools
         ]
@@ -977,7 +1553,14 @@ def _complete_turn(
     usage_out: dict[str, object] | None = None,
     change_log: list[dict[str, object]] | None = None,
     activity_out: list[dict[str, object]] | None = None,
+    on_questions: Callable[[object], str] | None = None,
+    on_planning: Callable[[str], None] | None = None,
 ) -> str:
+    allowed_tool_names = {
+        str(tool["function"]["name"])
+        for tool in _tools_for_mode(mode, config)
+        if isinstance(tool.get("function"), dict)
+    }
     messages: list[dict[str, object]] = [
         {"role": "system", "content": _system_message(config, custom_system_prompt, mode)},
         *(
@@ -1021,16 +1604,46 @@ def _complete_turn(
             tool_started = time.monotonic()
             status = "ok"
             try:
-                if mode == "plan" and name not in PLAN_BUILTIN_TOOLS | {"list_files", "read_file"}:
-                    raise RuntimeError("This tool is disabled in plan mode; switch to /mode build after approval.")
-                if name in {tool["function"]["name"] for tool in BUILTIN_TOOLS}:
+                if name not in allowed_tool_names:
+                    if mode == "plan" and name in {tool["function"]["name"] for tool in [*BUILTIN_TOOLS, *WORKSPACE_TOOLS]}:
+                        raise RuntimeError("This tool is disabled in plan mode; switch to /mode build after approval.")
+                    raise RuntimeError(f"The {name or 'requested'} tool is not enabled for {mode} mode.")
+                if name == "ask":
+                    if mode not in {"plan", "build"}:
+                        raise RuntimeError("The ask tool is available in plan and build modes only.")
+                    if on_questions is None:
+                        raise RuntimeError("The ask tool requires an interactive TUI.")
+                    result = on_questions(raw_arguments)
+                elif name == "planning":
+                    if mode not in {"plan", "build"}:
+                        raise RuntimeError("The planning tool is available in plan and build modes only.")
+                    if on_planning is not None:
+                        on_planning("Updating TODO.md")
+                    try:
+                        result = _execute_workspace_tool(
+                            name,
+                            raw_arguments,
+                            change_log=change_log,
+                            config=config,
+                        )
+                    except (RuntimeError, OSError, ValueError, KeyError, TypeError):
+                        if on_planning is not None:
+                            on_planning("TODO.md update failed")
+                        raise
+                    else:
+                        if on_planning is not None:
+                            on_planning("TODO.md updated")
+                elif name in {tool["function"]["name"] for tool in BUILTIN_TOOLS}:
                     result = _execute_builtin_tool(name, raw_arguments)
                 else:
                     result = _execute_workspace_tool(
                         name,
                         raw_arguments,
                         change_log=change_log,
+                        config=config,
                     )
+            except AgentInterrupted:
+                raise
             except (RuntimeError, OSError, ValueError, KeyError, TypeError) as error:
                 result = f"Tool error: {error}"
                 status = "error"
@@ -1042,7 +1655,7 @@ def _complete_turn(
                     "status": status,
                     "summary": _tool_result_summary(name, result),
                     "duration_ms": round((time.monotonic() - tool_started) * 1000),
-                    "changes": _tool_change_details(name, decoded_arguments, change_log, previous_state),
+                    "changes": _tool_change_details(name, decoded_arguments, change_log, previous_state, config),
                 })
             messages.append({
                 "role": "tool",
@@ -1643,6 +2256,7 @@ def _draw_screen(
     animation_frame: int = 0,
     streaming_text: str = "",
     reasoning_text: str = "",
+    planning_text: str = "",
     context_window: int | None = None,
     mode: str = "chat",
     reasoning_state: str = "off",
@@ -1681,11 +2295,14 @@ def _draw_screen(
             feed.extend(_reasoning_rows(
                 reasoning_text,
                 columns,
-                frame=None if streaming_text.strip() else animation_frame,
+                frame=animation_frame,
                 connect_to_answer=bool(streaming_text.strip()),
                 expanded=reasoning_expanded,
             ))
-        elif answering and not streaming_text.strip():
+        if answering and planning_text.strip():
+            feed.extend(_answering_rows(animation_frame, "Planning"))
+            feed.append(paint("  │  " + _truncate_display(planning_text, max(12, columns - 12)), MUTED))
+        elif answering and not streaming_text.strip() and not reasoning_text.strip():
             label = "Reasoning >" if reasoning_state not in {"off", "not supported"} else "Answering"
             feed.extend(_answering_rows(animation_frame, label))
         if streaming_text:
@@ -2133,11 +2750,19 @@ def _footer_rows(
         directory = "~/" + PROJECT_DIR.relative_to(Path.home()).as_posix()
     except ValueError:
         directory = display_home_paths(PROJECT_DIR)
+    status_label = f"Reasoning: {reasoning} · Mode: {mode}"
+    combined_status = f"{status_label} · {context_label}"
     body = [
         _truncate_display("Model: " + model, inner),
-        _truncate_display(f"Reasoning: {reasoning} · Mode: {mode} · {context_label}", inner),
-        _truncate_display("Directory: " + directory, inner),
     ]
+    if display_width(combined_status) > inner:
+        body.extend([
+            _truncate_display(status_label, inner),
+            _truncate_display(context_label, inner),
+        ])
+    else:
+        body.append(combined_status)
+    body.append(_truncate_display("Directory: " + directory, inner))
     return _card_rows(
         None,
         body,
@@ -2503,56 +3128,181 @@ def _pick_directory_tree(
             return None
 
 
-def _restore_workspace_changes(changes: list[dict[str, object]]) -> str:
-    plans: list[tuple[Path, dict[str, object]]] = []
-    conflicts: list[str] = []
-    for change in changes:
-        relative = str(change.get("path", ""))
-        path = _workspace_file(relative)
-        after = change.get("after")
-        before_exists = change.get("before_exists") is True
-        if not isinstance(after, bytes):
-            raise RuntimeError(f"Undo data for {relative} is invalid.")
+def _workspace_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    if path.is_file():
+        digest.update(path.read_bytes())
+    else:
+        for item in sorted(path.rglob("*"), key=lambda entry: entry.relative_to(path).as_posix()):
+            digest.update(item.relative_to(path).as_posix().encode("utf-8", errors="replace"))
+            if item.is_symlink():
+                digest.update(b"symlink")
+                digest.update(os.readlink(item).encode("utf-8", errors="replace"))
+            elif item.is_file():
+                with item.open("rb") as stream:
+                    for chunk in iter(lambda: stream.read(64 * 1024), b""):
+                        digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _map_reference_through_moves(reference: str, later_changes: list[dict[str, object]]) -> str:
+    location = Path(reference)
+    for change in later_changes:
+        if change.get("kind") not in {"move_file", "move_folder"}:
+            continue
+        source_value = change.get("path")
+        destination_value = change.get("destination")
+        if not isinstance(source_value, str) or not isinstance(destination_value, str):
+            continue
+        source = Path(source_value)
+        destination = Path(destination_value)
         try:
-            current = path.read_bytes() if path.exists() else None
+            relative = location.relative_to(source)
+        except ValueError:
+            continue
+        if change.get("kind") == "move_file" and relative != Path("."):
+            continue
+        location = destination / relative
+    return str(location)
+
+
+def _refresh_undo_digests(changes: list[dict[str, object]], config: dict[str, object] | None = None) -> None:
+    for index, change in enumerate(changes):
+        kind = str(change.get("kind", ""))
+        reference = change.get("destination") if kind in {"move_file", "move_folder"} else change.get("path")
+        if kind not in {"created_folder", "created_file_digest", "move_file", "move_folder"} or not isinstance(reference, str):
+            continue
+        try:
+            mapped = _map_reference_through_moves(reference, changes[index + 1 :])
+            path = _workspace_file(mapped, allow_root=True, config=config)
+            if path.exists():
+                change["after_digest"] = _workspace_digest(path)
+        except (OSError, RuntimeError, ValueError):
+            continue
+
+
+def _restore_workspace_changes(
+    changes: list[dict[str, object]],
+    config: dict[str, object] | None = None,
+) -> str:
+    plans: list[tuple[Path, Path | None, dict[str, object]]] = []
+    conflicts: list[str] = []
+    for index, change in enumerate(changes):
+        relative = str(change.get("path", ""))
+        kind = str(change.get("kind", "write_file"))
+        path = _workspace_file(relative, allow_root=True, config=config)
+        destination_value = change.get("destination")
+        destination = _workspace_file(str(destination_value), allow_root=True, config=config) if isinstance(destination_value, str) else None
+        later_changes = changes[index + 1 :]
+        try:
+            if kind in {"write_file", "created_file"}:
+                after = change.get("after")
+                current_path = _workspace_file(
+                    _map_reference_through_moves(relative, later_changes),
+                    allow_root=True,
+                    config=config,
+                )
+                current = current_path.read_bytes() if current_path.is_file() else None
+                deleted_later = any(
+                    item.get("kind") == "delete_file"
+                    and item.get("path") == _map_reference_through_moves(relative, later_changes)
+                    for item in later_changes
+                )
+                if (not isinstance(after, bytes) or current != after) and not deleted_later:
+                    conflicts.append(relative)
+            elif kind == "delete_file":
+                current_reference = _map_reference_through_moves(relative, later_changes)
+                current_path = _workspace_file(current_reference, allow_root=True, config=config)
+                recreated_later = any(item.get("path") == current_reference and item.get("before_exists") is False for item in later_changes)
+                if current_path.exists() and not recreated_later:
+                    conflicts.append(relative)
+                if not isinstance(change.get("before"), bytes):
+                    raise RuntimeError(f"Undo data for {relative} is invalid.")
+            elif kind == "created_file_digest":
+                if not path.is_file() or _workspace_digest(path) != change.get("after_digest"):
+                    conflicts.append(relative)
+            elif kind == "created_folder":
+                if not path.is_dir() or _workspace_digest(path) != change.get("after_digest"):
+                    conflicts.append(relative)
+            elif kind in {"move_file", "move_folder"}:
+                mapped_destination = _workspace_file(
+                    _map_reference_through_moves(str(destination_value or ""), later_changes),
+                    allow_root=True,
+                    config=config,
+                ) if isinstance(destination_value, str) else None
+                deleted_after_move = any(
+                    item.get("kind") == "delete_file"
+                    and item.get("path") == _map_reference_through_moves(str(destination_value or ""), later_changes)
+                    for item in later_changes
+                )
+                if destination is None or path.exists() or (
+                    (mapped_destination is None or not mapped_destination.exists())
+                    and not deleted_after_move
+                ) or (
+                    mapped_destination is not None
+                    and mapped_destination.exists()
+                    and _workspace_digest(mapped_destination) != change.get("after_digest")
+                ):
+                    conflicts.append(relative)
+            else:
+                raise RuntimeError(f"Undo data for {relative} has an unsupported operation.")
         except OSError as error:
             raise RuntimeError(f"Could not check {relative} before undo: {error}") from None
-        if current != after:
-            conflicts.append(relative)
-        plans.append((path, change))
+        plans.append((path, destination, change))
     if conflicts:
         raise RuntimeError(
-            "Undo stopped because these files changed after the Agent edit: "
+            "Undo stopped because these paths changed after the Agent edit or operation: "
             + ", ".join(conflicts)
             + ". Review them manually to avoid overwriting newer work."
         )
+
     restored = 0
-    for path, change in plans:
-        relative = str(change["path"])
-        if change.get("before_exists") is not True:
-            path.unlink()
-            restored += 1
-            continue
-        before = change.get("before")
-        if not isinstance(before, bytes):
-            raise RuntimeError(f"Undo data for {relative} is invalid.")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, temporary = tempfile.mkstemp(prefix=".sophon-undo-", dir=path.parent)
-        try:
-            with os.fdopen(fd, "wb") as stream:
-                stream.write(before)
+    for path, destination, change in reversed(plans):
+        kind = str(change.get("kind", "write_file"))
+        if kind in {"write_file", "created_file"}:
+            if change.get("before_exists") is not True:
+                path.unlink()
+            else:
+                before = change.get("before")
+                if not isinstance(before, bytes):
+                    raise RuntimeError(f"Undo data for {path} is invalid.")
+                path.parent.mkdir(parents=True, exist_ok=True)
+                fd, temporary = tempfile.mkstemp(prefix=".sophon-undo-", dir=path.parent)
+                try:
+                    with os.fdopen(fd, "wb") as stream:
+                        stream.write(before)
+                    mode = change.get("before_mode")
+                    if isinstance(mode, int):
+                        os.chmod(temporary, mode)
+                    os.replace(temporary, path)
+                except BaseException:
+                    try:
+                        os.unlink(temporary)
+                    except OSError:
+                        pass
+                    raise
+        elif kind == "delete_file":
+            before = change.get("before")
+            assert isinstance(before, bytes)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(before)
             mode = change.get("before_mode")
             if isinstance(mode, int):
-                os.chmod(temporary, mode)
-            os.replace(temporary, path)
-        except BaseException:
-            try:
-                os.unlink(temporary)
-            except OSError:
-                pass
-            raise
+                os.chmod(path, mode)
+        elif kind in {"created_file_digest", "created_folder"}:
+            if path.is_dir():
+                shutil.rmtree(path)
+            elif path.exists():
+                path.unlink()
+        elif kind in {"move_file", "move_folder"}:
+            assert destination is not None
+            path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(destination), str(path))
+            mode = change.get("before_mode")
+            if kind == "move_file" and isinstance(mode, int):
+                os.chmod(path, mode)
         restored += 1
-    return f"Undid the last Agent edit in {restored} file{'s' if restored != 1 else ''}."
+    return f"Undid the last Agent operation in {restored} file/path{'s' if restored != 1 else ''}."
 
 
 def _change_diff(changes: list[dict[str, object]], max_chars: int = 24_000) -> str:
@@ -2767,6 +3517,129 @@ def _history_panel(session: dict[str, object], draw) -> None:
             selected = 0
 
 
+def _validated_questions(arguments: object) -> list[dict[str, object]]:
+    payload = _decoded_tool_arguments(arguments)
+    raw_questions = payload.get("questions")
+    if not isinstance(raw_questions, list) or not 1 <= len(raw_questions) <= 6:
+        raise RuntimeError("ask requires between one and six questions.")
+    questions: list[dict[str, object]] = []
+    for item in raw_questions:
+        if not isinstance(item, dict) or not isinstance(item.get("question"), str) or not item["question"].strip():
+            raise RuntimeError("Each ask item needs a non-empty question.")
+        question = _history_display_text(item["question"], 1200)
+        raw_options = item.get("options", [])
+        if not isinstance(raw_options, list) or len(raw_options) > 3 or any(not isinstance(option, str) or not option.strip() for option in raw_options):
+            raise RuntimeError("Each ask question may contain up to three non-empty preset answers.")
+        questions.append({
+            "question": question,
+            "options": [_history_display_text(option, 500) for option in raw_options],
+        })
+    return questions
+
+
+def _questions_panel(
+    arguments: object,
+    draw,
+    key_events: queue.Queue[str],
+    answering: dict[str, object],
+    cancellation: RequestCancellation | None = None,
+) -> str | None:
+    questions = _validated_questions(arguments)
+    responses: list[dict[str, object]] = []
+    frame = int(answering.get("frame", 0))
+    last_escape_at: float | None = None
+    for question_index, item in enumerate(questions, 1):
+        question = str(item["question"])
+        options = item["options"]
+        input_text = ""
+        while True:
+            body = [f"Q: {question}", ""]
+            body.extend(f"{chr(65 + index)}) {option}" for index, option in enumerate(options))
+            if options:
+                body.append("")
+            body.extend([
+                "S) Skip this question",
+                "",
+                "Choose A–C for a preset, or type a custom answer.",
+                "Press Enter to continue to the next question.",
+            ])
+            panel = _card_rows(
+                "Questions",
+                body,
+                columns=shutil.get_terminal_size((80, 24)).columns,
+                top_right=f"{question_index} of {len(questions)}",
+            )
+            draw(input_text, len(input_text), panel_rows=panel, placeholder="Type an answer, or enter A–C/S then Enter")
+            try:
+                key = key_events.get(timeout=ANIMATION_TICK)
+            except queue.Empty:
+                frame += 1
+                answering["frame"] = frame
+                continue
+            if key in {"CANCEL", "DOUBLE_CANCEL"}:
+                now = time.monotonic()
+                if key == "DOUBLE_CANCEL" or (last_escape_at is not None and now - last_escape_at <= 1.5):
+                    if cancellation is not None:
+                        cancellation.cancel()
+                    raise AgentInterrupted("Response interrupted by user.")
+                last_escape_at = now
+                answering["interrupt_warning"] = True
+                continue
+            if key == "BACKSPACE":
+                input_text = input_text[:-1]
+            elif key == "ENTER":
+                shortcut = input_text.strip().casefold()
+                if len(shortcut) == 1 and shortcut in {chr(97 + index) for index in range(len(options))}:
+                    response = options[ord(shortcut) - 97]
+                    skipped = False
+                elif shortcut == "s":
+                    response = ""
+                    skipped = True
+                elif input_text.startswith("="):
+                    response = input_text[1:].strip()
+                    skipped = False
+                else:
+                    response = input_text.strip()
+                    skipped = False
+                responses.append({"question": question, "answer": response, "skipped": skipped})
+                break
+            elif key.startswith("CHAR:"):
+                value = key[5:]
+                input_text = (input_text + value)[:1000]
+            elif key in {"INSERT_LINE", "DELETE_LINE", "DELETE", "UP", "DOWN", "LEFT", "RIGHT", "TOGGLE_REASONING"}:
+                continue
+            frame += 1
+            answering["frame"] = frame
+
+    summary_rows = ["Review the responses before sending them to the Agent.", ""]
+    for index, response in enumerate(responses, 1):
+        summary_rows.append(f"Q{index}: {response['question']}")
+        summary_rows.append("  Skipped" if response["skipped"] else f"  A: {response['answer'] or '(blank)'}")
+    summary_rows.extend(["", "Press Enter to submit all answers · Esc to cancel"])
+    summary = _card_rows(
+        "Questions",
+        summary_rows,
+        columns=shutil.get_terminal_size((80, 24)).columns,
+        top_right=f"{len(questions)} of {len(questions)}",
+    )
+    while True:
+        draw("", 0, panel_rows=summary, placeholder="Press Enter to send the answers")
+        try:
+            key = key_events.get(timeout=ANIMATION_TICK)
+        except queue.Empty:
+            continue
+        if key == "ENTER":
+            return "User responses to the clarification questions:\n" + json.dumps(responses, ensure_ascii=False)
+        if key in {"CANCEL", "DOUBLE_CANCEL"}:
+            now = time.monotonic()
+            if key == "DOUBLE_CANCEL" or (last_escape_at is not None and now - last_escape_at <= 1.5):
+                if cancellation is not None:
+                    cancellation.cancel()
+                raise AgentInterrupted("Response interrupted by user.")
+            last_escape_at = now
+            answering["interrupt_warning"] = True
+
+
 def _interactive(config: dict[str, object]) -> int:
     global PROJECT_DIR
     try:
@@ -2792,7 +3665,7 @@ def _interactive(config: dict[str, object]) -> int:
             args=(config.copy(), context_state),
             daemon=True,
         ).start()
-    answering = {"active": False, "frame": 0, "text": "", "reasoning": "", "reasoning_expanded": False}
+    answering = {"active": False, "frame": 0, "text": "", "reasoning": "", "planning": "", "planning_until": 0.0, "reasoning_expanded": False}
 
     def draw(
         text: str,
@@ -2822,6 +3695,11 @@ def _interactive(config: dict[str, object]) -> int:
             animation_frame=int(answering["frame"]),
             streaming_text=str(answering["text"]),
             reasoning_text=str(answering["reasoning"]),
+            planning_text=(
+                str(answering.get("planning", ""))
+                if time.monotonic() < float(answering.get("planning_until", 0.0))
+                else ""
+            ),
             context_window=context_state["window"] if isinstance(context_state["window"], int) else None,
             mode=str(session.get("mode", "chat")),
             reasoning_state=reasoning_state,
@@ -3119,7 +3997,7 @@ def _interactive(config: dict[str, object]) -> int:
                     notice("Undo unavailable", "No Agent file edit is available to undo.", error=True)
                     continue
                 try:
-                    result = _restore_workspace_changes(session_changes)
+                    result = _restore_workspace_changes(session_changes, config)
                 except (RuntimeError, OSError) as error:
                     notice("Undo stopped", str(error), error=True)
                     continue
@@ -3462,11 +4340,13 @@ def _interactive(config: dict[str, object]) -> int:
         answering["frame"] = 0
         answering["text"] = ""
         answering["reasoning"] = ""
+        answering["planning"] = ""
         answering["reasoning_expanded"] = False
         answering["interrupt_warning"] = False
         request_started = time.monotonic()
         draw("", 0)
         events: queue.Queue[tuple[str, object]] = queue.Queue()
+        key_events: queue.Queue[str] = queue.Queue()
         cancellation = RequestCancellation()
         turn_mode = str(session.get("mode", "chat"))
         turn_session_id = str(session.get("id", ""))
@@ -3476,6 +4356,20 @@ def _interactive(config: dict[str, object]) -> int:
         request_messages = [
             item for item in messages if item["role"] in {"user", "assistant"}
         ]
+
+        def request_user_questions(arguments: object) -> str:
+            if not sys.stdin.isatty():
+                return "Interactive questions are unavailable because Sophon is not attached to a terminal. Continue with a clearly stated assumption."
+            handoff = QuestionHandoff()
+            events.put(("questions", (arguments, handoff)))
+            while not handoff.ready.wait(0.1):
+                cancellation.check()
+            if handoff.response:
+                return handoff.response
+            return "The user cancelled the question card. Continue without assuming an answer and do not immediately ask the same questions again."
+
+        def set_planning_status(value: str) -> None:
+            events.put(("planning", value))
 
         def request_answer() -> None:
             try:
@@ -3489,6 +4383,8 @@ def _interactive(config: dict[str, object]) -> int:
                     usage_out=turn_usage,
                     change_log=turn_changes,
                     activity_out=turn_activity,
+                    on_questions=request_user_questions,
+                    on_planning=set_planning_status,
                 )
             except Exception as error:
                 events.put(("error", error))
@@ -3502,7 +4398,6 @@ def _interactive(config: dict[str, object]) -> int:
         request_error: Exception | None = None
         interrupted_by_user = False
         last_escape_at: float | None = None
-        key_events: queue.Queue[str] = queue.Queue()
         key_stop = threading.Event()
         key_reader = None
         if sys.stdin.isatty():
@@ -3528,6 +4423,32 @@ def _interactive(config: dict[str, object]) -> int:
                     parts.append(str(value))
                 elif kind == "reasoning":
                     reasoning_parts.append(str(value))
+                elif kind == "planning":
+                    if str(value):
+                        answering["planning"] = str(value)
+                        answering["planning_until"] = time.monotonic() + 1.2
+                    elif str(answering.get("planning", "")):
+                        answering["planning"] = "TODO.md plan updated"
+                        answering["planning_until"] = time.monotonic() + 0.6
+                elif kind == "questions" and isinstance(value, tuple) and len(value) == 2:
+                    question_arguments, handoff = value
+                    if isinstance(handoff, QuestionHandoff):
+                        try:
+                            handoff.response = _questions_panel(
+                                question_arguments,
+                                draw,
+                                key_events,
+                                answering,
+                                cancellation,
+                            ) or ""
+                        except AgentInterrupted as error:
+                            cancellation.cancel()
+                            interrupted_by_user = True
+                            request_error = error
+                        except (RuntimeError, ValueError) as error:
+                            handoff.response = "The question card could not be shown: " + str(error)
+                        finally:
+                            handoff.ready.set()
                 elif kind == "done":
                     answer = str(value)
                 elif kind == "error":
@@ -3599,6 +4520,7 @@ def _interactive(config: dict[str, object]) -> int:
         answering["active"] = False
         answering["text"] = ""
         answering["reasoning"] = ""
+        answering["planning"] = ""
         answering["interrupt_warning"] = False
         _merge_session_usage(session, turn_usage)
         activity_log = session.get("activity_log")
@@ -3607,6 +4529,7 @@ def _interactive(config: dict[str, object]) -> int:
         if turn_activity:
             session["activity_log"] = [*activity_log, *turn_activity][-250:]
         if turn_changes:
+            _refresh_undo_digests(turn_changes, config)
             last_changes_by_session[turn_session_id] = turn_changes
         refresh_sessions_after_tools()
         if interrupted_by_user:

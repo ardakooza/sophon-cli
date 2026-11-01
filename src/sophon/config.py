@@ -22,6 +22,32 @@ PROVIDERS: dict[str, dict[str, str]] = {
     },
 }
 
+AGENT_MODES = ("plan", "build", "chat")
+
+
+def _default_mode_tools() -> dict[str, list[str]]:
+    return {mode: [] for mode in AGENT_MODES}
+
+
+def _normalized_agent_access(data: dict[str, Any]) -> tuple[list[str], dict[str, list[str]]]:
+    allowed_path = data.get("allowed_path", [])
+    if not isinstance(allowed_path, list) or any(
+        not isinstance(item, str) or not item.strip() for item in allowed_path
+    ):
+        raise ValueError("allowed_path must be a list of non-empty path strings")
+    normalized_paths = list(dict.fromkeys(item.strip() for item in allowed_path))
+
+    mode_value = data.get("mode", {})
+    if not isinstance(mode_value, dict) or set(mode_value) - set(AGENT_MODES):
+        raise ValueError("mode must contain only plan, build, and chat tool lists")
+    normalized_mode: dict[str, list[str]] = {}
+    for mode in AGENT_MODES:
+        tools = mode_value.get(mode, [])
+        if not isinstance(tools, list) or any(not isinstance(tool, str) or not tool.strip() for tool in tools):
+            raise ValueError(f"mode.{mode} must be a list of non-empty tool names")
+        normalized_mode[mode] = list(dict.fromkeys(tool.strip() for tool in tools))
+    return normalized_paths, normalized_mode
+
 
 def config_path() -> Path:
     xdg_home = os.environ.get("XDG_CONFIG_HOME")
@@ -150,9 +176,10 @@ def read_config() -> dict[str, Any] | None:
     if data.get("provider") is None:
         allowed_preferences = {
             "schema_version", "auto_update", "agent_instructions_path", "reasoning",
-            "auto_compression", "auto_compression_threshold", "Environment",
+            "auto_compression", "auto_compression_threshold", "Environment", "allowed_path", "mode",
         }
         if set(data) <= allowed_preferences:
+            _normalized_agent_access(data)
             return None
         raise ValueError("Unsupported or malformed provider configuration")
     if data.get("provider") not in PROVIDERS:
@@ -205,6 +232,13 @@ def read_config() -> dict[str, Any] | None:
     if data.get("auto_compression_threshold") != threshold:
         data["auto_compression_threshold"] = threshold
         changed = True
+    allowed_path, mode_tools = _normalized_agent_access(data)
+    if data.get("allowed_path") != allowed_path:
+        data["allowed_path"] = allowed_path
+        changed = True
+    if data.get("mode") != mode_tools:
+        data["mode"] = mode_tools
+        changed = True
     if source != path or changed:
         write_config(data)
     if migrated_auto_update:
@@ -218,11 +252,12 @@ def read_config() -> dict[str, Any] | None:
 
 
 def write_config(data: dict[str, Any]) -> Path:
+    data = dict(data)
     provider = data.get("provider")
     if provider is None:
         allowed_preferences = {
             "schema_version", "auto_update", "agent_instructions_path", "reasoning",
-            "auto_compression", "auto_compression_threshold", "Environment",
+            "auto_compression", "auto_compression_threshold", "Environment", "allowed_path", "mode",
         }
         if set(data) - allowed_preferences:
             raise ValueError("Preferences-only config contains unsupported fields")
@@ -238,6 +273,7 @@ def write_config(data: dict[str, Any]) -> Path:
         environment = data.get("Environment")
         if environment is not None and (not isinstance(environment, str) or not environment.strip()):
             raise ValueError("Environment must be a non-empty string")
+        allowed_path, mode_tools = _normalized_agent_access(data)
     else:
         if provider not in PROVIDERS:
             raise ValueError("Unsupported provider")
@@ -245,6 +281,12 @@ def write_config(data: dict[str, Any]) -> Path:
             raise ValueError("Model and API key are required")
         if provider == "cloudflare" and not data.get("account_id"):
             raise ValueError("Cloudflare Account ID is required")
+        allowed_path, mode_tools = _normalized_agent_access(data)
+
+    if "allowed_path" in data:
+        data["allowed_path"] = allowed_path
+    if "mode" in data:
+        data["mode"] = mode_tools
 
     path = config_path()
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)

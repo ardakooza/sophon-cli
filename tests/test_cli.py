@@ -2128,3 +2128,360 @@ def test_escape_from_nested_agent_prompt_returns_to_tui():
     ):
         assert agent._interactive({"provider": "openrouter", "model": "test", "context_window": 1024}) == agent.EXIT_TO_TUI
     assert calls == 2
+
+
+def test_config_persists_allowed_path_and_empty_mode_tool_lists(tmp_path):
+    import json
+
+    config = {
+        "schema_version": 1,
+        "provider": "openrouter",
+        "model": "test-model",
+        "api_key": "secret",
+        "allowed_path": ["~/shared", "~/shared"],
+        "mode": {"plan": [], "build": ["file_read", "file_edit"], "chat": []},
+    }
+    with patch.dict(os.environ, {"XDG_CONFIG_HOME": str(tmp_path)}):
+        write_config(config)
+        persisted = json.loads(config_path().read_text(encoding="utf-8"))
+    assert persisted["allowed_path"] == ["~/shared"]
+    assert persisted["mode"] == {"plan": [], "build": ["file_read", "file_edit"], "chat": []}
+
+
+def test_mode_tool_registry_includes_ask_planning_and_file_manage_but_respects_explicit_allowlist():
+    from sophon.agent import FILE_MANAGE_TOOL_NAMES, _tools_for_mode
+
+    plan_names = {tool["function"]["name"] for tool in _tools_for_mode("plan")}
+    build_names = {tool["function"]["name"] for tool in _tools_for_mode("build")}
+    restricted_names = {tool["function"]["name"] for tool in _tools_for_mode("build", {"mode": {"build": ["file_read"]}})}
+    assert {"ask", "planning", "tree_view"} <= plan_names
+    assert "file_edit" not in plan_names
+    assert {"ask", "planning", "file_create", "file_edit", "extract"} <= build_names
+    assert len(FILE_MANAGE_TOOL_NAMES) >= 15
+    assert restricted_names == {"file_read"}
+
+
+def test_file_manage_allowed_path_rejects_escape_and_symlink_and_supports_absolute_roots(tmp_path):
+    from sophon.agent import _execute_workspace_tool
+
+    project = tmp_path / "project"
+    project.mkdir()
+    allowed = tmp_path / "shared"
+    allowed.mkdir()
+    (allowed / "notes.txt").write_text("shared data", encoding="utf-8")
+    outside = tmp_path / "secret.txt"
+    outside.write_text("secret", encoding="utf-8")
+    (project / "link.txt").symlink_to(outside)
+    with patch("sophon.agent.PROJECT_DIR", project):
+        assert _execute_workspace_tool("file_read", {"path": str(allowed / "notes.txt")}, config={"allowed_path": [str(allowed)]}) == "shared data"
+        for path in ("../secret.txt", "link.txt", str(outside)):
+            try:
+                _execute_workspace_tool("file_read", {"path": path})
+            except RuntimeError as error:
+                assert "File Manage paths" in str(error) or "Symbolic links" in str(error)
+            else:
+                raise AssertionError(f"Unsafe path unexpectedly allowed: {path}")
+
+
+def test_file_manage_operations_are_bounded_safe_and_undoable(tmp_path):
+    import zipfile
+    from sophon.agent import _execute_workspace_tool, _restore_workspace_changes, _refresh_undo_digests
+
+    project = tmp_path / "project"
+    project.mkdir()
+    changes = []
+    with patch("sophon.agent.PROJECT_DIR", project):
+        assert "Created" in _execute_workspace_tool("file_create", {"path": "docs/a.txt", "content": "alpha\n"}, change_log=changes)
+        assert _execute_workspace_tool("file_read", {"path": "docs/a.txt"}) == "alpha\n"
+        _execute_workspace_tool("file_edit", {"path": "docs/a.txt", "new_content": "beta\n"}, change_log=changes)
+        _execute_workspace_tool("file_rename", {"path": "docs/a.txt", "new_name": "b.txt"}, change_log=changes)
+        _execute_workspace_tool("file_copy", {"source_path": "docs/b.txt", "destination_path": "docs/c.txt"}, change_log=changes)
+        _execute_workspace_tool("zip", {"path": "docs", "archive_path": "docs.zip"}, change_log=changes)
+        _execute_workspace_tool("extract", {"path": "docs.zip", "destination_path": "unzipped"}, change_log=changes)
+        assert "b.txt" in _execute_workspace_tool("tree_view", {"path": "."})
+        _refresh_undo_digests(changes)
+        summary = _restore_workspace_changes(changes)
+        assert "Undid" in summary
+        assert not (project / "docs").exists()
+        assert not (project / "docs.zip").exists()
+        assert not (project / "unzipped").exists()
+
+        malicious = project / "unsafe.zip"
+        with zipfile.ZipFile(malicious, "w") as archive:
+            archive.writestr("../escape.txt", "not safe")
+        try:
+            _execute_workspace_tool("extract", {"path": "unsafe.zip", "destination_path": "bad"})
+        except RuntimeError as error:
+            assert "unsafe path" in str(error)
+        else:
+            raise AssertionError("ZIP traversal must be rejected")
+        assert not (tmp_path / "escape.txt").exists()
+
+
+def test_file_manage_copy_refuses_existing_destinations_and_folder_self_copy(tmp_path):
+    from sophon.agent import _execute_workspace_tool
+
+    project = tmp_path / "project"
+    (project / "folder").mkdir(parents=True)
+    (project / "folder" / "a.txt").write_text("data", encoding="utf-8")
+    (project / "existing.txt").write_text("keep", encoding="utf-8")
+    with patch("sophon.agent.PROJECT_DIR", project):
+        for name, args in [
+            ("file_copy", {"source_path": "folder/a.txt", "destination_path": "existing.txt"}),
+            ("folder_copy", {"source_path": "folder", "destination_path": "folder/child"}),
+        ]:
+            try:
+                _execute_workspace_tool(name, args)
+            except RuntimeError as error:
+                assert "destination" in str(error).lower() or "itself" in str(error).lower()
+            else:
+                raise AssertionError(f"Unsafe copy unexpectedly succeeded: {name}")
+    assert (project / "existing.txt").read_text(encoding="utf-8") == "keep"
+
+
+def test_planning_tool_updates_and_completes_todo_checklist(tmp_path):
+    from sophon.agent import _execute_workspace_tool, _restore_workspace_changes
+
+    project = tmp_path / "project"
+    project.mkdir()
+    changes = []
+    with patch("sophon.agent.PROJECT_DIR", project):
+        result = _execute_workspace_tool("planning", {
+            "action": "create", "goal": "Ship support", "steps": ["Inspect code", "Add tests", "Verify"],
+        }, change_log=changes)
+        assert "3 tracked steps" in result
+        _execute_workspace_tool("planning", {"action": "complete", "step": 1}, change_log=changes)
+        content = (project / "TODO.md").read_text(encoding="utf-8")
+        assert "- [x] 1. Inspect code" in content
+        assert "- [ ] 2. Add tests" in content
+        assert "TODO.md" in str(changes)
+        _restore_workspace_changes(changes)
+        assert not (project / "TODO.md").exists()
+
+
+def test_question_card_renders_sequential_presets_skip_and_final_submit(tmp_path):
+    import queue
+    from sophon.agent import _questions_panel
+
+    events = queue.Queue()
+    for key in ("CHAR:a", "ENTER", "CHAR:s", "ENTER", "ENTER"):
+        events.put(key)
+    rendered = []
+    with patch("sophon.agent.shutil.get_terminal_size", return_value=os.terminal_size((100, 32))):
+        answer = _questions_panel({"questions": [
+            {"question": "Which framework?", "options": ["Flask", "FastAPI"]},
+            {"question": "Proceed now?", "options": ["Yes", "No"]},
+        ]}, lambda text, cursor, **kwargs: rendered.append((text, kwargs.get("panel_rows"))), events, {"frame": 0})
+    assert answer is not None
+    assert '"answer": "Flask"' in answer
+    assert '"skipped": true' in answer
+    assert any("Questions" in "\n".join(rows or []) and "1 of 2" in "\n".join(rows or []) for _, rows in rendered)
+    assert any("2 of 2" in "\n".join(rows or []) for _, rows in rendered)
+    assert any("Press Enter to submit all answers" in "\n".join(rows or []) for _, rows in rendered)
+
+
+def test_questions_validate_count_and_preset_limits():
+    from sophon.agent import _validated_questions
+
+    for payload in (
+        {"questions": []},
+        {"questions": [{"question": "Q", "options": ["a", "b", "c", "d"]}]},
+        {"questions": [{"question": "Q"}] * 7},
+    ):
+        try:
+            _validated_questions(payload)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("Invalid question payload was accepted")
+
+
+def test_doctor_reports_agent_tool_registry_and_provider_model_catalog_failure(tmp_path):
+    from sophon import core
+
+    config = {"provider": "openrouter", "model": "test/model", "api_key": "private-token"}
+    output = StringIO()
+    with (
+        patch.dict(os.environ, {"XDG_CONFIG_HOME": str(tmp_path)}),
+        patch("sophon.core.read_config", return_value=config),
+        patch("sophon.agent._load_sessions", return_value=[]),
+        patch("sophon.agent._list_models", side_effect=RuntimeError("HTTP 401 private-token")),
+        patch("sys.stdout", output),
+    ):
+        core.doctor()
+    rendered = re.sub(r"\x1b\[[0-9;]*m", "", output.getvalue())
+    assert "Agent tool registry" in rendered
+    assert "Agent provider check failed" in rendered
+    assert "private-token" not in rendered
+    assert re.search(r"\d+ of \d+", rendered)
+
+
+def test_footer_moves_context_to_second_line_when_status_is_too_wide():
+    from sophon.agent import _footer_rows
+
+    rendered = "\n".join(_footer_rows("a-very-long-model-name/with-a-long-provider-id", [], 4096, 42, mode="build", reasoning="high"))
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", rendered)
+    lines = plain.splitlines()
+    status_index = next(index for index, line in enumerate(lines) if "Reasoning:" in line)
+    context_index = next(index for index, line in enumerate(lines) if "Context:" in line)
+    assert context_index == status_index + 1
+
+
+def test_undo_delete_recreate_move_restores_original_path_and_removes_replacement(tmp_path):
+    from sophon.agent import _execute_workspace_tool, _refresh_undo_digests, _restore_workspace_changes
+
+    project = tmp_path / "project"
+    project.mkdir()
+    original = project / "a.txt"
+    original.write_text("original content\n", encoding="utf-8")
+    changes = []
+    with patch("sophon.agent.PROJECT_DIR", project):
+        _execute_workspace_tool("file_delete", {"path": "a.txt"}, change_log=changes)
+        _execute_workspace_tool("file_create", {"path": "a.txt", "content": "replacement\n"}, change_log=changes)
+        _execute_workspace_tool("file_move", {"source_path": "a.txt", "destination_path": "b.txt"}, change_log=changes)
+        _refresh_undo_digests(changes)
+        _restore_workspace_changes(changes)
+    assert original.read_text(encoding="utf-8") == "original content\n"
+    assert not (project / "b.txt").exists()
+
+
+def test_complete_turn_enforces_nonempty_mode_allowlist_at_tool_dispatch(tmp_path):
+    import json
+    from sophon.agent import _complete_turn
+
+    project = tmp_path / "project"
+    project.mkdir()
+    target = project / "notes.txt"
+    target.write_text("original\n", encoding="utf-8")
+    calls = 0
+    captured = []
+
+    def fake_request(config, messages, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            kwargs["tool_calls_out"].append({
+                "id": "blocked-edit",
+                "type": "function",
+                "function": {"name": "file_edit", "arguments": json.dumps({"path": "notes.txt", "new_content": "changed\n"})},
+            })
+            return ""
+        captured.extend(messages)
+        return "I did not edit the file."
+
+    with patch("sophon.agent.PROJECT_DIR", project), patch("sophon.agent._request", side_effect=fake_request):
+        answer = _complete_turn(
+            {"provider": "openrouter", "model": "test", "api_key": "key", "mode": {"build": ["file_read"]}},
+            [{"role": "user", "content": "Change this file"}],
+            mode="build",
+        )
+    assert answer == "I did not edit the file."
+    assert target.read_text(encoding="utf-8") == "original\n"
+    tool_result = next(message for message in captured if message.get("role") == "tool")
+    assert "not enabled for build mode" in tool_result["content"]
+
+
+def test_planning_animation_reports_failure_instead_of_success(tmp_path):
+    import json
+    from sophon.agent import _complete_turn
+
+    project = tmp_path / "project"
+    project.mkdir()
+    calls = 0
+    statuses = []
+
+    def fake_request(config, messages, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            kwargs["tool_calls_out"].append({
+                "id": "bad-plan",
+                "type": "function",
+                "function": {"name": "planning", "arguments": json.dumps({"action": "complete", "step": 999})},
+            })
+            return ""
+        return "There is no such step."
+
+    with patch("sophon.agent.PROJECT_DIR", project), patch("sophon.agent._request", side_effect=fake_request):
+        _complete_turn(
+            {"provider": "openrouter", "model": "test", "api_key": "key"},
+            [{"role": "user", "content": "Complete step 999"}],
+            mode="build",
+            on_planning=statuses.append,
+        )
+    assert statuses == ["Updating TODO.md", "TODO.md update failed"]
+    assert not (project / "TODO.md").exists()
+
+
+def test_questions_allow_custom_answers_starting_with_preset_letter_and_double_escape_cancels_turn():
+    import queue
+    from sophon.agent import AgentInterrupted, RequestCancellation, _questions_panel
+
+    custom_events = queue.Queue()
+    for key in ("CHAR:A", "CHAR:p", "CHAR:p", "CHAR:l", "CHAR:e", "ENTER", "ENTER"):
+        custom_events.put(key)
+    with patch("sophon.agent.shutil.get_terminal_size", return_value=os.terminal_size((100, 32))):
+        answer = _questions_panel(
+            {"questions": [{"question": "What should it be called?", "options": ["Alpha", "Beta"]}]},
+            lambda *args, **kwargs: None,
+            custom_events,
+            {"frame": 0},
+        )
+    assert '"answer": "Apple"' in answer
+
+    cancel_events = queue.Queue()
+    cancel_events.put("DOUBLE_CANCEL")
+    cancellation = RequestCancellation()
+    with patch("sophon.agent.shutil.get_terminal_size", return_value=os.terminal_size((100, 32))):
+        try:
+            _questions_panel(
+                {"questions": [{"question": "Continue?", "options": ["Yes", "No"]}]},
+                lambda *args, **kwargs: None,
+                cancel_events,
+                {"frame": 0},
+                cancellation,
+            )
+        except AgentInterrupted:
+            pass
+        else:
+            raise AssertionError("Double Escape must cancel the active request")
+    assert cancellation.cancelled
+
+
+def test_setup_preserves_providerless_access_settings_on_first_provider_setup(tmp_path):
+    import json
+    from sophon.setup_wizard import run_setup_wizard
+
+    preferences = {
+        "schema_version": 1,
+        "auto_update": True,
+        "allowed_path": ["~/shared"],
+        "mode": {"plan": [], "build": ["file_read"], "chat": []},
+    }
+    preference_path = tmp_path / "config.json"
+    preference_path.write_text(json.dumps(preferences), encoding="utf-8")
+    saved = {}
+    with (
+        patch("sophon.setup_wizard.sys.stdin.isatty", return_value=True),
+        patch("sophon.setup_wizard.sys.stdout.isatty", return_value=True),
+        patch("sophon.setup_wizard.read_config", return_value=None),
+        patch("sophon.setup_wizard.config_path", return_value=preference_path),
+        patch("sophon.setup_wizard._choose_existing_action", side_effect=AssertionError("no provider is configured yet")),
+        patch("sophon.setup_wizard._choose_provider", return_value="openrouter"),
+        patch("sophon.setup_wizard._choose_model", return_value="test-model"),
+        patch("sophon.setup_wizard._read_hidden_credential", return_value="new-key"),
+        patch("sophon.agent._detect_reasoning_support", return_value=False),
+        patch("sophon.setup_wizard.auto_compression_settings", return_value=(True, 80)),
+        patch("sophon.setup_wizard.auto_update_enabled", return_value=True),
+        patch("sophon.setup_wizard.card"),
+        patch("sophon.setup_wizard.clear_terminal"),
+        patch("sophon.setup_wizard._read_key", return_value="ENTER"),
+        patch("sophon.setup_wizard.ensure_agent_instructions_file"),
+        patch("sophon.setup_wizard.agent_instructions_path", return_value=tmp_path / "AGENT.md"),
+        patch("sophon.setup_wizard.config_display_path", return_value="~/.sophon/config/config.json"),
+        patch("sophon.setup_wizard.write_config", side_effect=lambda value: saved.update(value) or preference_path),
+    ):
+        assert run_setup_wizard() == 0
+    assert saved["allowed_path"] == ["~/shared"]
+    assert saved["mode"] == preferences["mode"]
+    assert saved["auto_update"] is True

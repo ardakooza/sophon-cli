@@ -109,13 +109,13 @@ def _read_hidden_credential(
         termios.tcsetattr(fd, termios.TCSADRAIN, previous)
 
 
-def _choose_provider() -> str | None:
+def _choose_provider(default_provider: str | None = None, *, title: str = "Setup of Provider") -> str | None:
     choices = ["openrouter", "cloudflare"]
     labels = [PROVIDERS[item]["label"] for item in choices]
-    selected = 0
+    selected = choices.index(default_provider) if default_provider in choices else 0
     interactive = sys.stdin.isatty() and sys.stdout.isatty()
     if not interactive:
-        print("\nProvider setup")
+        print(f"\n{title}")
         for index, label in enumerate(labels, 1):
             print(f"  {index}. {label}")
         print("  0. Cancel")
@@ -132,7 +132,7 @@ def _choose_provider() -> str | None:
     while True:
         clear_terminal()
         card(
-            "Setup of Provider",
+            title,
             [
                 "Choose a service for model requests.",
                 "",
@@ -217,7 +217,7 @@ def _choose_model(provider: str, default_model: str, saved_model: str = "") -> s
             return None
 
 
-def run_setup_wizard() -> int:
+def run_setup_wizard(*, reconfigure: bool = False) -> int:
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         card("Sophon", ["Setup requires an interactive terminal.", "Run sophon setup from Termux or a shell."])
         return 1
@@ -227,7 +227,7 @@ def run_setup_wizard() -> int:
         card("Sophon", ["Existing configuration could not be read.", str(error)])
         return 1
 
-    if existing is not None:
+    if existing is not None and not reconfigure:
         action = _choose_existing_action(existing)
         if action == "keep":
             card(
@@ -243,7 +243,10 @@ def run_setup_wizard() -> int:
             card(None, ["Setup cancelled."], width=16)
             return 1
 
-    provider = _choose_provider()
+    provider = _choose_provider(
+        str(existing.get("provider")) if reconfigure and existing else None,
+        title="Reconfiguration" if reconfigure else "Setup of Provider",
+    )
     if provider is None:
         card(None, ["Setup cancelled."], width=16)
         return 1

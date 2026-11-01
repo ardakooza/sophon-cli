@@ -9,10 +9,10 @@ import os
 import platform
 import re
 import select
-import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unicodedata
@@ -44,6 +44,7 @@ LATEST_VERSION_URL = "https://raw.githubusercontent.com/ardakooza/sophon-cli/mai
 LATEST_VERSION_API_URL = "https://api.github.com/repos/ardakooza/sophon-cli/contents/src/sophon/VERSION"
 RESTART_REQUESTED = False
 RESTART_ARGS: list[str] | None = None
+CONFIG_BACKUP_PATH = Path.home() / ".sophon" / "backup" / "config_backup.json"
 
 
 def paint(text: str, color: str) -> str:
@@ -579,6 +580,133 @@ def auto_update_on_start() -> None:
         update(known_version=remote_version, restart_after=True)
 
 
+def _write_private_bytes(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if os.name != "nt":
+        os.chmod(path.parent.parent, 0o700)
+        os.chmod(path.parent, 0o700)
+    fd, temporary_path = tempfile.mkstemp(prefix=".backup-", suffix=".tmp", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(content)
+        os.replace(temporary_path, path)
+        if os.name != "nt":
+            os.chmod(path, 0o600)
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(temporary_path)
+        except OSError:
+            pass
+        raise
+
+
+def backup_config() -> int:
+    source = config_path()
+    try:
+        if not source.is_file():
+            read_config()  # Migrate a supported legacy config before looking for its current path.
+            source = config_path()
+        raw = source.read_bytes()
+        parsed = json.loads(raw.decode("utf-8"))
+        if not isinstance(parsed, dict):
+            raise ValueError("Configuration must be a JSON object.")
+        _write_private_bytes(CONFIG_BACKUP_PATH, raw)
+    except FileNotFoundError:
+        card("Configuration Backup", ["No saved configuration was found to back up."], border_color=NOTICE_BORDER, text_color=NOTICE_TEXT)
+        return 1
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
+        card("Configuration Backup", [f"Backup failed: {error}"], border_color=NOTICE_BORDER, text_color=NOTICE_TEXT)
+        return 1
+    card(
+        "Configuration Backup",
+        ["Configuration data saved securely.", f"Backup: {display_home_paths(CONFIG_BACKUP_PATH)}"],
+        top_right="Saved",
+    )
+    return 0
+
+
+def _validate_backup_payload(data: dict[str, object]) -> None:
+    provider = data.get("provider")
+    if provider is None:
+        allowed = {
+            "schema_version", "auto_update", "agent_instructions_path", "reasoning",
+            "auto_compression", "auto_compression_threshold", "Environment",
+        }
+        if set(data) - allowed:
+            raise ValueError("Backup contains unsupported preferences-only fields.")
+        if "auto_update" in data and not isinstance(data["auto_update"], bool):
+            raise ValueError("Backup has an invalid auto-update preference.")
+        if "auto_compression" in data and not isinstance(data["auto_compression"], bool):
+            raise ValueError("Backup has an invalid auto-compression preference.")
+        threshold = data.get("auto_compression_threshold")
+        if threshold is not None and (
+            not isinstance(threshold, int) or isinstance(threshold, bool) or not 30 <= threshold <= 95
+        ):
+            raise ValueError("Backup has an auto-compression threshold outside 30–95.")
+        environment = data.get("Environment")
+        if environment is not None and (not isinstance(environment, str) or not environment.strip()):
+            raise ValueError("Backup has an invalid environment label.")
+        return
+    if not isinstance(provider, str) or provider not in PROVIDERS:
+        raise ValueError("Backup names an unsupported provider.")
+    if not isinstance(data.get("model"), str) or not data["model"].strip():
+        raise ValueError("Backup is missing a valid model ID.")
+    if not isinstance(data.get("api_key"), str) or not data["api_key"].strip():
+        raise ValueError("Backup is missing a valid provider credential.")
+    if provider == "cloudflare":
+        account_id = data.get("account_id")
+        if not isinstance(account_id, str) or len(account_id) != 32 or any(
+            character not in "0123456789abcdefABCDEF" for character in account_id
+        ):
+            raise ValueError("Backup has an invalid Cloudflare Account ID.")
+
+
+def restore_config() -> int:
+    try:
+        raw = CONFIG_BACKUP_PATH.read_bytes()
+        data = json.loads(raw.decode("utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("Backup must contain a JSON object.")
+        _validate_backup_payload(data)
+    except FileNotFoundError:
+        card("Configuration Restore", ["No backup found.", f"Expected: {display_home_paths(CONFIG_BACKUP_PATH)}"], border_color=NOTICE_BORDER, text_color=NOTICE_TEXT)
+        return 1
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
+        card("Configuration Restore", [f"Backup could not be restored: {error}"], border_color=NOTICE_BORDER, text_color=NOTICE_TEXT)
+        return 1
+
+    card(
+        "Restore Configuration",
+        [
+            "This will overwrite the current provider settings and preferences.",
+            f"Source: {display_home_paths(CONFIG_BACKUP_PATH)}",
+            "Type RESTORE to confirm; any other input cancels.",
+        ],
+        border_color=UPDATE_BORDER,
+        text_color=UPDATE_TEXT,
+    )
+    try:
+        confirmation = read_prompt("  › ").strip()
+    except (EOFError, KeyboardInterrupt):
+        confirmation = ""
+    if confirmation != "RESTORE":
+        card("Configuration Restore", ["Restore cancelled. No settings were changed."])
+        return 0
+    try:
+        path = write_config(data)
+        read_config()
+    except (OSError, ValueError) as error:
+        card("Configuration Restore", [f"Restore failed: {error}"], border_color=NOTICE_BORDER, text_color=NOTICE_TEXT)
+        return 1
+    card("Configuration Restore", ["Configuration and preferences restored.", f"Config: {display_home_paths(path)}"], top_right="Restored")
+    return 0
+
+
 def run_session() -> int:
     clear_terminal()
     show_welcome(check_updates=False)
@@ -610,10 +738,13 @@ def run_session() -> int:
                     [
                         "/agent — Open Sophon Agent",
                         "/auto-update on|off — Set startup updates",
+                        "/backup — Save a private configuration backup",
                         "/clear — Redraw the welcome screen",
                         "/config — Show saved settings",
                         "/help — Show available commands",
-                        "/identity — View or edit AGENT.md",
+                        "/identity — Edit AGENT.md in the card",
+                        "/reconfig — Reconfigure the provider directly",
+                        "/restore — Restore config backup after confirmation",
                         "/restart — Restart Sophon",
                         "/setup — Configure a provider",
                         "/status — Inspect system and workspace health",
@@ -634,10 +765,20 @@ def run_session() -> int:
                 system_status()
             elif command == "/identity":
                 manage_identity()
+            elif command == "/backup":
+                backup_config()
+            elif command == "/restore":
+                if restore_config() == 0:
+                    show_welcome()
             elif command == "/setup":
                 from sophon.setup_wizard import run_setup_wizard
 
                 if run_setup_wizard() == 0:
+                    show_welcome()
+            elif command == "/reconfig":
+                from sophon.setup_wizard import run_setup_wizard
+
+                if run_setup_wizard(reconfigure=True) == 0:
                     show_welcome()
             elif command == "/config":
                 show_config()
@@ -974,6 +1115,126 @@ def system_status() -> int:
     return 0
 
 
+def _identity_visible_text(text: str, cursor: int, max_cells: int) -> str:
+    if len(text) <= max_cells:
+        return text[:cursor] + "▏" + text[cursor:]
+    start = max(0, min(cursor - max_cells // 2, len(text) - max_cells))
+    end = min(len(text), start + max_cells)
+    fragment = text[start:end]
+    caret = max(0, min(cursor - start, len(fragment)))
+    return ("…" if start else "") + fragment[:caret] + "▏" + fragment[caret:] + ("…" if end < len(text) else "")
+
+
+def _edit_identity_card(path: Path, content: str) -> str | None:
+    from sophon.agent import _read_key
+
+    lines = content.split("\n") if content else [""]
+    trailing_newline = content.endswith("\n")
+    selected = 0
+    cursor = 0
+    scroll = 0
+    while True:
+        size = shutil.get_terminal_size((80, 24))
+        visible_count = max(3, min(18, size.lines - 12))
+        scroll = max(0, min(selected - visible_count // 2, len(lines) - visible_count))
+        inner_width = min(68, max(20, size.columns - 8))
+        max_line_cells = max(8, inner_width - 14)
+        visible = lines[scroll : scroll + visible_count]
+        rows = [
+            f"File: {display_home_paths(path)}",
+            "",
+        ]
+        for index, line in enumerate(visible, scroll):
+            marker = "❯" if index == selected else "·"
+            safe_line = "".join(character if character.isprintable() else "�" for character in line)
+            visible_line = _identity_visible_text(safe_line, cursor, max_line_cells) if index == selected else safe_line[:max_line_cells]
+            rows.append(f"{marker} {index + 1:>3} │ {visible_line}")
+        rows.extend([
+            "",
+            "↑/↓ line · ←/→ caret · Ctrl+N new line · Ctrl+K delete line",
+            "Esc cancel · Press enter to save",
+        ])
+        clear_terminal()
+        card(
+            "Agent Identity",
+            rows,
+            top_right="AGENT.md",
+            border_color=UPDATE_BORDER,
+            text_color=WHITE,
+        )
+        key = _read_key()
+        if key == "UP":
+            selected = max(0, selected - 1)
+            cursor = min(cursor, len(lines[selected]))
+        elif key == "DOWN":
+            selected = min(len(lines) - 1, selected + 1)
+            cursor = min(cursor, len(lines[selected]))
+        elif key == "LEFT":
+            cursor = max(0, cursor - 1)
+        elif key == "RIGHT":
+            cursor = min(len(lines[selected]), cursor + 1)
+        elif key == "BACKSPACE":
+            if cursor:
+                lines[selected] = lines[selected][: cursor - 1] + lines[selected][cursor:]
+                cursor -= 1
+            elif selected:
+                previous_length = len(lines[selected - 1])
+                lines[selected - 1] += lines.pop(selected)
+                selected -= 1
+                cursor = previous_length
+        elif key == "DELETE":
+            if cursor < len(lines[selected]):
+                lines[selected] = lines[selected][:cursor] + lines[selected][cursor + 1 :]
+            elif selected + 1 < len(lines):
+                lines[selected] += lines.pop(selected + 1)
+        elif key == "INSERT_LINE":
+            remainder = lines[selected][cursor:]
+            lines[selected] = lines[selected][:cursor]
+            lines.insert(selected + 1, remainder)
+            selected += 1
+            cursor = 0
+            trailing_newline = False
+        elif key == "DELETE_LINE":
+            if len(lines) > 1:
+                lines.pop(selected)
+                selected = min(selected, len(lines) - 1)
+                cursor = min(cursor, len(lines[selected]))
+            else:
+                lines[0] = ""
+                cursor = 0
+        elif key.startswith("CHAR:"):
+            character = key[5:]
+            lines[selected] = lines[selected][:cursor] + character + lines[selected][cursor:]
+            cursor += len(character)
+        elif key == "ENTER":
+            result = "\n".join(lines)
+            return result + ("\n" if trailing_newline and not result.endswith("\n") else "")
+        elif key in {"CANCEL", "DOUBLE_CANCEL"}:
+            return None
+
+
+def _write_identity_file(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, temporary_path = tempfile.mkstemp(prefix=".AGENT-", suffix=".tmp", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(content)
+        os.replace(temporary_path, path)
+        if os.name != "nt":
+            os.chmod(path, 0o600)
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(temporary_path)
+        except OSError:
+            pass
+        raise
+
+
 def manage_identity() -> int:
     from sophon.agent import _instructions_file
     from sophon.config import ensure_agent_instructions_file
@@ -984,71 +1245,28 @@ def manage_identity() -> int:
         config = {}
     try:
         path = ensure_agent_instructions_file(_instructions_file(config))
-    except (OSError, ValueError) as error:
-        card(
-            "Agent Identity",
-            [f"Could not open AGENT.md: {error}"],
-            border_color=NOTICE_BORDER,
-            text_color=NOTICE_TEXT,
-        )
+        content = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError, ValueError) as error:
+        card("Agent Identity", [f"Could not read AGENT.md: {error}"], border_color=NOTICE_BORDER, text_color=NOTICE_TEXT)
         return 1
 
-    while True:
-        try:
-            content = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeError) as error:
-            card(
-                "Agent Identity",
-                [f"Could not read AGENT.md: {error}"],
-                border_color=NOTICE_BORDER,
-                text_color=NOTICE_TEXT,
-            )
-            return 1
-        lines = content.splitlines() or ["(AGENT.md is empty)"]
-        lines.extend(["", f"File: {display_home_paths(path)}", "E — edit and save · Enter — return"])
-        card("Agent Identity", lines, top_right="AGENT.md")
-        try:
-            action = read_prompt("  › ").strip().casefold()
-        except (EOFError, KeyboardInterrupt):
-            return 0
-        if action not in {"e", "edit"}:
-            return 0
-
-        editor_spec = os.environ.get("VISUAL") or os.environ.get("EDITOR")
-        try:
-            editor = shlex.split(editor_spec) if editor_spec else []
-        except ValueError as error:
-            card("Editor unavailable", [str(error)], border_color=NOTICE_BORDER, text_color=NOTICE_TEXT)
-            return 1
-        if not editor:
-            found = next(
-                (candidate for name in ("nano", "micro", "vi", "vim") if (candidate := shutil.which(name))),
-                None,
-            )
-            if found:
-                editor = [found]
-        executable = shutil.which(editor[0]) if editor else None
-        if not executable:
-            card(
-                "Editor unavailable",
-                ["Set EDITOR or install nano, micro, vi, or vim to edit AGENT.md."],
-                border_color=NOTICE_BORDER,
-                text_color=NOTICE_TEXT,
-            )
-            return 1
-        try:
-            result = subprocess.run([executable, *editor[1:], str(path)], check=False)
-        except OSError as error:
-            card("Editor failed", [str(error)], border_color=NOTICE_BORDER, text_color=NOTICE_TEXT)
-            return 1
-        if result.returncode != 0:
-            card(
-                "Editor failed",
-                [f"Editor exited with status {result.returncode}."],
-                border_color=NOTICE_BORDER,
-                text_color=NOTICE_TEXT,
-            )
-            return result.returncode
+    try:
+        updated = _edit_identity_card(path, content)
+    except (EOFError, KeyboardInterrupt):
+        return 0
+    except (OSError, ValueError) as error:
+        card("Agent Identity", [f"Editor input failed: {error}"], border_color=NOTICE_BORDER, text_color=NOTICE_TEXT)
+        return 1
+    if updated is None:
+        card("Agent Identity", ["Changes discarded.", f"File: {display_home_paths(path)}"])
+        return 0
+    try:
+        _write_identity_file(path, updated)
+    except OSError as error:
+        card("Agent Identity", [f"Could not save AGENT.md: {error}"], border_color=NOTICE_BORDER, text_color=NOTICE_TEXT)
+        return 1
+    card("Agent Identity", ["AGENT.md saved.", f"File: {display_home_paths(path)}"], top_right="Saved")
+    return 0
 
 
 def print_help() -> None:

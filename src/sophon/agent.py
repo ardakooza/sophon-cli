@@ -9,6 +9,7 @@ import json
 import math
 import os
 import queue
+import re
 import shutil
 import stat
 import subprocess
@@ -59,7 +60,7 @@ AGENT_MODES = {"chat", "plan", "build"}
 PLAN_BUILTIN_TOOLS = {"get_version", "is_update", "system_health", "workspace_list", "session_list", "get_time", "get_date"}
 SLASH_COMMANDS = (
     "/auto-compression", "/auto-update", "/cd", "/changelog", "/clear", "/compact", "/cwd", "/delete",
-    "/exit", "/fork", "/help", "/mode", "/model", "/new", "/reasoning",
+    "/exit", "/fork", "/help", "/history", "/mode", "/model", "/new", "/reasoning",
     "/reasoning-effort", "/rename", "/resume", "/review", "/sessions",
     "/threshold", "/undo", "/usage",
 )
@@ -655,6 +656,97 @@ def _execute_builtin_tool(name: str, arguments: object) -> str:
     raise RuntimeError(f"Unknown Sophon built-in tool: {name}")
 
 
+def _decoded_tool_arguments(value: object) -> dict[str, object]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return {"arguments": "[invalid JSON]"}
+    return value if isinstance(value, dict) else {"arguments": "[invalid argument object]"}
+
+
+def _history_safe_arguments(value: object) -> dict[str, object]:
+    arguments = _decoded_tool_arguments(value)
+    safe: dict[str, object] = {}
+    for key, item in arguments.items():
+        name = str(key)
+        normalized = re.sub(r"[^a-z0-9]", "", name.casefold())
+        if any(marker in normalized for marker in ("apikey", "token", "secret", "password", "credential", "authorization", "privatekey")):
+            safe[name] = "[redacted]"
+        elif normalized in {"content", "prompt", "text"} and isinstance(item, str):
+            lines = len(item.splitlines())
+            safe[name] = f"[omitted · {len(item.encode('utf-8'))} bytes · {lines} lines]"
+        elif isinstance(item, (str, int, float, bool)) or item is None:
+            safe[name] = item[:240] + "…" if isinstance(item, str) and len(item) > 240 else item
+        else:
+            safe[name] = "[omitted]"
+    return safe
+
+
+def _change_line_counts(before: bytes | None, after: bytes) -> tuple[int, int]:
+    old_lines = before.decode("utf-8", errors="replace").splitlines() if before is not None else []
+    new_lines = after.decode("utf-8", errors="replace").splitlines()
+    added = removed = 0
+    for operation, old_start, old_end, new_start, new_end in difflib.SequenceMatcher(
+        a=old_lines,
+        b=new_lines,
+        autojunk=False,
+    ).get_opcodes():
+        if operation in {"insert", "replace"}:
+            added += new_end - new_start
+        if operation in {"delete", "replace"}:
+            removed += old_end - old_start
+    return added, removed
+
+
+def _tool_change_details(
+    name: str,
+    arguments: dict[str, object],
+    change_log: list[dict[str, object]] | None,
+    previous_state: dict[str, bytes | None],
+) -> list[dict[str, object]]:
+    if name != "write_file" or change_log is None:
+        return []
+    try:
+        path = _workspace_file(str(arguments.get("path", "")))
+        relative_path = path.relative_to(PROJECT_DIR.resolve()).as_posix()
+    except (OSError, RuntimeError, ValueError):
+        return []
+    change = next((item for item in change_log if item.get("path") == relative_path), None)
+    if not isinstance(change, dict) or not isinstance(change.get("after"), bytes):
+        return []
+    before = previous_state.get(relative_path, change.get("before") if change.get("before_exists") else None)
+    before_bytes = len(before) if isinstance(before, bytes) else 0
+    after = change["after"]
+    added, removed = _change_line_counts(before if isinstance(before, bytes) else None, after)
+    return [{
+        "path": relative_path,
+        "operation": "created" if not change.get("before_exists") and relative_path not in previous_state else "updated",
+        "before_bytes": before_bytes,
+        "after_bytes": len(after),
+        "added_lines": added,
+        "removed_lines": removed,
+    }]
+
+
+def _tool_result_summary(name: str, result: str) -> str:
+    if result.startswith("Tool error:"):
+        return result[:400]
+    if name == "read_file":
+        encoded = result.encode("utf-8")
+        return f"Read file · {len(encoded)} bytes · {len(result.splitlines())} lines."
+    if name == "list_files":
+        count = 0 if result == "This folder is empty." else len(result.splitlines())
+        return f"Listed {count} entries."
+    if name == "session_list":
+        count = len(result.splitlines())
+        return f"Listed {count} saved sessions."
+    if name == "workspace_list":
+        count = len(result.splitlines())
+        return f"Listed {count} workspace entries."
+    return result[:400]
+
+
 def _request(
     config: dict[str, object],
     messages: list[dict[str, object]],
@@ -884,6 +976,7 @@ def _complete_turn(
     cancellation: RequestCancellation | None = None,
     usage_out: dict[str, object] | None = None,
     change_log: list[dict[str, object]] | None = None,
+    activity_out: list[dict[str, object]] | None = None,
 ) -> str:
     messages: list[dict[str, object]] = [
         {"role": "system", "content": _system_message(config, custom_system_prompt, mode)},
@@ -917,19 +1010,40 @@ def _complete_turn(
             if not isinstance(function, dict):
                 continue
             name = str(function.get("name", ""))
+            raw_arguments = function.get("arguments", "{}")
+            decoded_arguments = _decoded_tool_arguments(raw_arguments)
+            safe_arguments = _history_safe_arguments(raw_arguments)
+            previous_state = {
+                str(change.get("path", "")): change.get("after")
+                for change in (change_log or [])
+                if isinstance(change.get("path"), str)
+            }
+            tool_started = time.monotonic()
+            status = "ok"
             try:
                 if mode == "plan" and name not in PLAN_BUILTIN_TOOLS | {"list_files", "read_file"}:
                     raise RuntimeError("This tool is disabled in plan mode; switch to /mode build after approval.")
                 if name in {tool["function"]["name"] for tool in BUILTIN_TOOLS}:
-                    result = _execute_builtin_tool(name, function.get("arguments", "{}"))
+                    result = _execute_builtin_tool(name, raw_arguments)
                 else:
                     result = _execute_workspace_tool(
                         name,
-                        function.get("arguments", "{}"),
+                        raw_arguments,
                         change_log=change_log,
                     )
-            except (RuntimeError, OSError, ValueError) as error:
+            except (RuntimeError, OSError, ValueError, KeyError, TypeError) as error:
                 result = f"Tool error: {error}"
+                status = "error"
+            if activity_out is not None:
+                activity_out.append({
+                    "timestamp": _timestamp(),
+                    "tool": name,
+                    "arguments": safe_arguments,
+                    "status": status,
+                    "summary": _tool_result_summary(name, result),
+                    "duration_ms": round((time.monotonic() - tool_started) * 1000),
+                    "changes": _tool_change_details(name, decoded_arguments, change_log, previous_state),
+                })
             messages.append({
                 "role": "tool",
                 "tool_call_id": str(call.get("id", "")),
@@ -980,6 +1094,8 @@ def _new_session() -> dict[str, object]:
         "messages": [],
         "usage": _fresh_usage(),
         "workspace_dir": str(PROJECT_DIR.resolve()),
+        "workspace_root": str(WORKSPACE_ROOT.resolve()),
+        "activity_log": [],
     }
 
 
@@ -995,27 +1111,52 @@ def _fork_session(source: dict[str, object]) -> dict[str, object]:
         "messages": [dict(message) for message in source.get("messages", [])],
         "usage": _fresh_usage(),
         "workspace_dir": str(_session_workspace_path(source)),
+        "workspace_root": str(_session_workspace_root(source)),
+        "activity_log": [],
     }
 
 
-def _validated_workspace_directory(value: str | Path, *, relative_to: Path | None = None) -> Path:
-    root = WORKSPACE_ROOT.resolve()
+def _validated_workspace_directory(
+    value: str | Path,
+    *,
+    relative_to: Path | None = None,
+    workspace_root: Path | None = None,
+    allow_root: bool = False,
+) -> Path:
+    root = (workspace_root or WORKSPACE_ROOT).expanduser().resolve()
     requested = Path(value).expanduser()
     if not requested.is_absolute():
         requested = (relative_to or PROJECT_DIR) / requested
     candidate = requested.resolve()
-    if candidate == root or root not in candidate.parents:
-        raise RuntimeError("Choose a project directory inside the Sophon workspace; the workspace root is not a project.")
+    if (candidate == root and not allow_root) or (candidate != root and root not in candidate.parents):
+        raise RuntimeError("Choose a project directory inside the directory tree shown by /cd.")
     if not candidate.is_dir():
         raise RuntimeError("The requested workspace directory does not exist.")
     return candidate
+
+
+def _session_workspace_root(session: dict[str, object]) -> Path:
+    saved_root = session.get("workspace_root")
+    if isinstance(saved_root, str) and saved_root.strip():
+        try:
+            candidate = Path(saved_root).expanduser().resolve()
+            if candidate.is_dir():
+                return candidate
+        except (OSError, ValueError):
+            pass
+    return WORKSPACE_ROOT.resolve()
 
 
 def _session_workspace_path(session: dict[str, object]) -> Path:
     saved = session.get("workspace_dir")
     if isinstance(saved, str) and saved.strip():
         try:
-            return _validated_workspace_directory(saved, relative_to=WORKSPACE_ROOT)
+            return _validated_workspace_directory(
+                saved,
+                relative_to=_session_workspace_root(session),
+                workspace_root=_session_workspace_root(session),
+                allow_root=True,
+            )
         except (OSError, RuntimeError, ValueError):
             pass
     return (WORKSPACE_ROOT / "my-project").resolve()
@@ -1025,6 +1166,7 @@ def _activate_session_workspace(session: dict[str, object]) -> Path:
     global PROJECT_DIR
     PROJECT_DIR = _session_workspace_path(session)
     session["workspace_dir"] = str(PROJECT_DIR)
+    session["workspace_root"] = str(_session_workspace_root(session))
     return PROJECT_DIR
 
 
@@ -1067,7 +1209,19 @@ def _load_sessions() -> list[dict[str, object]]:
         item.setdefault("mode", "chat")
         if item.get("mode") not in AGENT_MODES:
             item["mode"] = "chat"
+        item["workspace_root"] = str(_session_workspace_root(item))
         item["workspace_dir"] = str(_session_workspace_path(item))
+        activity_log = item.get("activity_log")
+        if not isinstance(activity_log, list):
+            activity_log = []
+        item["activity_log"] = [
+            event
+            for event in activity_log[-250:]
+            if isinstance(event, dict)
+            and isinstance(event.get("tool"), str)
+            and isinstance(event.get("summary"), str)
+            and isinstance(event.get("timestamp"), str)
+        ]
         usage = item.get("usage")
         if not isinstance(usage, dict):
             item["usage"] = _fresh_usage()
@@ -1568,6 +1722,10 @@ def _read_key_raw(timeout: float | None = None) -> str:
         return "CANCEL"
     if first == b"\x12":
         return "TOGGLE_REASONING"
+    if first == b"\x0e":
+        return "INSERT_LINE"
+    if first == b"\x0b":
+        return "DELETE_LINE"
     if first in {b"\x08", b"\x7f"}:
         return "BACKSPACE"
     if first == b"\x1b":
@@ -1580,6 +1738,8 @@ def _read_key_raw(timeout: float | None = None) -> str:
                 break
         if sequence == b"\x1b":
             return "DOUBLE_CANCEL"
+        if bytes(sequence) in {b"[3~", b"O3~"}:
+            return "DELETE"
         return {b"A": "UP", b"B": "DOWN", b"C": "RIGHT", b"D": "LEFT"}.get(bytes(sequence[-1:]), "OTHER")
     first_byte = first[0]
     expected_bytes = 1 if first_byte < 0x80 else 2 if first_byte < 0xE0 else 3 if first_byte < 0xF0 else 4
@@ -2197,29 +2357,150 @@ def _sessions_panel_rows(
     return rows
 
 
-def _workspace_directory_items() -> list[dict[str, object]]:
-    root = WORKSPACE_ROOT.resolve()
-    directories: list[Path] = []
-    try:
-        directories = sorted(
-            (path.resolve() for path in root.iterdir() if path.is_dir()),
-            key=lambda path: path.name.casefold(),
+def _directory_browser_root(session: dict[str, object]) -> Path:
+    saved_root = _session_workspace_root(session)
+    if saved_root != WORKSPACE_ROOT.resolve():
+        return saved_root
+    return Path.cwd().resolve()
+
+
+def _directory_tree_nodes(root: Path, *, max_depth: int = 5, max_nodes: int = 500) -> list[dict[str, object]]:
+    base = root.expanduser().resolve()
+    nodes: list[dict[str, object]] = [{
+        "id": str(base),
+        "path": str(base),
+        "directory": True,
+        "depth": 0,
+        "tree": (base.name or str(base)) + "/",
+    }]
+    truncated = False
+
+    def visit(directory: Path, depth: int, prefix: str) -> None:
+        nonlocal truncated
+        if depth >= max_depth or truncated:
+            return
+        try:
+            entries = list(directory.iterdir())
+        except OSError:
+            return
+        ignored_directories = {".git", ".hg", ".svn", "node_modules", ".venv", "venv", "__pycache__", ".pytest_cache"}
+
+        def entry_key(entry: Path) -> tuple[bool, str]:
+            try:
+                is_directory = entry.is_dir() and not entry.is_symlink()
+            except OSError:
+                is_directory = False
+            return not is_directory, entry.name.casefold()
+
+        entries.sort(key=entry_key)
+        for index, entry in enumerate(entries):
+            if entry.name in ignored_directories and entry.is_dir() and not entry.is_symlink():
+                continue
+            if len(nodes) >= max_nodes:
+                truncated = True
+                return
+            try:
+                is_directory = entry.is_dir() and not entry.is_symlink()
+                resolved = entry.resolve()
+                if resolved != base and base not in resolved.parents:
+                    continue
+            except OSError:
+                is_directory = False
+                resolved = entry
+            is_last = index + 1 == len(entries)
+            branch = "└── " if is_last else "├── "
+            relative_tree = prefix + branch + entry.name + ("/" if is_directory else "")
+            node = {
+                "id": str(resolved),
+                "path": str(resolved),
+                "directory": is_directory,
+                "depth": depth + 1,
+                "tree": relative_tree,
+            }
+            nodes.append(node)
+            if is_directory:
+                visit(resolved, depth + 1, prefix + ("    " if is_last else "│   "))
+                if truncated:
+                    return
+
+    visit(base, 0, "")
+    if truncated:
+        nodes.append({"id": "__truncated__", "directory": False, "depth": max_depth, "tree": "… more entries omitted"})
+    return nodes
+
+
+def _pick_directory_tree(
+    session: dict[str, object],
+    draw,
+    root: Path,
+    current: Path,
+) -> Path | None:
+    root = root.expanduser().resolve()
+    nodes = _directory_tree_nodes(root)
+    directory_positions = [index for index, node in enumerate(nodes) if node.get("directory") is True]
+    if not directory_positions:
+        return None
+    current_path = current.expanduser().resolve()
+    selected = next(
+        (position for position, node_index in enumerate(directory_positions) if nodes[node_index].get("path") == str(current_path)),
+        min(1, len(directory_positions) - 1),
+    )
+
+    while True:
+        size = shutil.get_terminal_size((80, 24))
+        selected_node_index = directory_positions[selected]
+        visible_count = max(2, min(18, size.lines - 20))
+        start = max(0, min(selected_node_index - visible_count // 2, len(nodes) - visible_count))
+        visible = nodes[start : start + visible_count]
+        tree_rows: list[str] = []
+        for index, node in enumerate(visible, start):
+            tree = str(node.get("tree", ""))
+            if node.get("id") == "__truncated__":
+                tree_rows.append("  " + tree)
+                continue
+            if node.get("directory") is True:
+                marker = "❯" if index == selected_node_index else "·"
+            else:
+                marker = " "
+            tree_rows.append(f"{marker} {tree}")
+        footer = "[ENTER] select · [ARROW KEYS] navigate · [ESC] back"
+        panel = _card_rows(
+            "Change Directory",
+            [f"Root: {display_home_paths(root)}", "", *tree_rows, "", footer],
+            columns=size.columns,
+            top_left=root.name or str(root),
+            top_right=f"{selected + 1} of {len(directory_positions)}",
         )
-    except OSError:
-        pass
-    current = PROJECT_DIR.resolve()
-    if current.is_dir() and current not in directories:
-        directories.append(current)
-    return [
-        {
-            "id": str(path),
-            "title": path.name or "Workspace root",
-            "label": f"{path.name or 'Workspace root'} · {display_home_paths(path)}",
-            "path": str(path),
-        }
-        for path in directories
-        if root in path.parents
-    ]
+        draw("", 0, panel_rows=panel, placeholder="Choose a directory from the tree")
+        key = _read_key(timeout=0.2)
+        if key == "TIMEOUT":
+            continue
+        if key in {"UP", "LEFT"}:
+            if key == "UP":
+                selected = (selected - 1) % len(directory_positions)
+            else:
+                parent = Path(str(nodes[selected_node_index].get("path", root))).parent
+                selected = next(
+                    (position for position, node_index in enumerate(directory_positions) if nodes[node_index].get("path") == str(parent)),
+                    selected,
+                )
+        elif key in {"DOWN", "RIGHT"}:
+            if key == "DOWN":
+                selected = (selected + 1) % len(directory_positions)
+            else:
+                selected_path = Path(str(nodes[selected_node_index].get("path", root)))
+                selected = next(
+                    (
+                        position
+                        for position, node_index in enumerate(directory_positions)
+                        if Path(str(nodes[node_index].get("path", root))).parent == selected_path
+                    ),
+                    selected,
+                )
+        elif key == "ENTER":
+            return Path(str(nodes[directory_positions[selected]].get("path", root)))
+        elif key == "CANCEL" or key.startswith("CHAR:") and key[5:].casefold() == "q":
+            return None
 
 
 def _restore_workspace_changes(changes: list[dict[str, object]]) -> str:
@@ -2399,6 +2680,91 @@ def _usage_panel_rows(session: dict[str, object], config: dict[str, object]) -> 
         "",
         *_provider_limit_rows(config),
     ]
+
+
+def _history_display_text(value: object, limit: int = 400) -> str:
+    text = str(value)
+    text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
+    text = "".join(character for character in text if character.isprintable() or character in "\t ")
+    return text[:limit] + ("…" if len(text) > limit else "")
+
+
+def _history_int(value: object) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def _history_panel(session: dict[str, object], draw) -> None:
+    stored = session.get("activity_log")
+    events = list(reversed(stored[-250:])) if isinstance(stored, list) else []
+    selected = 0
+    while True:
+        if not events:
+            body = ["No tool calls have been recorded for this session yet.", "", "↑/↓ browse · Esc return"]
+            panel = _card_rows(
+                "Agent History",
+                body,
+                columns=shutil.get_terminal_size((80, 24)).columns,
+                top_left="This session",
+                top_right="0 of 0",
+            )
+        else:
+            event = events[selected]
+            arguments = event.get("arguments") if isinstance(event.get("arguments"), dict) else {}
+            argument_rows = [
+                f"{_history_display_text(key, 60)}: {_history_display_text(value, 140)}"
+                for key, value in arguments.items()
+            ]
+            changes = event.get("changes") if isinstance(event.get("changes"), list) else []
+            change_rows = []
+            for change in changes:
+                if not isinstance(change, dict):
+                    continue
+                change_rows.append(
+                    "  "
+                    + _history_display_text(change.get("operation", "updated"), 20)
+                    + " · "
+                    + _history_display_text(change.get("path", "unknown file"), 160)
+                    + f" · +{_history_int(change.get('added_lines'))}/-{_history_int(change.get('removed_lines'))} lines"
+                    + f" · {_history_int(change.get('before_bytes'))}→{_history_int(change.get('after_bytes'))} bytes"
+                )
+            event_time = _history_display_text(event.get("timestamp", "Unknown time"), 40).replace("T", " ")
+            status = _history_display_text(event.get("status", "ok"), 20).upper()
+            body = [
+                f"Time: {event_time}",
+                f"Tool: {_history_display_text(event.get('tool', 'unknown'), 80)} · {status}",
+                f"Duration: {_history_int(event.get('duration_ms'))} ms",
+                "",
+                "Arguments:",
+                *(argument_rows or ["  No arguments"]),
+                "",
+                "Result:",
+                _history_display_text(event.get("summary", "No result summary"), 400),
+            ]
+            if changes:
+                body.extend(["", "File changes:", *(change_rows or ["  No file change recorded"])])
+            body.extend(["", "↑/↓ older/newer · Esc return"])
+            panel = _card_rows(
+                "Agent History",
+                body,
+                columns=shutil.get_terminal_size((80, 24)).columns,
+                top_left="This session",
+                top_right=f"{selected + 1} of {len(events)}",
+                border_color=NOTICE_BORDER if status == "ERROR" else BORDER,
+            )
+        draw("", 0, panel_rows=panel, placeholder="Browse this session's activity")
+        key = _read_key(timeout=0.2)
+        if key == "TIMEOUT":
+            continue
+        if key in {"CANCEL", "ENTER"} or key.startswith("CHAR:") and key[5:].casefold() == "q":
+            return
+        if events and key == "UP":
+            selected = min(len(events) - 1, selected + 1)
+        elif events and key == "DOWN":
+            selected = max(0, selected - 1)
+        elif events and key == "LEFT":
+            selected = len(events) - 1
+        elif events and key == "RIGHT":
+            selected = 0
 
 
 def _interactive(config: dict[str, object]) -> int:
@@ -2610,7 +2976,7 @@ def _interactive(config: dict[str, object]) -> int:
                     [
                         "/auto-compression on|off — Toggle automatic mode",
                         "/auto-update on|off — Toggle automatic startup updates",
-                        "/cd [path] — Select a project directory in the workspace",
+                        "/cd [path] — Browse current directory, up to five levels deep",
                         "/changelog — Show latest changes",
                         "/clear — Clear the screen, keep this session",
                         "/compact — Summarize context at 50% or more",
@@ -2620,6 +2986,7 @@ def _interactive(config: dict[str, object]) -> int:
                         "/exit or Q — Close Sophon Agent",
                         "/fork — Fork a saved session",
                         "/help — Show available commands",
+                        "/history — Inspect this session's tool and file-change log",
                         "/mode plan|build|chat — Set the Agent mode",
                         "/model [search] — Choose a model",
                         "/new — Start a new session",
@@ -2643,7 +3010,9 @@ def _interactive(config: dict[str, object]) -> int:
                         f"Version: {VERSION}",
                         f"Last updated: {updated}",
                         "",
-                        "Added: /cd workspace selection, and main-TUI /agent, /status, and /identity commands.",
+                        "Added: /cd five-level tree, /history tool/change log, and main-TUI /agent, /status, /identity.",
+                        "Added: main-TUI /backup, confirmed /restore, and direct /reconfig.",
+                        "Improved: /identity edits AGENT.md in-card with arrow-key line/caret navigation.",
                         "Improved: /sessions opens saved sessions; each session retains its project directory.",
                         "Improved: reasoning details start folded; Ctrl+R toggles the muted disclosure.",
                         "Improved: credential input is masked inside its card; setup ends with one completion card.",
@@ -2662,33 +3031,48 @@ def _interactive(config: dict[str, object]) -> int:
                 if not save_current():
                     continue
                 old_directory = PROJECT_DIR
+                old_root = str(session.get("workspace_root", WORKSPACE_ROOT))
+                browser_root = _directory_browser_root(session)
                 if argument:
                     try:
-                        target_directory = _validated_workspace_directory(argument)
+                        target_directory = _validated_workspace_directory(
+                            argument,
+                            relative_to=browser_root,
+                            workspace_root=browser_root,
+                            allow_root=True,
+                        )
+                        if len(target_directory.relative_to(browser_root).parts) > 5:
+                            raise RuntimeError("Choose a directory no more than five levels below the current directory.")
                     except (OSError, RuntimeError, ValueError) as error:
                         notice("Directory unchanged", str(error), error=True)
                         continue
                 else:
-                    selected_directory = _pick_item(
+                    selected_directory = _pick_directory_tree(
                         session,
                         draw,
-                        _workspace_directory_items(),
-                        title="Change Directory",
-                        current_id=str(PROJECT_DIR.resolve()),
+                        browser_root,
+                        PROJECT_DIR,
                     )
                     if selected_directory is None:
                         notice("Directory selection cancelled", "The active project is unchanged.")
                         continue
                     try:
-                        target_directory = _validated_workspace_directory(str(selected_directory.get("path", "")))
+                        target_directory = _validated_workspace_directory(
+                            selected_directory,
+                            relative_to=browser_root,
+                            workspace_root=browser_root,
+                            allow_root=True,
+                        )
                     except (OSError, RuntimeError, ValueError) as error:
                         notice("Directory unchanged", str(error), error=True)
                         continue
                 PROJECT_DIR = target_directory
                 session["workspace_dir"] = str(PROJECT_DIR)
+                session["workspace_root"] = str(browser_root)
                 if not save_current():
                     PROJECT_DIR = old_directory
                     session["workspace_dir"] = str(old_directory)
+                    session["workspace_root"] = old_root
                     continue
                 notice("Active project directory", display_home_paths(PROJECT_DIR))
             elif command == "cwd":
@@ -2700,6 +3084,9 @@ def _interactive(config: dict[str, object]) -> int:
                     _usage_panel_rows(session, config),
                     columns=shutil.get_terminal_size((80, 24)).columns,
                 )
+            elif command == "history":
+                _history_panel(session, draw)
+                notice_rows = []
             elif command == "review":
                 changes = last_changes_by_session.get(str(session.get("id")), [])
                 if not changes:
@@ -2776,7 +3163,10 @@ def _interactive(config: dict[str, object]) -> int:
                 else:
                     notice("Session selection cancelled", "The current session is still open.")
             elif command == "new":
+                workspace_root = _session_workspace_root(session)
                 session = _new_session()
+                session["workspace_root"] = str(workspace_root)
+                session["workspace_dir"] = str(PROJECT_DIR.resolve())
                 display_message_start = 0
                 notice_plain("New session created.")
             elif command == "clear":
@@ -3082,6 +3472,7 @@ def _interactive(config: dict[str, object]) -> int:
         turn_session_id = str(session.get("id", ""))
         turn_usage = _fresh_usage()
         turn_changes: list[dict[str, object]] = []
+        turn_activity: list[dict[str, object]] = []
         request_messages = [
             item for item in messages if item["role"] in {"user", "assistant"}
         ]
@@ -3097,6 +3488,7 @@ def _interactive(config: dict[str, object]) -> int:
                     cancellation=cancellation,
                     usage_out=turn_usage,
                     change_log=turn_changes,
+                    activity_out=turn_activity,
                 )
             except Exception as error:
                 events.put(("error", error))
@@ -3209,6 +3601,11 @@ def _interactive(config: dict[str, object]) -> int:
         answering["reasoning"] = ""
         answering["interrupt_warning"] = False
         _merge_session_usage(session, turn_usage)
+        activity_log = session.get("activity_log")
+        if not isinstance(activity_log, list):
+            activity_log = []
+        if turn_activity:
+            session["activity_log"] = [*activity_log, *turn_activity][-250:]
         if turn_changes:
             last_changes_by_session[turn_session_id] = turn_changes
         refresh_sessions_after_tools()

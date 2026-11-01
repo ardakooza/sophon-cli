@@ -1064,7 +1064,7 @@ def test_manual_compact_requires_threshold_and_saves_summary(tmp_path):
 def test_changelog_shows_release_and_last_updated_date():
     from sophon import agent
 
-    commands = iter(["/changelog", "/exit"])
+    commands = iter(["/changelog", "/help", "/exit"])
     captured = []
 
     def fake_draw(session, text, cursor, **kwargs):
@@ -1085,6 +1085,7 @@ def test_changelog_shows_release_and_last_updated_date():
     assert "Last updated:" in rendered
     assert "/sessions" in rendered
     assert "/undo" in rendered and "/review" in rendered and "/usage" in rendered
+    assert "/history" in rendered and "five levels deep" in rendered
     assert "double-Esc" in rendered
     assert "30–95%" in rendered
     assert "argument-aware command completion" in rendered
@@ -1433,6 +1434,7 @@ def test_usage_panel_reports_session_totals_and_openrouter_remaining_limits():
 
 
 def test_agent_undo_and_review_commands_follow_the_last_workspace_edit(tmp_path):
+    import json
     from sophon import agent
 
     project = tmp_path / "project"
@@ -1447,6 +1449,15 @@ def test_agent_undo_and_review_commands_follow_the_last_workspace_edit(tmp_path)
             {"path": "created.txt", "content": "hello\n"},
             change_log=kwargs["change_log"],
         )
+        kwargs["activity_out"].append({
+            "timestamp": "2026-11-01T12:00:00+03:00",
+            "tool": "write_file",
+            "arguments": {"path": "created.txt", "content": "[omitted]"},
+            "status": "ok",
+            "summary": "Wrote created.txt.",
+            "duration_ms": 1,
+            "changes": [{"path": "created.txt", "operation": "created", "added_lines": 1}],
+        })
         return "Created the file."
 
     def fake_review(config, task, changes, usage_out):
@@ -1478,6 +1489,9 @@ def test_agent_undo_and_review_commands_follow_the_last_workspace_edit(tmp_path)
     assert review_calls[0][0] == "Create a file"
     assert review_calls[0][1][0]["path"] == "created.txt"
     assert not (project / "created.txt").exists()
+    stored = json.loads(sessions_file.read_text(encoding="utf-8"))[0]
+    assert stored["activity_log"][0]["tool"] == "write_file"
+    assert stored["activity_log"][0]["summary"] == "Wrote created.txt."
 
 
 def test_sessions_panel_sorts_by_title_and_shows_context_and_date():
@@ -1617,32 +1631,39 @@ def test_plan_mode_blocks_unexpected_mutating_tool_calls():
     assert "disabled in plan mode" in captured["messages"][-1]["content"]
 
 
-def test_agent_cd_changes_only_to_workspace_directories_and_persists_path(tmp_path):
+def test_agent_cd_browses_current_directory_and_persists_safe_root(tmp_path):
     from sophon import agent
 
     workspace = tmp_path / "workspace"
     current = workspace / "my-project"
-    target = workspace / "CaseSensitiveProject"
+    browser_root = tmp_path / "checkout"
+    target = browser_root / "src" / "CaseSensitiveProject"
     outside = tmp_path / "outside"
     current.mkdir(parents=True)
-    target.mkdir()
+    target.mkdir(parents=True)
+    browser_root.mkdir(exist_ok=True)
     outside.mkdir()
     sessions_file = tmp_path / "sessions" / "sessions.json"
-    commands = iter([f"/cd {target}", "/rename switched", f"/cd {outside}", "/exit"])
+    commands = iter([f"/cd {target}", "/rename switched", f"/cd {outside}", "/new", "hello", "/exit"])
 
     with (
         patch("sophon.agent.WORKSPACE_ROOT", workspace),
         patch("sophon.agent.PROJECT_DIR", current),
+        patch("sophon.agent.Path.cwd", return_value=browser_root),
         patch("sophon.agent.SESSION_FILE", sessions_file),
         patch("sophon.agent.LEGACY_SESSION_FILE", tmp_path / "legacy.json"),
         patch("sophon.agent._input_bar", side_effect=lambda *args, **kwargs: next(commands)),
+        patch("sophon.agent._complete_turn", return_value="Done."),
         patch("sophon.agent._draw_screen"),
     ):
         assert agent._interactive({"provider": "openrouter", "model": "test", "context_window": 1024}) == 0
         saved = agent._load_sessions()
         assert agent.PROJECT_DIR == target
 
-    assert saved[0]["workspace_dir"] == str(target.resolve())
+    created = next(item for item in saved if item["title"] == "hello")
+    assert created["workspace_dir"] == str(target.resolve())
+    assert created["workspace_root"] == str(browser_root.resolve())
+    assert created["messages"][-1]["content"] == "Done."
 
 
 def test_sessions_picker_uses_fork_style_and_opens_selected_workspace(tmp_path):
@@ -1785,27 +1806,226 @@ def test_identity_command_displays_and_saves_agent_instructions(tmp_path):
     from sophon import core
     from sophon.config import agent_instructions_path
 
-    output = StringIO()
-    prompts = iter(["e", ""])
-
-    def fake_editor(arguments, check):
-        Path(arguments[-1]).write_text("# Updated Identity\nBe careful.\n", encoding="utf-8")
-        return subprocess.CompletedProcess(arguments, 0)
+    keys = iter(["DOWN", "CHAR:Please ", "ENTER"])
+    cards = []
+    instructions = "# Instructions\nBe concise.\n"
 
     with (
-        patch.dict(os.environ, {"XDG_CONFIG_HOME": str(tmp_path), "EDITOR": "fake-editor --wait"}),
+        patch.dict(os.environ, {"XDG_CONFIG_HOME": str(tmp_path)}),
         patch("sophon.core.read_config", return_value=None),
-        patch("sophon.core.read_prompt", side_effect=lambda *args, **kwargs: next(prompts)),
-        patch("sophon.core.shutil.which", return_value="/usr/bin/fake-editor"),
-        patch("sophon.core.subprocess.run", side_effect=fake_editor) as run_editor,
-        patch("sys.stdout", output),
+        patch("sophon.core.clear_terminal"),
+        patch("sophon.core.card", side_effect=lambda *args, **kwargs: cards.append((args, kwargs))),
+        patch("sophon.agent._read_key", side_effect=lambda: next(keys)),
     ):
+        identity_path = agent_instructions_path()
+        identity_path.parent.mkdir(parents=True, exist_ok=True)
+        identity_path.write_text(instructions, encoding="utf-8")
         assert core.manage_identity() == 0
         path = agent_instructions_path()
-    assert path.read_text(encoding="utf-8") == "# Updated Identity\nBe careful.\n"
-    assert "Agent Identity" in output.getvalue()
-    assert "# Updated Identity" in output.getvalue()
-    run_editor.assert_called_once()
+    assert path.read_text(encoding="utf-8") == "# Instructions\nPlease Be concise.\n"
+    rendered = "\n".join(str(call) for call in cards)
+    assert "Agent Identity" in rendered
+    assert "Press enter to save" in rendered
+    assert "E — edit" not in rendered
+
+
+def test_directory_tree_picker_is_current_directory_relative_and_depth_limited(tmp_path):
+    from sophon.agent import _directory_tree_nodes, _pick_directory_tree
+
+    root = tmp_path / "checkout"
+    nested = root / "src" / "components" / "ui"
+    nested.mkdir(parents=True)
+    (nested / "Button.tsx").write_text("export {}\n", encoding="utf-8")
+    deep = root
+    for index in range(1, 7):
+        deep = deep / f"level{index}"
+        deep.mkdir()
+    nodes = _directory_tree_nodes(root, max_depth=5)
+    paths = {Path(str(node.get("path", ""))) for node in nodes if node.get("directory") is True}
+    assert (root / "src").resolve() in paths
+    assert (root / "src" / "components" / "ui").resolve() in paths
+    assert (root / "level1" / "level2" / "level3" / "level4" / "level5").resolve() in paths
+    assert (root / "level1" / "level2" / "level3" / "level4" / "level5" / "level6").resolve() not in paths
+    assert any("Button.tsx" in str(node.get("tree")) for node in nodes)
+
+    rendered = []
+    with (
+        patch("sophon.agent._read_key", side_effect=["DOWN", "ENTER"]),
+        patch("sophon.agent.shutil.get_terminal_size", return_value=os.terminal_size((100, 30))),
+    ):
+        selected = _pick_directory_tree(
+            {"workspace_root": str(root)},
+            lambda *args, **kwargs: rendered.append(kwargs["panel_rows"]),
+            root,
+            tmp_path / "other-project",
+        )
+    assert selected == (root / "level1" / "level2").resolve()
+    assert "[ENTER] select · [ARROW KEYS] navigate · [ESC] back" in "\n".join(rendered[-1])
+    assert any("of" in row for row in rendered[-1])
+
+
+def test_complete_turn_records_redacted_tool_activity_and_file_change_details(tmp_path):
+    import json
+    from sophon.agent import _complete_turn
+
+    project = tmp_path / "project"
+    project.mkdir()
+    activity = []
+    changes = []
+    calls = 0
+
+    def fake_request(config, messages, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            kwargs["tool_calls_out"].append({
+                "id": "write-1",
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "arguments": json.dumps({"path": "secret.txt", "content": "private\nvalue\n"}),
+                },
+            })
+            return ""
+        return "Done."
+
+    with patch("sophon.agent.PROJECT_DIR", project), patch("sophon.agent._request", side_effect=fake_request):
+        answer = _complete_turn(
+            {"provider": "openrouter", "model": "test", "api_key": "key"},
+            [{"role": "user", "content": "write a file"}],
+            change_log=changes,
+            activity_out=activity,
+        )
+    assert answer == "Done."
+    assert len(activity) == 1
+    event = activity[0]
+    assert event["tool"] == "write_file" and event["status"] == "ok"
+    assert "private" not in str(event["arguments"])
+    assert event["arguments"]["content"].startswith("[omitted")
+    assert event["changes"][0]["path"] == "secret.txt"
+    assert event["changes"][0]["added_lines"] == 2
+    assert "private" not in event["summary"]
+    assert (project / "secret.txt").read_text(encoding="utf-8") == "private\nvalue\n"
+
+
+def test_activity_history_redacts_credential_key_spellings():
+    from sophon.agent import _history_safe_arguments
+
+    safe = _history_safe_arguments({
+        "apiKey": "camel-secret",
+        "api-key": "dash-secret",
+        "Authorization": "Bearer secret",
+        "private_key": "private-secret",
+        "ordinary": "visible",
+    })
+    assert safe == {
+        "apiKey": "[redacted]",
+        "api-key": "[redacted]",
+        "Authorization": "[redacted]",
+        "private_key": "[redacted]",
+        "ordinary": "visible",
+    }
+
+
+def test_history_panel_shows_latest_tool_details_and_navigates_to_older_events():
+    from sophon.agent import _history_panel
+
+    session = {"activity_log": [
+        {
+            "timestamp": "2026-11-01T12:00:00+03:00",
+            "tool": "read_file",
+            "arguments": {"path": "src/app.py"},
+            "status": "ok",
+            "summary": "Read file · 40 bytes · 2 lines.",
+            "duration_ms": 2,
+            "changes": [],
+        },
+        {
+            "timestamp": "2026-11-01T12:01:00+03:00",
+            "tool": "write_file",
+            "arguments": {"path": "src/app.py", "content": "[omitted · 3 bytes · 1 lines]"},
+            "status": "ok",
+            "summary": "Wrote src/app.py.",
+            "duration_ms": 4,
+            "changes": [{"path": "src/app.py", "operation": "updated", "added_lines": 1, "removed_lines": 1, "before_bytes": 40, "after_bytes": 3}],
+        },
+    ]}
+    rendered = []
+    with (
+        patch("sophon.agent._read_key", side_effect=["UP", "CANCEL"]),
+        patch("sophon.agent.shutil.get_terminal_size", return_value=os.terminal_size((100, 30))),
+    ):
+        _history_panel(session, lambda *args, **kwargs: rendered.append(kwargs["panel_rows"]))
+    latest = "\n".join(rendered[0])
+    earlier = "\n".join(rendered[1])
+    assert "write_file" in latest and "src/app.py" in latest and "+1/-1 lines" in latest
+    assert "read_file" in earlier and "40 bytes" in earlier
+    assert "Press enter" not in latest
+
+
+def test_config_backup_and_restore_require_confirmation_and_preserve_all_fields(tmp_path):
+    import json
+    from sophon import core
+
+    backup_path = tmp_path / ".sophon" / "backup" / "config_backup.json"
+    cards = []
+    initial = {
+        "schema_version": 1,
+        "provider": "openrouter",
+        "model": "saved-model",
+        "api_key": "saved-secret",
+        "auto_update": True,
+        "custom_metadata": {"keep": "me"},
+    }
+    with (
+        patch.dict(os.environ, {"XDG_CONFIG_HOME": str(tmp_path / "xdg")} ),
+        patch("sophon.core.CONFIG_BACKUP_PATH", backup_path),
+        patch("sophon.core.card", side_effect=lambda *args, **kwargs: cards.append((args, kwargs))),
+        patch("sophon.core.read_prompt", side_effect=["no", "RESTORE"]),
+    ):
+        write_config(initial)
+        assert core.backup_config() == 0
+        assert json.loads(backup_path.read_text(encoding="utf-8")) == initial
+        assert backup_path.stat().st_mode & 0o777 == 0o600
+        write_config({**initial, "model": "new-model", "api_key": "new-secret", "auto_update": False})
+        assert core.restore_config() == 0
+        assert json.loads(config_path().read_text(encoding="utf-8"))["model"] == "new-model"
+        assert core.restore_config() == 0
+        restored = json.loads(config_path().read_text(encoding="utf-8"))
+    assert restored["model"] == "saved-model"
+    assert restored["api_key"] == "saved-secret"
+    assert restored["auto_update"] is True
+    assert restored["custom_metadata"] == {"keep": "me"}
+    assert "new-secret" not in "\n".join(str(card_call) for card_call in cards)
+
+
+def test_reconfiguration_starts_at_provider_picker_without_existing_provider_prompt(tmp_path):
+    from sophon.setup_wizard import run_setup_wizard
+
+    existing = {"provider": "cloudflare", "model": "old-model", "api_key": "old-key"}
+    selected = {}
+    with (
+        patch("sophon.setup_wizard.sys.stdin.isatty", return_value=True),
+        patch("sophon.setup_wizard.sys.stdout.isatty", return_value=True),
+        patch("sophon.setup_wizard.read_config", return_value=existing),
+        patch("sophon.setup_wizard._choose_existing_action", side_effect=AssertionError("must be skipped")),
+        patch("sophon.setup_wizard._choose_provider", side_effect=lambda *args, **kwargs: selected.update(args=args, kwargs=kwargs) or "cloudflare"),
+        patch("sophon.setup_wizard._choose_model", return_value="new-model"),
+        patch("sophon.setup_wizard._read_hidden_credential", return_value="new-key"),
+        patch("sophon.agent._detect_reasoning_support", return_value=False),
+        patch("sophon.setup_wizard.auto_compression_settings", return_value=(True, 80)),
+        patch("sophon.setup_wizard.auto_update_enabled", return_value=False),
+        patch("builtins.input", return_value="a" * 32),
+        patch("sophon.setup_wizard.card"),
+        patch("sophon.setup_wizard.clear_terminal"),
+        patch("sophon.setup_wizard._read_key", return_value="ENTER"),
+        patch("sophon.setup_wizard.ensure_agent_instructions_file"),
+        patch("sophon.setup_wizard.agent_instructions_path", return_value=tmp_path / "AGENT.md"),
+        patch("sophon.setup_wizard.write_config", return_value=tmp_path / "config.json"),
+    ):
+        assert run_setup_wizard(reconfigure=True) == 0
+    assert selected["args"] == ("cloudflare",)
+    assert selected["kwargs"]["title"] == "Reconfiguration"
 
 
 def test_system_prompt_requests_plain_unfenced_workspace_paths():
@@ -1834,6 +2054,30 @@ def test_interactive_tui_routes_status_and_identity_commands():
     identity.assert_called_once_with()
 
 
+def test_interactive_tui_routes_backup_restore_reconfig_and_documents_them():
+    from sophon import core
+
+    prompts = iter(["/backup", "/restore", "/reconfig", "/help", "/exit"])
+    cards = []
+    with (
+        patch("sophon.core.clear_terminal"),
+        patch("sophon.core.show_welcome"),
+        patch("sophon.core.auto_update_enabled", return_value=False),
+        patch("sophon.core.read_prompt", side_effect=lambda *args, **kwargs: next(prompts)),
+        patch("sophon.core.backup_config", return_value=0) as backup,
+        patch("sophon.core.restore_config", return_value=0) as restore,
+        patch("sophon.setup_wizard.run_setup_wizard", return_value=0) as setup,
+        patch("sophon.core.card", side_effect=lambda *args, **kwargs: cards.append((args, kwargs))),
+        patch.object(core, "RESTART_REQUESTED", False),
+    ):
+        assert core.run_session() == 0
+    backup.assert_called_once_with()
+    restore.assert_called_once_with()
+    setup.assert_called_once_with(reconfigure=True)
+    help_rows = "\n".join(str(call) for call in cards)
+    assert "/backup —" in help_rows and "/restore —" in help_rows and "/reconfig —" in help_rows
+
+
 def test_ctrl_r_key_maps_to_reasoning_disclosure_toggle():
     from sophon.agent import _read_key_raw
 
@@ -1847,6 +2091,22 @@ def test_ctrl_r_key_maps_to_reasoning_disclosure_toggle():
         terminal_input.close()
         os.close(read_fd)
         os.close(write_fd)
+
+
+def test_identity_editor_keys_map_to_line_insert_delete_and_delete_key():
+    from sophon.agent import _read_key_raw
+
+    for payload, expected in [(b"\x0e", "INSERT_LINE"), (b"\x0b", "DELETE_LINE"), (b"\x1b[3~", "DELETE")]:
+        read_fd, write_fd = os.pipe()
+        terminal_input = os.fdopen(read_fd, "r", encoding="utf-8", closefd=False)
+        try:
+            os.write(write_fd, payload)
+            with patch("sys.stdin", terminal_input):
+                assert _read_key_raw() == expected
+        finally:
+            terminal_input.close()
+            os.close(read_fd)
+            os.close(write_fd)
 
 
 def test_escape_from_nested_agent_prompt_returns_to_tui():

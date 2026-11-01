@@ -2166,15 +2166,31 @@ def _slash_completion_choices(text: str, cursor: int) -> list[str]:
         for command in sorted(SLASH_COMMANDS):
             if command.startswith(prefix) and command != prefix:
                 suffix = command[len(text):]
-                if command[1:] in ARGUMENT_COMPLETIONS or command in {"/model", "/rename", "/threshold"}:
+                if command[1:] in ARGUMENT_COMPLETIONS or command in {"/cd", "/model", "/rename", "/threshold"}:
                     suffix += " "
                 choices.append(suffix)
         if prefix in SLASH_COMMANDS and (
-            prefix[1:] in ARGUMENT_COMPLETIONS or prefix in {"/model", "/rename", "/threshold"}
+            prefix[1:] in ARGUMENT_COMPLETIONS or prefix in {"/cd", "/model", "/rename", "/threshold"}
         ):
             choices.append(" ")
         return choices
     command, _, argument_text = text[1:].partition(" ")
+    if command.casefold() == "cd":
+        prefix = argument_text
+        expanded = Path(prefix).expanduser()
+        typed_parent = prefix.rsplit("/", 1)[0] + "/" if "/" in prefix else ""
+        leaf = prefix.rsplit("/", 1)[-1]
+        base = expanded.parent if "/" in prefix else PROJECT_DIR
+        if not expanded.is_absolute() and "/" in prefix:
+            base = (PROJECT_DIR / typed_parent).expanduser()
+        try:
+            base = base.resolve()
+            active = PROJECT_DIR.expanduser().resolve()
+            if base != active and active not in base.parents:
+                return []
+            return [str(entry.name)[len(leaf):] + ("/" if entry.name.casefold() == leaf.casefold() else "/" if entry.is_dir() else "") for entry in sorted(base.iterdir(), key=lambda item: item.name.casefold()) if entry.is_dir() and entry.name.casefold().startswith(leaf.casefold())]
+        except OSError:
+            return []
     options = ARGUMENT_COMPLETIONS.get(command.casefold())
     if options is None:
         return []
@@ -2339,6 +2355,8 @@ def _read_key_raw(timeout: float | None = None) -> str:
         return "CANCEL"
     if first == b"\x12":
         return "TOGGLE_REASONING"
+    if first == b"\x18":
+        return "SAVE"
     if first == b"\x0e":
         return "INSERT_LINE"
     if first == b"\x0b":
@@ -3083,11 +3101,10 @@ def _pick_directory_tree(
             if node.get("id") == "__truncated__":
                 tree_rows.append("  " + tree)
                 continue
-            if node.get("directory") is True:
-                marker = "❯" if index == selected_node_index else "·"
+            if node.get("directory") is True and index == selected_node_index:
+                tree_rows.append(f"› {tree}")
             else:
-                marker = " "
-            tree_rows.append(f"{marker} {tree}")
+                tree_rows.append(f"  {tree}")
         footer = "[ENTER] select · [ARROW KEYS] navigate · [ESC] back"
         panel = _card_rows(
             "Change Directory",

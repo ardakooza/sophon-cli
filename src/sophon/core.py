@@ -237,6 +237,30 @@ def clear_terminal() -> None:
         print("\033[2J\033[H", end="", flush=True)
 
 
+def _main_completion_choices(text: str, cursor: int) -> list[str]:
+    if cursor != len(text) or not text.startswith("/"):
+        return []
+    commands = ("/agent", "/auto-backup", "/auto-update", "/backup", "/clear", "/config", "/exit", "/help", "/identity", "/reconfig", "/restore", "/restart", "/setup", "/status", "/update", "/version")
+    if " " not in text:
+        prefix = text.casefold()
+        return [command[len(text):] + (" " if command in {"/auto-backup", "/auto-update"} else "") for command in commands if command.startswith(prefix) and command != prefix]
+    command, _, argument = text.partition(" ")
+    if command.casefold() == "/auto-backup":
+        options = ("on", "off", "frequency ", "amount ")
+        if " " in argument:
+            sub, _, tail = argument.partition(" ")
+            if sub == "amount":
+                options = tuple(str(value) for value in range(1, 11))
+                argument = tail
+            else:
+                return []
+        prefix = argument.casefold()
+        return [option[len(prefix):] for option in options if option.casefold().startswith(prefix) and option.casefold() != prefix]
+    if command.casefold() == "/auto-update":
+        return [option[len(argument):] for option in ("on", "off") if option.startswith(argument.casefold()) and option != argument.casefold()]
+    return []
+
+
 def read_prompt(prompt: str) -> str:
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         return input(prompt)
@@ -248,25 +272,63 @@ def read_prompt(prompt: str) -> str:
     previous = termios.tcgetattr(fd)
     decoder = codecs.getincrementaldecoder(sys.stdin.encoding or "utf-8")()
     characters: list[str] = []
-    sys.stdout.write(prompt)
-    sys.stdout.flush()
+    cursor = 0
+    completion_index = 0
+    last_size = shutil.get_terminal_size((80, 24))
+
+    def redraw() -> None:
+        text = "".join(characters)
+        sys.stdout.write("\r\033[2K" + prompt + text + "\033[" + str(display_width(text[cursor:])) + "D")
+        sys.stdout.flush()
+
     try:
         tty.setraw(fd)
+        sys.stdout.write(prompt)
+        sys.stdout.flush()
         while True:
+            if not select.select([fd], [], [], 0.2)[0]:
+                size = shutil.get_terminal_size((80, 24))
+                if size != last_size:
+                    last_size = size
+                    redraw()
+                continue
             raw = os.read(fd, 1)
             if not raw:
                 raise EOFError
             if raw == b"\x1b":
-                if not select.select([fd], [], [], 0.08)[0]:
+                if not select.select([fd], [], [], 0.06)[0]:
                     raise EOFError
-                prefix = os.read(fd, 1)
-                if prefix in {b"[", b"O"}:
-                    while select.select([fd], [], [], 0.01)[0]:
-                        suffix = os.read(fd, 1)
-                        if suffix and 0x40 <= suffix[0] <= 0x7E:
-                            break
+                sequence = bytearray()
+                while select.select([fd], [], [], 0.03)[0]:
+                    sequence.extend(os.read(fd, 1))
+                    if len(sequence) >= 2 and 0x40 <= sequence[-1] <= 0x7E:
+                        break
+                key = bytes(sequence[-1:])
+                if key == b"D":
+                    cursor = max(0, cursor - 1)
+                elif key == b"C":
+                    choices = _main_completion_choices("".join(characters), cursor)
+                    if choices:
+                        characters[cursor:cursor] = list(choices[completion_index % len(choices)])
+                        cursor += len(choices[completion_index % len(choices)])
+                        completion_index = 0
+                    else:
+                        cursor = min(len(characters), cursor + 1)
+                elif key in {b"A", b"B"}:
+                    choices = _main_completion_choices("".join(characters), cursor)
+                    if choices:
+                        completion_index = (completion_index + (1 if key == b"B" else -1)) % len(choices)
+                redraw()
                 continue
             if raw in {b"\r", b"\n"}:
+                choices = _main_completion_choices("".join(characters), cursor)
+                if choices and cursor == len(characters):
+                    completion = choices[completion_index % len(choices)]
+                    characters.extend(completion)
+                    cursor += len(completion)
+                    completion_index = 0
+                    redraw()
+                    continue
                 sys.stdout.write("\r\n")
                 sys.stdout.flush()
                 return "".join(characters)
@@ -276,19 +338,28 @@ def read_prompt(prompt: str) -> str:
                 if not characters:
                     raise EOFError
                 continue
-            if raw in {b"\x08", b"\x7f"}:
-                if characters:
-                    width = display_width(characters.pop())
-                    if width:
-                        sys.stdout.write("\b \b" * width)
-                        sys.stdout.flush()
+            if raw == b"\t":
+                choices = _main_completion_choices("".join(characters), cursor)
+                if choices:
+                    completion = choices[completion_index % len(choices)]
+                    characters[cursor:cursor] = list(completion)
+                    cursor += len(completion)
+                    completion_index = 0
+                    redraw()
                 continue
-
+            if raw in {b"\x08", b"\x7f"}:
+                if cursor:
+                    characters.pop(cursor - 1)
+                    cursor -= 1
+                    completion_index = 0
+                    redraw()
+                continue
             character = decoder.decode(raw)
-            if character and (character.isprintable() or character == "\t"):
-                characters.append(character)
-                sys.stdout.write(character)
-                sys.stdout.flush()
+            if character and character.isprintable():
+                characters[cursor:cursor] = list(character)
+                cursor += len(character)
+                completion_index = 0
+                redraw()
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, previous)
 
@@ -605,37 +676,225 @@ def _write_private_bytes(path: Path, content: bytes) -> None:
         raise
 
 
-def backup_config() -> int:
+def _backup_preferences() -> tuple[dict[str, object], dict[str, object]]:
+    try:
+        raw = json.loads(config_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        raw = {"schema_version": 1}
+    if not isinstance(raw, dict):
+        raw = {"schema_version": 1}
+    backup = raw.get("backup")
+    if not isinstance(backup, dict):
+        backup = {}
+    normalized = {
+        "enabled": backup.get("enabled") is True,
+        "frequency": backup.get("frequency") if isinstance(backup.get("frequency"), str) else "Every 2 days",
+        "backup_amount": backup.get("backup_amount") if isinstance(backup.get("backup_amount"), int) and not isinstance(backup.get("backup_amount"), bool) and 1 <= backup["backup_amount"] <= 10 else 1,
+        "last_backup_at": backup.get("last_backup_at") if isinstance(backup.get("last_backup_at"), str) else "",
+    }
+    return raw, normalized
+
+
+def _save_backup_preferences(settings: dict[str, object]) -> None:
+    raw, _ = _backup_preferences()
+    raw["backup"] = settings
+    write_config(raw)
+
+
+def _backup_files() -> list[Path]:
+    directory = CONFIG_BACKUP_PATH.parent
+    files = list(directory.glob("config_backup*.json")) if directory.exists() else []
+    return sorted((path for path in files if path.is_file()), key=lambda path: path.stat().st_mtime, reverse=True)
+
+
+def _backup_payload(path: Path) -> dict[str, object] | None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _backup_comparison(data: dict[str, object]) -> str:
+    comparable = dict(data)
+    nested = comparable.get("backup")
+    if isinstance(nested, dict):
+        nested = dict(nested)
+        nested.pop("last_backup_at", None)
+        comparable["backup"] = nested
+    return json.dumps(comparable, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+
+def backup_config(*, automatic: bool = False) -> int:
     source = config_path()
     try:
         if not source.is_file():
-            read_config()  # Migrate a supported legacy config before looking for its current path.
+            read_config()
             source = config_path()
         raw = source.read_bytes()
         parsed = json.loads(raw.decode("utf-8"))
         if not isinstance(parsed, dict):
             raise ValueError("Configuration must be a JSON object.")
-        _write_private_bytes(CONFIG_BACKUP_PATH, raw)
+        _, settings = _backup_preferences()
+        files = _backup_files()
+        if files and _backup_comparison(_backup_payload(files[0]) or {}) == _backup_comparison(parsed):
+            settings["last_backup_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+            _save_backup_preferences(settings)
+            card("Configuration Backup", ["Backup is already current.", f"Latest: {display_home_paths(files[0])}"], top_right="Unchanged")
+            return 0
+        amount = int(settings["backup_amount"])
+        deleted = max(0, len(files) + 1 - amount)
+        if not automatic and amount == 1 and files:
+            card("Configuration Backup", ["The existing backup will be replaced.", f"{len(files)} backup file(s) will be deleted.", "Type BACKUP to confirm; anything else cancels."], border_color=UPDATE_BORDER, text_color=UPDATE_TEXT)
+            try:
+                confirmation = read_prompt("  › ").strip()
+            except (EOFError, KeyboardInterrupt):
+                confirmation = ""
+            if confirmation != "BACKUP":
+                card("Configuration Backup", ["Backup cancelled. The existing backup was kept."])
+                return 0
+        elif not automatic and deleted:
+            card("Configuration Backup", [f"{deleted} backup file(s) will be deleted to keep the configured limit.", "Type BACKUP to confirm; anything else cancels."], border_color=UPDATE_BORDER, text_color=UPDATE_TEXT)
+            try:
+                confirmation = read_prompt("  › ").strip()
+            except (EOFError, KeyboardInterrupt):
+                confirmation = ""
+            if confirmation != "BACKUP":
+                card("Configuration Backup", ["Backup cancelled. Existing backups were kept."])
+                return 0
+        if amount == 1:
+            target = CONFIG_BACKUP_PATH
+        else:
+            target = CONFIG_BACKUP_PATH.with_name(time.strftime("config_backup_%Y%m%dT%H%M%S") + f"_{time.time_ns() % 1_000_000_000:09d}.json")
+        _write_private_bytes(target, raw)
+        for old in _backup_files()[amount:]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+        settings["last_backup_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        _save_backup_preferences(settings)
     except FileNotFoundError:
         card("Configuration Backup", ["No saved configuration was found to back up."], border_color=NOTICE_BORDER, text_color=NOTICE_TEXT)
         return 1
     except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
         card("Configuration Backup", [f"Backup failed: {error}"], border_color=NOTICE_BORDER, text_color=NOTICE_TEXT)
         return 1
-    card(
-        "Configuration Backup",
-        ["Configuration data saved securely.", f"Backup: {display_home_paths(CONFIG_BACKUP_PATH)}"],
-        top_right="Saved",
-    )
+    card("Configuration Backup", ["Configuration data saved securely.", f"Backup: {display_home_paths(target)}"], top_right="Saved")
     return 0
 
+
+def _normalize_backup_frequency(text: str) -> str | None:
+    folded = unicodedata.normalize("NFKD", text.casefold())
+    folded = "".join(ch for ch in folded if not unicodedata.combining(ch)).replace("ı", "i")
+    folded = re.sub(r"\s+", " ", folded.strip())
+    if folded in {"", "default", "varsayilan", "varsayılan"}:
+        return "Every 2 days"
+    if re.search(r"(twice|2 times|gunde 2|gunde iki|day twice)", folded):
+        return "Twice a day"
+    time_match = re.search(r"(?:at|saat)\s*(\d{1,2})(?::(\d{2}))?", folded)
+    at = f"{int(time_match.group(1)):02d}:{int(time_match.group(2) or 0):02d}" if time_match else None
+    if at and (int(at[:2]) > 23 or int(at[3:]) > 59):
+        return None
+    if any(word in folded for word in ("weekend", "weekends", "haftasonu", "hafta sonu")):
+        return f"Every weekend at {at}" if at else "Every weekend"
+    if re.search(r"(month|ayda bir|her ay)", folded):
+        return "Every month"
+    if re.search(r"(week|hafta|weekly)", folded):
+        return "Once a week"
+    if at:
+        return f"Every day at {at}"
+    match = re.search(r"(?:every|her)\s+(\d+)\s*(day|days|gun|g[uü]n|week|weeks|hafta)", folded)
+    if match:
+        count = int(match.group(1))
+        unit = "week" if match.group(2) in {"week", "weeks", "hafta"} else "day"
+        return f"Every {count} {unit}{'' if count == 1 else 's'}" if count > 0 else None
+    if any(word in folded for word in ("daily", "every day", "her gun", "her gün", "gunde bir", "günde bir", "gunde 1 kez", "her gun 1 kez")):
+        return "Every day"
+    return None
+
+
+def _backup_is_due(settings: dict[str, object]) -> bool:
+    frequency = str(settings.get("frequency", "Every 2 days"))
+    last = str(settings.get("last_backup_at", ""))
+    if not last:
+        return True
+    try:
+        previous = time.strptime(last, "%Y-%m-%dT%H:%M:%S%z")
+        elapsed = max(0, time.time() - time.mktime(previous))
+    except (ValueError, OverflowError):
+        return True
+    if frequency == "Twice a day":
+        return elapsed >= 12 * 3600
+    if frequency.startswith("Every weekend"):
+        local = time.localtime()
+        match = re.search(r"at (\d{2}):", frequency)
+        target_hour = int(match.group(1)) if match else 0
+        return local.tm_wday >= 5 and local.tm_hour >= target_hour and elapsed >= 24 * 3600
+    if frequency.startswith("Every day at "):
+        return time.localtime().tm_hour >= int(frequency[-5:-3]) and elapsed >= 20 * 3600
+    if frequency == "Every day":
+        return elapsed >= 24 * 3600
+    if frequency == "Once a week":
+        return elapsed >= 7 * 86400
+    if frequency == "Every month":
+        return elapsed >= 30 * 86400
+    match = re.fullmatch(r"Every (\d+) (day|days|week|weeks)", frequency)
+    if match:
+        return elapsed >= int(match.group(1)) * (86400 if match.group(2).startswith("day") else 7 * 86400)
+    return elapsed >= 2 * 86400
+
+
+def _auto_backup_startup() -> None:
+    _, settings = _backup_preferences()
+    if settings["enabled"] and _backup_is_due(settings):
+        backup_config(automatic=True)
+
+
+def auto_backup_command(argument: str) -> int:
+    raw, settings = _backup_preferences()
+    parts = argument.split(maxsplit=1)
+    action = parts[0].casefold() if parts else ""
+    value = parts[1].strip() if len(parts) > 1 else ""
+    if action in {"on", "off"} and not value:
+        settings["enabled"] = action == "on"
+        if action == "on" and "frequency" not in (raw.get("backup") if isinstance(raw.get("backup"), dict) else {}):
+            try:
+                answer = read_prompt("Backup frequency (blank = every 2 days): ").strip()
+            except (EOFError, KeyboardInterrupt):
+                answer = ""
+            normalized = _normalize_backup_frequency(answer)
+            if normalized is None:
+                card("Automatic backups", ["Frequency not recognized; using Every 2 days."])
+                normalized = "Every 2 days"
+            settings["frequency"] = normalized
+        _save_backup_preferences(settings)
+        card("Automatic backups", [f"Automatic backup is {action}.", f"Frequency: {settings['frequency']}", f"Keep: {settings['backup_amount']} backup(s)"], top_right=action.upper())
+        return 0
+    if action == "frequency" and value:
+        normalized = _normalize_backup_frequency(value)
+        if normalized is None:
+            card("Automatic backups", ["Frequency not recognized.", "Examples: every day, twice a day, once a week, every month, every day at 09:00, every weekend at 10:00."], border_color=NOTICE_BORDER, text_color=NOTICE_TEXT)
+            return 1
+        settings["frequency"] = normalized
+    elif action == "amount" and value.isdigit() and 1 <= int(value) <= 10:
+        settings["backup_amount"] = int(value)
+    elif not action:
+        card("Automatic backups", [f"Status: {'on' if settings['enabled'] else 'off'}", f"Frequency: {settings['frequency']}", f"Keep: {settings['backup_amount']} backup(s)"], top_right="Backup")
+        return 0
+    else:
+        card("Automatic backups", ["Use /auto-backup on|off, /auto-backup frequency <schedule>, or /auto-backup amount <1-10>."], border_color=NOTICE_BORDER, text_color=NOTICE_TEXT)
+        return 1
+    _save_backup_preferences(settings)
+    card("Automatic backups", [f"Frequency: {settings['frequency']}", f"Keep: {settings['backup_amount']} backup(s)"])
+    return 0
 
 def _validate_backup_payload(data: dict[str, object]) -> None:
     provider = data.get("provider")
     if provider is None:
         allowed = {
             "schema_version", "auto_update", "agent_instructions_path", "reasoning",
-            "auto_compression", "auto_compression_threshold", "Environment", "allowed_path", "mode",
+            "auto_compression", "auto_compression_threshold", "Environment", "allowed_path", "mode", "backup",
         }
         if set(data) - allowed:
             raise ValueError("Backup contains unsupported preferences-only fields.")
@@ -651,6 +910,15 @@ def _validate_backup_payload(data: dict[str, object]) -> None:
         environment = data.get("Environment")
         if environment is not None and (not isinstance(environment, str) or not environment.strip()):
             raise ValueError("Backup has an invalid environment label.")
+        backup = data.get("backup")
+        if backup is not None:
+            if not isinstance(backup, dict):
+                raise ValueError("Backup has invalid automatic backup settings.")
+            amount = backup.get("backup_amount", 1)
+            if not isinstance(amount, int) or isinstance(amount, bool) or not 1 <= amount <= 10:
+                raise ValueError("Backup has an invalid backup retention amount.")
+            if "enabled" in backup and not isinstance(backup["enabled"], bool):
+                raise ValueError("Backup has an invalid automatic backup preference.")
         return
     if not isinstance(provider, str) or provider not in PROVIDERS:
         raise ValueError("Backup names an unsupported provider.")
@@ -667,8 +935,10 @@ def _validate_backup_payload(data: dict[str, object]) -> None:
 
 
 def restore_config() -> int:
+    backup_files = _backup_files()
+    restore_path = backup_files[0] if backup_files else CONFIG_BACKUP_PATH
     try:
-        raw = CONFIG_BACKUP_PATH.read_bytes()
+        raw = restore_path.read_bytes()
         data = json.loads(raw.decode("utf-8"))
         if not isinstance(data, dict):
             raise ValueError("Backup must contain a JSON object.")
@@ -684,7 +954,7 @@ def restore_config() -> int:
         "Restore Configuration",
         [
             "This will overwrite the current provider settings and preferences.",
-            f"Source: {display_home_paths(CONFIG_BACKUP_PATH)}",
+            f"Source: {display_home_paths(restore_path)}",
             "Type RESTORE to confirm; any other input cancels.",
         ],
         border_color=UPDATE_BORDER,
@@ -710,6 +980,7 @@ def restore_config() -> int:
 def run_session() -> int:
     clear_terminal()
     show_welcome(check_updates=False)
+    _auto_backup_startup()
     if auto_update_enabled():
         auto_update_on_start()
         if not RESTART_REQUESTED:
@@ -738,6 +1009,9 @@ def run_session() -> int:
                     [
                         "/agent — Open Sophon Agent",
                         "/auto-update on|off — Set startup updates",
+                        "/auto-backup on|off — Configure automatic backups",
+                        "/auto-backup frequency <schedule> — Set backup frequency",
+                        "/auto-backup amount <1-10> — Set backup retention",
                         "/backup — Save a private configuration backup",
                         "/clear — Redraw the welcome screen",
                         "/config — Show saved settings",
@@ -767,6 +1041,8 @@ def run_session() -> int:
                 manage_identity()
             elif command == "/backup":
                 backup_config()
+            elif command == "/auto-backup":
+                auto_backup_command(argument)
             elif command == "/restore":
                 if restore_config() == 0:
                     show_welcome()
@@ -1155,6 +1431,7 @@ def _identity_visible_text(text: str, cursor: int, max_cells: int) -> str:
 def _edit_identity_card(path: Path, content: str) -> str | None:
     from sophon.agent import _read_key
 
+    original = content
     lines = content.split("\n") if content else [""]
     trailing_newline = content.endswith("\n")
     selected = 0
@@ -1165,77 +1442,69 @@ def _edit_identity_card(path: Path, content: str) -> str | None:
         visible_count = max(3, min(18, size.lines - 12))
         scroll = max(0, min(selected - visible_count // 2, len(lines) - visible_count))
         inner_width = min(68, max(20, size.columns - 8))
-        max_line_cells = max(8, inner_width - 14)
-        visible = lines[scroll : scroll + visible_count]
-        rows = [
-            f"File: {display_home_paths(path)}",
-            "",
-        ]
-        for index, line in enumerate(visible, scroll):
-            marker = "❯" if index == selected else "·"
+        max_line_cells = max(8, inner_width - 4)
+        rows = [f"File: {display_home_paths(path)}", ""]
+        for index, line in enumerate(lines[scroll : scroll + visible_count], scroll):
             safe_line = "".join(character if character.isprintable() else "�" for character in line)
             visible_line = _identity_visible_text(safe_line, cursor, max_line_cells) if index == selected else safe_line[:max_line_cells]
-            rows.append(f"{marker} {index + 1:>3} │ {visible_line}")
-        rows.extend([
-            "",
-            "↑/↓ line · ←/→ caret · Ctrl+N new line · Ctrl+K delete line",
-            "Esc cancel · Press enter to save",
-        ])
+            rows.append(("› " if index == selected else "  ") + visible_line)
+        rows.extend(["", "esc to cancel·ctrl+x to save"])
         clear_terminal()
-        card(
-            "Agent Identity",
-            rows,
-            top_right="AGENT.md",
-            border_color=UPDATE_BORDER,
-            text_color=WHITE,
-        )
-        key = _read_key()
+        card("Agent Identity", rows, top_right="AGENT.md", border_color=UPDATE_BORDER, text_color=WHITE)
+        key = _read_key(timeout=0.2)
+        if key == "TIMEOUT":
+            continue
         if key == "UP":
             selected = max(0, selected - 1)
             cursor = min(cursor, len(lines[selected]))
         elif key == "DOWN":
-            selected = min(len(lines) - 1, selected + 1)
-            cursor = min(cursor, len(lines[selected]))
+            if selected == len(lines) - 1:
+                lines.append("")
+                selected += 1
+                cursor = 0
+                trailing_newline = False
+            else:
+                selected += 1
+                cursor = min(cursor, len(lines[selected]))
         elif key == "LEFT":
             cursor = max(0, cursor - 1)
         elif key == "RIGHT":
             cursor = min(len(lines[selected]), cursor + 1)
         elif key == "BACKSPACE":
             if cursor:
-                lines[selected] = lines[selected][: cursor - 1] + lines[selected][cursor:]
+                lines[selected] = lines[selected][:cursor - 1] + lines[selected][cursor:]
                 cursor -= 1
             elif selected:
-                previous_length = len(lines[selected - 1])
+                cursor = len(lines[selected - 1])
                 lines[selected - 1] += lines.pop(selected)
                 selected -= 1
-                cursor = previous_length
         elif key == "DELETE":
             if cursor < len(lines[selected]):
-                lines[selected] = lines[selected][:cursor] + lines[selected][cursor + 1 :]
+                lines[selected] = lines[selected][:cursor] + lines[selected][cursor + 1:]
             elif selected + 1 < len(lines):
                 lines[selected] += lines.pop(selected + 1)
-        elif key == "INSERT_LINE":
+        elif key == "ENTER":
             remainder = lines[selected][cursor:]
             lines[selected] = lines[selected][:cursor]
             lines.insert(selected + 1, remainder)
             selected += 1
             cursor = 0
             trailing_newline = False
-        elif key == "DELETE_LINE":
-            if len(lines) > 1:
-                lines.pop(selected)
-                selected = min(selected, len(lines) - 1)
-                cursor = min(cursor, len(lines[selected]))
-            else:
-                lines[0] = ""
-                cursor = 0
+        elif key == "SAVE":
+            result = "\n".join(lines)
+            if trailing_newline and not result.endswith("\n"):
+                result += "\n"
+            if result == original:
+                return result
+            clear_terminal()
+            card("Save Agent Identity", ["Save changes to AGENT.md?", "Y save · N continue editing"], border_color=UPDATE_BORDER, text_color=WHITE)
+            answer = _read_key()
+            if answer == "CHAR:y" or answer == "CHAR:Y":
+                return result
         elif key.startswith("CHAR:"):
             character = key[5:]
             lines[selected] = lines[selected][:cursor] + character + lines[selected][cursor:]
             cursor += len(character)
-        elif key == "ENTER":
-            result = "\n".join(lines)
-            return result + ("\n" if trailing_newline and not result.endswith("\n") else "")
         elif key in {"CANCEL", "DOUBLE_CANCEL"}:
             return None
 

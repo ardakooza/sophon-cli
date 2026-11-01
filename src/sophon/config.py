@@ -176,7 +176,7 @@ def read_config() -> dict[str, Any] | None:
     if data.get("provider") is None:
         allowed_preferences = {
             "schema_version", "auto_update", "agent_instructions_path", "reasoning",
-            "auto_compression", "auto_compression_threshold", "Environment", "allowed_path", "mode",
+            "auto_compression", "auto_compression_threshold", "Environment", "allowed_path", "mode", "backup",
         }
         if set(data) <= allowed_preferences:
             _normalized_agent_access(data)
@@ -257,7 +257,7 @@ def write_config(data: dict[str, Any]) -> Path:
     if provider is None:
         allowed_preferences = {
             "schema_version", "auto_update", "agent_instructions_path", "reasoning",
-            "auto_compression", "auto_compression_threshold", "Environment", "allowed_path", "mode",
+            "auto_compression", "auto_compression_threshold", "Environment", "allowed_path", "mode", "backup",
         }
         if set(data) - allowed_preferences:
             raise ValueError("Preferences-only config contains unsupported fields")
@@ -265,6 +265,19 @@ def write_config(data: dict[str, Any]) -> Path:
             raise ValueError("Auto-update preference must be a boolean")
         if "auto_compression" in data and not isinstance(data["auto_compression"], bool):
             raise ValueError("Auto-compression preference must be a boolean")
+        backup = data.get("backup")
+        if backup is not None:
+            if not isinstance(backup, dict):
+                raise ValueError("Backup preferences must be an object")
+            if "enabled" in backup and not isinstance(backup["enabled"], bool):
+                raise ValueError("Automatic backup preference must be a boolean")
+            if "frequency" in backup and (not isinstance(backup["frequency"], str) or not backup["frequency"].strip()):
+                raise ValueError("Backup frequency must be a non-empty string")
+            amount = backup.get("backup_amount", 1)
+            if not isinstance(amount, int) or isinstance(amount, bool) or not 1 <= amount <= 10:
+                raise ValueError("Backup amount must be between 1 and 10")
+            if "last_backup_at" in backup and not isinstance(backup["last_backup_at"], str):
+                raise ValueError("Last backup timestamp must be a string")
         threshold = data.get("auto_compression_threshold")
         if threshold is not None and (
             not isinstance(threshold, int) or isinstance(threshold, bool) or not 30 <= threshold <= 95

@@ -28,7 +28,7 @@ from sophon.core import (
 )
 
 
-def _read_key() -> str:
+def _read_key(timeout: float = 0.2) -> str:
     import termios
     import tty
 
@@ -36,6 +36,8 @@ def _read_key() -> str:
     previous = termios.tcgetattr(fd)
     try:
         tty.setraw(fd)
+        if not select.select([fd], [], [], timeout)[0]:
+            return "TIMEOUT"
         key = os.read(fd, 1).decode("utf-8", errors="ignore")
         if key == "\x1b":
             if not select.select([fd], [], [], 0.08)[0]:
@@ -71,44 +73,65 @@ def _read_hidden_credential(
     import tty
 
     fd = sys.stdin.fileno()
-    previous = termios.tcgetattr(fd)
     decoder = codecs.getincrementaldecoder("utf-8")("ignore")
     characters: list[str] = []
+    last_size = None
 
     def redraw() -> None:
+        nonlocal last_size
+        size = os.get_terminal_size(sys.stdout.fileno()) if sys.stdout.isatty() else None
+        last_size = size
         clear_terminal()
         value = "•" * len(characters) if characters else "[hidden input]"
-        rows = [
-            f"Provider: {provider_label}",
-            f"Model: {model}",
-            "",
-            f"{credential_label}: {value}",
-            "",
-            "Enter to keep the saved credential." if saved_key_exists and not characters else "",
-            "Enter continue · Backspace edit · Esc cancel",
-        ]
+        rows = [f"Provider: {provider_label}", f"Model: {model}", "", f"{credential_label}: {value}"]
+        if saved_key_exists and not characters:
+            rows.extend(["", "Enter to keep the saved credential."])
+        rows.extend(["", "Enter continue · Backspace edit · Esc cancel"])
         card("Setup of Credentials", rows, top_right="3 of 4")
 
-    try:
-        tty.setraw(fd)
-        redraw()
-        while True:
-            raw = os.read(fd, 1)
-            if not raw or raw in {b"\x03", b"\x1b"}:
+    def read_byte(timeout: float = 0.2) -> bytes:
+        if not select.select([fd], [], [], timeout)[0]:
+            return b""
+        previous = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            return os.read(fd, 1)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, previous)
+
+    redraw()
+    while True:
+        try:
+            size = os.get_terminal_size(sys.stdout.fileno()) if sys.stdout.isatty() else None
+            if size != last_size:
+                redraw()
+            raw = read_byte()
+        except (OSError, termios.error):
+            return None
+        if not raw:
+            continue
+        if raw in {b"\x03", b"\x1b"}:
+            if raw == b"\x1b":
+                # Consume any arrow-key sequence so it cannot become credential text.
+                if select.select([fd], [], [], 0.03)[0]:
+                    read_byte(0)
+                    while select.select([fd], [], [], 0.01)[0]:
+                        read_byte(0)
+                else:
+                    return None
+            else:
                 return None
-            if raw in {b"\r", b"\n"}:
-                return "".join(characters)
-            if raw in {b"\x08", b"\x7f"}:
-                if characters:
-                    characters.pop()
-                    redraw()
-                continue
+        elif raw in {b"\r", b"\n"}:
+            return "".join(characters)
+        elif raw in {b"\x08", b"\x7f"}:
+            if characters:
+                characters.pop()
+                redraw()
+        else:
             character = decoder.decode(raw)
             if character and character.isprintable():
                 characters.append(character)
                 redraw()
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, previous)
 
 
 def _choose_provider(default_provider: str | None = None, *, title: str = "Setup of Provider") -> str | None:

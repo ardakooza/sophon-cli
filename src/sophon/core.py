@@ -46,6 +46,7 @@ LATEST_VERSION_API_URL = "https://api.github.com/repos/ardakooza/sophon-cli/cont
 RESTART_REQUESTED = False
 RESTART_ARGS: list[str] | None = None
 CONFIG_BACKUP_PATH = Path.home() / ".sophon" / "backup" / "config_backup.json"
+FIRST_INTERACTIVE_MARKER = Path.home() / ".sophon" / "state" / "interactive_initialized"
 
 
 def paint(text: str, color: str) -> str:
@@ -106,6 +107,21 @@ def display_width(text: str) -> int:
             width += char_cells
             cluster_width = char_cells
     return width
+
+
+def _clip_display(text: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    if display_width(text) <= width:
+        return text
+    if width == 1:
+        return "…"
+    clipped = ""
+    for character in text:
+        if display_width(clipped + character + "…") > width:
+            break
+        clipped += character
+    return clipped + "…"
 
 
 def break_long_word(word: str, width: int) -> list[str]:
@@ -184,14 +200,18 @@ def card(
     centered_lines: set[str] | None = None,
     top_right: str | None = None,
     border_color: str = BORDER,
-    text_color: str = WHITE,
+    text_color: str = MUTED,
     title_color: str | None = None,
     highlight_terms: tuple[str, ...] = (),
 ) -> None:
     title = display_home_paths(title) if title is not None else None
     lines = [display_home_paths(line) for line in lines]
     terminal_width = intelligent_ui.terminal_layout().columns
-    inner = min(width, intelligent_ui.card_width(terminal_width)) if width is not None else intelligent_ui.card_width(terminal_width)
+    preferred = min(width, intelligent_ui.card_width(terminal_width)) if width is not None else intelligent_ui.card_width(terminal_width)
+    inner = max(1, min(preferred, terminal_width - 6))
+    title = _clip_display(title, inner) if title is not None else None
+    top_right = _clip_display(top_right, inner) if top_right is not None else None
+    title_color = title_color or WHITE
     centered_lines = centered_lines or set()
     top_border = "  ╭" + "─" * (inner + 2) + "╮"
     print(paint(top_border, border_color))
@@ -225,8 +245,10 @@ def card(
         for chunk in chunks:
             text = centered(chunk, inner) if is_centered else chunk
             content = " " + text + " " * (inner - display_width(text) + 1)
-            if line == title and title_color is not None:
+            if line == title and title is not None:
                 colored_content = paint(content, title_color)
+            elif line.startswith(("❯ ", "› ")):
+                colored_content = paint(content, WHITE)
             else:
                 colored_content = _paint_highlight_terms(content, highlight_terms, text_color, WHITE)
             print(paint("  │", border_color) + colored_content + paint("│", border_color))
@@ -244,23 +266,34 @@ def _main_completion_choices(text: str, cursor: int) -> list[str]:
     commands = (
         "/agent", "/auto-backup", "/auto-update", "/backup", "/clear", "/config",
         "/exit", "/help", "/identity", "/reconfig", "/restore", "/restart",
-        "/setup", "/status", "/update", "/version",
+        "/status", "/update", "/version",
     )
     if " " not in text:
         prefix = text.casefold()
-        return [command[len(text):] + (" " if command in {"/auto-backup", "/auto-update"} else "")
-                for command in commands if command.startswith(prefix) and command != prefix]
+        matches = [command[len(text):] + (" " if command in {"/auto-backup", "/auto-update"} else "")
+                   for command in commands if command.startswith(prefix) and command != prefix]
+        if not matches and prefix in {"/auto-backup", "/auto-update"}:
+            return [" "]
+        return matches
     command, _, argument = text.partition(" ")
     options: tuple[str, ...] = ()
     if command.casefold() == "/auto-backup":
         if " " not in argument:
             options = ("on", "off", "frequency ", "amount ")
+            if argument.casefold() in {"frequency", "amount"}:
+                return [" "]
         else:
             sub, _, tail = argument.partition(" ")
             if sub == "amount":
                 options = tuple(str(value) for value in range(1, 11))
                 argument = tail
-            elif sub in {"on", "off", "frequency"}:
+            elif sub == "frequency":
+                options = (
+                    "Every 2 days", "Every day", "Twice a day", "Once a week",
+                    "Every month", "Every weekend", "Every day at 09:00", "Every weekend at 10:00",
+                )
+                argument = tail
+            elif sub in {"on", "off"}:
                 return []
     elif command.casefold() == "/auto-update":
         options = ("on", "off")
@@ -269,7 +302,7 @@ def _main_completion_choices(text: str, cursor: int) -> list[str]:
             if option.casefold().startswith(prefix) and option.casefold() != prefix]
 
 
-def read_prompt(prompt: str) -> str:
+def read_prompt(prompt: str, *, on_resize=None) -> str:
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         return input(prompt)
 
@@ -286,7 +319,13 @@ def read_prompt(prompt: str) -> str:
 
     def redraw() -> None:
         text = "".join(characters)
-        sys.stdout.write("\r\033[2K" + prompt + text + "\033[" + str(display_width(text[cursor:])) + "D")
+        choices = _main_completion_choices(text, cursor)
+        suggestion = choices[completion_index % len(choices)] if choices else ""
+        rendered = text[:cursor] + paint(suggestion, MUTED) + text[cursor:]
+        move_left = display_width(suggestion + text[cursor:])
+        sys.stdout.write("\r\033[2K" + prompt + rendered)
+        if move_left:
+            sys.stdout.write(f"\033[{move_left}D")
         sys.stdout.flush()
 
     try:
@@ -298,6 +337,9 @@ def read_prompt(prompt: str) -> str:
                 size = shutil.get_terminal_size((80, 24))
                 if size != last_size:
                     last_size = size
+                    if on_resize is not None:
+                        clear_terminal()
+                        on_resize()
                     redraw()
                 continue
             raw = os.read(fd, 1)
@@ -314,6 +356,7 @@ def read_prompt(prompt: str) -> str:
                 key = bytes(sequence[-1:])
                 if key == b"D":
                     cursor = max(0, cursor - 1)
+                    completion_index = 0
                 elif key == b"C":
                     choices = _main_completion_choices("".join(characters), cursor)
                     if choices:
@@ -429,7 +472,7 @@ def run_git_animated(args: list[str], lines: list[str], active_line: int, messag
     dots = 0
     while True:
         try:
-            stdout, stderr = process.communicate(timeout=0.25)
+            stdout, stderr = process.communicate(timeout=intelligent_ui.animation_interval())
             return stdout, stderr, process.returncode
         except subprocess.TimeoutExpired:
             if animate and sys.stdout.isatty():
@@ -999,7 +1042,7 @@ def run_session() -> int:
             show_welcome()
     while True:
         try:
-            value = read_prompt(paint("  › ", GREEN)).strip()
+            value = read_prompt(paint("  › ", WHITE), on_resize=show_welcome).strip()
         except (EOFError, KeyboardInterrupt):
             sys.stdout.write("\r\033[2K")
             card(None, ["Interactive closed. See you soon."])
@@ -1031,7 +1074,6 @@ def run_session() -> int:
                         "/reconfig — Reconfigure the provider directly",
                         "/restore — Restore config backup after confirmation",
                         "/restart — Restart Sophon",
-                        "/setup — Configure a provider",
                         "/status — Inspect system and workspace health",
                         "/update — Update and restart if changed",
                         "/version — Show the current version",
@@ -1039,7 +1081,7 @@ def run_session() -> int:
                     ],
                     text_color=MUTED,
                     title_color=WHITE,
-                    highlight_terms=("/agent", "/auto-update", "/auto-backup", "/backup", "/clear", "/config", "/help", "/identity", "/reconfig", "/restore", "/restart", "/setup", "/status", "/update", "/version", "/exit"),
+                    highlight_terms=("/agent", "/auto-update", "/auto-backup", "/backup", "/clear", "/config", "/help", "/identity", "/reconfig", "/restore", "/restart", "/status", "/update", "/version", "/exit"),
                 )
             elif command == "/agent":
                 from sophon.agent import main as agent_main
@@ -1059,11 +1101,6 @@ def run_session() -> int:
                 auto_backup_command(argument)
             elif command == "/restore":
                 if restore_config() == 0:
-                    show_welcome()
-            elif command == "/setup":
-                from sophon.setup_wizard import run_setup_wizard
-
-                if run_setup_wizard() == 0:
                     show_welcome()
             elif command == "/reconfig":
                 from sophon.setup_wizard import run_setup_wizard
@@ -1109,6 +1146,70 @@ def run_session() -> int:
             )
     card(None, ["Interactive closed. See you soon."])
     return 0
+
+
+def _mark_interactive_initialized() -> bool:
+    marker = FIRST_INTERACTIVE_MARKER
+    temporary = None
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(marker.parent.parent, 0o700)
+        os.chmod(marker.parent, 0o700)
+        fd, temporary = tempfile.mkstemp(prefix=".startup-", suffix=".tmp", dir=marker.parent)
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write("initialized\n")
+        os.replace(temporary, marker)
+        os.chmod(marker, 0o600)
+        return True
+    except OSError:
+        if temporary:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+        return False
+
+
+def _start_interactive() -> int:
+    from sophon.setup_wizard import run_setup_wizard
+
+    try:
+        saved_config = read_config()
+    except (OSError, ValueError):
+        saved_config = None
+    if saved_config is None:
+        card("Setup required", ["No saved provider configuration was found.", "Setup will begin before the interactive terminal opens."])
+        if run_setup_wizard() != 0:
+            return 1
+        _mark_interactive_initialized()
+        return run_session()
+
+    if not FIRST_INTERACTIVE_MARKER.exists():
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            def show_saved_config_choice() -> None:
+                card(
+                    "Saved configuration found",
+                    [
+                        "Continue with the saved provider settings?",
+                        "Press Enter to continue, or type R to reconfigure.",
+                        "This choice is saved and will not be repeated after updates.",
+                    ],
+                    text_color=MUTED,
+                    title_color=WHITE,
+                )
+
+            show_saved_config_choice()
+            try:
+                choice = read_prompt(paint("  › ", WHITE), on_resize=show_saved_config_choice).strip().casefold()
+            except (EOFError, KeyboardInterrupt):
+                card(None, ["Startup cancelled."])
+                return 130
+            if choice in {"r", "reconfig", "reconfigure", "n", "no"}:
+                if run_setup_wizard(reconfigure=True) != 0:
+                    return 1
+        _mark_interactive_initialized()
+    return run_session()
 
 
 def init_config() -> int:
@@ -1624,7 +1725,10 @@ def main() -> int:
     if args == ["setup"]:
         from sophon.setup_wizard import run_setup_wizard
 
-        return run_setup_wizard()
+        result = run_setup_wizard()
+        if result == 0:
+            _mark_interactive_initialized()
+        return result
     if args == ["config"]:
         return show_config()
     if args == ["doctor"]:
@@ -1639,7 +1743,7 @@ def main() -> int:
             return run_session()
         return result
     if not args or args == ["run"]:
-        result = run_session()
+        result = _start_interactive()
         if RESTART_REQUESTED:
             restart_sophon(RESTART_ARGS)
         return result

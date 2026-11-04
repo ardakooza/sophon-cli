@@ -2570,3 +2570,66 @@ def test_setup_preserves_providerless_access_settings_on_first_provider_setup(tm
     assert saved["allowed_path"] == ["~/shared"]
     assert saved["mode"] == preferences["mode"]
     assert saved["auto_update"] is True
+
+
+def test_first_interactive_start_runs_setup_before_opening_tui():
+    from sophon import core
+
+    with (
+        patch("sophon.core.read_config", return_value=None),
+        patch("sophon.core.card"),
+        patch("sophon.setup_wizard.run_setup_wizard", return_value=0) as setup,
+        patch("sophon.core._mark_interactive_initialized") as mark_initialized,
+        patch("sophon.core.run_session", return_value=0) as run_session,
+    ):
+        assert core._start_interactive() == 0
+    setup.assert_called_once_with()
+    mark_initialized.assert_called_once_with()
+    run_session.assert_called_once_with()
+
+
+def test_existing_config_offers_reconfigure_once_and_persists_choice(tmp_path):
+    from sophon import core
+
+    marker = tmp_path / "state" / "interactive_initialized"
+    with (
+        patch("sophon.core.FIRST_INTERACTIVE_MARKER", marker),
+        patch("sophon.core.read_config", return_value={"provider": "openrouter", "model": "test"}),
+        patch("sophon.core.sys.stdin.isatty", return_value=True),
+        patch("sophon.core.sys.stdout.isatty", return_value=True),
+        patch("sophon.core.read_prompt", return_value="r"),
+        patch("sophon.core.card"),
+        patch("sophon.setup_wizard.run_setup_wizard", return_value=0) as setup,
+        patch("sophon.core._mark_interactive_initialized") as mark_initialized,
+        patch("sophon.core.run_session", return_value=0) as run_session,
+    ):
+        assert core._start_interactive() == 0
+    setup.assert_called_once_with(reconfigure=True)
+    mark_initialized.assert_called_once_with()
+    run_session.assert_called_once_with()
+
+
+def test_existing_config_with_startup_marker_skips_prompt(tmp_path):
+    from sophon import core
+
+    marker = tmp_path / "state" / "interactive_initialized"
+    marker.parent.mkdir()
+    marker.write_text("initialized\n", encoding="utf-8")
+    with (
+        patch("sophon.core.FIRST_INTERACTIVE_MARKER", marker),
+        patch("sophon.core.read_config", return_value={"provider": "openrouter", "model": "test"}),
+        patch("sophon.core.read_prompt", side_effect=AssertionError("startup choice should only be asked once")),
+        patch("sophon.core.run_session", return_value=0) as run_session,
+    ):
+        assert core._start_interactive() == 0
+    run_session.assert_called_once_with()
+
+
+def test_primary_slash_completion_omits_setup_and_completes_subcommands():
+    from sophon.core import _main_completion_choices
+
+    assert _main_completion_choices("/s", 2) == ["tatus"]
+    assert _main_completion_choices("/auto-backup", len("/auto-backup")) == [" "]
+    schedules = _main_completion_choices("/auto-backup frequency ", len("/auto-backup frequency "))
+    assert "Every 2 days" in schedules
+    assert "Every day at 09:00" in schedules

@@ -1749,16 +1749,21 @@ def _card_rows(
     top_left: str | None = None,
     top_right: str | None = None,
     border_color: str = BORDER,
-    text_color: str = WHITE,
+    text_color: str = MUTED,
+    title_color: str = WHITE,
     highlight_terms: tuple[str, ...] = (),
 ) -> list[str]:
     title = display_home_paths(title) if title is not None else None
     lines = [display_home_paths(line) for line in lines]
     top_left = display_home_paths(top_left) if top_left is not None else None
     top_right = display_home_paths(top_right) if top_right is not None else None
-    inner = min(width, intelligent_ui.card_width(columns)) if width is not None else intelligent_ui.card_width(columns)
+    preferred = min(width, intelligent_ui.card_width(columns)) if width is not None else intelligent_ui.card_width(columns)
+    inner = max(1, min(preferred, columns - 6))
     top = "  ╭" + "─" * (inner + 2) + "╮"
     bottom = "  ╰" + "─" * (inner + 2) + "╯"
+    title = _truncate_display(title, inner) if title is not None else None
+    top_left = _truncate_display(top_left, inner) if top_left is not None else None
+    top_right = _truncate_display(top_right, inner) if top_right is not None else None
     rows = [paint(top, border_color)]
     content = list(lines)
     if title is None and top_left is not None and top_right is not None:
@@ -1769,7 +1774,7 @@ def _card_rows(
         else:
             heading = _truncate_display(left, max(1, inner - display_width(badge) - 1))
             heading += " " * max(1, inner - display_width(heading) - display_width(badge)) + badge
-        rows.append(paint("  │", border_color) + paint(" " + heading + " ", text_color) + paint("│", border_color))
+        rows.append(paint("  │", border_color) + paint(" " + heading + " ", title_color) + paint("│", border_color))
     elif title is not None and top_left is not None and top_right is not None:
         left = _truncate_display(top_left, inner)
         heading = _truncate_display(title, inner)
@@ -1780,13 +1785,13 @@ def _card_rows(
         if left_start + display_width(left) < title_start and title_start + display_width(heading) < right_start:
             row = left + " " * (title_start - display_width(left)) + heading
             row += " " * max(0, right_start - display_width(row)) + badge
-            rows.append(paint("  │", border_color) + paint(" " + row + " ", text_color) + paint("│", border_color))
+            rows.append(paint("  │", border_color) + paint(" " + row + " ", title_color) + paint("│", border_color))
         else:
             title_row = centered(_truncate_display(heading, inner), inner)
             left_row = left + " " * max(0, inner - display_width(left))
             right_row = " " * max(0, inner - display_width(badge)) + badge
             for text in (title_row, left_row, right_row):
-                rows.append(paint("  │", border_color) + paint(" " + text + " ", text_color) + paint("│", border_color))
+                rows.append(paint("  │", border_color) + paint(" " + text + " ", title_color) + paint("│", border_color))
         content.insert(0, "")
     elif title is not None and top_right is not None:
         badge = _truncate_display(top_right, inner)
@@ -1796,11 +1801,11 @@ def _card_rows(
         if left_pad + title_width + 1 <= right_start:
             heading = " " * left_pad + title + " " * max(1, right_start - left_pad - title_width) + badge
             heading += " " * max(0, inner - display_width(heading))
-            rows.append(paint("  │", border_color) + paint(" " + heading + " ", text_color) + paint("│", border_color))
+            rows.append(paint("  │", border_color) + paint(" " + heading + " ", title_color) + paint("│", border_color))
         else:
             heading = centered(title, inner)
-            rows.append(paint("  │", border_color) + paint(" " + heading + " " * (inner - display_width(heading) + 1), text_color) + paint("│", border_color))
-            rows.append(paint("  │", border_color) + paint(" " + " " * (inner - badge_width) + badge + " ", text_color) + paint("│", border_color))
+            rows.append(paint("  │", border_color) + paint(" " + heading + " " * (inner - display_width(heading) + 1), title_color) + paint("│", border_color))
+            rows.append(paint("  │", border_color) + paint(" " + " " * (inner - badge_width) + badge + " ", title_color) + paint("│", border_color))
         content.insert(0, "")
     elif title is not None:
         content.insert(0, "")
@@ -1811,7 +1816,12 @@ def _card_rows(
             text = " " * ((inner - display_width(wrapped)) // 2) + wrapped if is_title else wrapped
             padding = max(0, inner - display_width(text))
             row = " " + text + " " * (padding + 1)
-            colored_row = _paint_highlight_terms(row, highlight_terms, text_color, WHITE)
+            if is_title:
+                colored_row = paint(row, title_color)
+            elif line.startswith(("❯ ", "› ")):
+                colored_row = paint(row, WHITE)
+            else:
+                colored_row = _paint_highlight_terms(row, highlight_terms, text_color, WHITE)
             rows.append(paint("  │", border_color) + colored_row + paint("│", border_color))
     rows.append(paint(bottom, border_color))
     return rows
@@ -2909,7 +2919,7 @@ def _pick_directory_tree(
         visible_count = max(1, min(24, size.lines - 8))
         start = max(0, min(selected_display_index - visible_count // 2, max(0, len(tree_indices) - visible_count)))
         visible_indices = tree_indices[start : start + visible_count]
-        inner = intelligent_ui.card_width(size.columns)
+        inner = max(1, min(intelligent_ui.card_width(size.columns), size.columns - 6))
         rows: list[str] = []
         for index in visible_indices:
             node = nodes[index]
@@ -3743,12 +3753,15 @@ def _interactive(config: dict[str, object]) -> int:
                         "  /sessions, /mode, /threshold and /cwd workspace controls",
                         "",
                         "INTERFACE",
-                        "  Responsive terminal cards and consistent command completion",
+                        "  Responsive terminal cards with bright headings and muted body text",
                         "  Keyboard-driven provider, model and session selection",
-                        "  Masked credential entry and saved-key preservation",
-                        "  Expandable reasoning details and faster status animation",
+                        "  Masked credentials with Keep saved key / New key choices",
+                        "  Inline completion in the main interface and Agent",
+                        "  Tap Reasoning to expand details; aligned faster animations",
                         "",
                         "RELIABILITY",
+                        "  Setup runs before the first interactive launch when needed",
+                        "  Existing settings can be kept or reconfigured once; updates do not repeat the prompt",
                         "  Session-specific project directories and context management",
                         "  Read-only planning, build approval and 30–95% auto-compression",
                         "  double-Esc interruption and clearer provider errors",

@@ -6,6 +6,7 @@ import codecs
 import json
 import os
 import select
+import shutil
 import sys
 
 from sophon.config import (
@@ -68,7 +69,9 @@ def _read_hidden_credential(
     model: str,
     *,
     saved_key_exists: bool,
+    saved_key: str = "",
 ) -> str | None:
+    """Read a masked credential in-place; saved credentials are never echoed."""
     import termios
     import tty
 
@@ -76,63 +79,111 @@ def _read_hidden_credential(
     decoder = codecs.getincrementaldecoder("utf-8")("ignore")
     characters: list[str] = []
     last_size = None
+    selected_action = 0
+    action_choices = ["Keep saved key", "New key"]
+    action = "keep" if saved_key_exists else "new"
 
-    def redraw() -> None:
+    def redraw(*, place_cursor: bool = True) -> None:
         nonlocal last_size
-        size = os.get_terminal_size(sys.stdout.fileno()) if sys.stdout.isatty() else None
+        size = shutil.get_terminal_size((80, 24))
         last_size = size
         clear_terminal()
-        value = "•" * len(characters) if characters else "[hidden input]"
-        rows = [f"Provider: {provider_label}", f"Model: {model}", "", f"{credential_label}: {value}"]
-        if saved_key_exists and not characters:
-            rows.extend(["", "Enter to keep the saved credential."])
-        rows.extend(["", "Enter continue · Backspace edit · Esc cancel"])
-        card("Setup of Credentials", rows, top_right="3 of 4")
+        rows = [f"Provider: {provider_label}", f"Model: {model}", ""]
+        input_row = len(rows)
+        rows.append(f"{credential_label}: " + "•" * len(characters))
+        if action == "choose":
+            rows.extend(["", *(f"{'›' if i == selected_action else ' '} {label}" for i, label in enumerate(action_choices))])
+            rows.extend(["", "↑/↓ choose · Enter select · Esc cancel"])
+        else:
+            rows.extend(["", "Enter continue · Esc cancel"])
+        card("Setup of Credentials", rows, top_right="3 of 4", text_color=MUTED, title_color=WHITE, highlight_terms=("Provider:", "Model:", f"{credential_label}:", "Keep saved key", "New key", "›"))
+        if place_cursor and action == "new":
+            # Return the terminal cursor to the credential row, immediately after its masked value.
+            lines_after_input = len(rows) + 1 - input_row
+            column = 4 + len(credential_label) + 2 + len(characters)
+            if sys.stdout.isatty():
+                try:
+                    sys.stdout.fileno()
+                except (AttributeError, OSError, ValueError):
+                    pass
+                else:
+                    sys.stdout.write(f"\033[{lines_after_input}A\r\033[{column}C")
+                    sys.stdout.flush()
 
     def read_byte(timeout: float = 0.2) -> bytes:
         if not select.select([fd], [], [], timeout)[0]:
             return b""
-        previous = termios.tcgetattr(fd)
-        try:
-            tty.setraw(fd)
-            return os.read(fd, 1)
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, previous)
+        return os.read(fd, 1)
 
-    redraw()
-    while True:
-        try:
-            size = os.get_terminal_size(sys.stdout.fileno()) if sys.stdout.isatty() else None
-            if size != last_size:
-                redraw()
-            raw = read_byte()
-        except (OSError, termios.error):
-            return None
-        if not raw:
-            continue
-        if raw in {b"\x03", b"\x1b"}:
-            if raw == b"\x1b":
-                # Consume any arrow-key sequence so it cannot become credential text.
-                if select.select([fd], [], [], 0.03)[0]:
-                    read_byte(0)
-                    while select.select([fd], [], [], 0.01)[0]:
-                        read_byte(0)
-                else:
-                    return None
-            else:
+    if saved_key_exists:
+        action = "choose"
+        redraw(place_cursor=False)
+    else:
+        action = "new"
+        redraw()
+    previous = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        while True:
+            try:
+                size = shutil.get_terminal_size((80, 24))
+                if size != last_size:
+                    redraw(place_cursor=action == "new")
+                raw = read_byte()
+            except (OSError, termios.error):
                 return None
-        elif raw in {b"\r", b"\n"}:
-            return "".join(characters)
-        elif raw in {b"\x08", b"\x7f"}:
-            if characters:
-                characters.pop()
-                redraw()
-        else:
+            if not raw:
+                continue
+            if raw == b"\x1b":
+                # Distinguish a standalone Escape from arrow-key sequences. Never feed
+                # escape bytes to the secret decoder (which previously rendered as "^[").
+                if select.select([fd], [], [], 0.05)[0]:
+                    first = read_byte(0)
+                    sequence = bytearray(first)
+                    while first and select.select([fd], [], [], 0.01)[0]:
+                        first = read_byte(0)
+                        sequence.extend(first)
+                        if len(sequence) >= 2 and first and 0x40 <= first[-1] <= 0x7E:
+                            break
+                    if action == "choose" and sequence.startswith(b"["):
+                        suffix = sequence[-1:]
+                        if suffix == b"A":
+                            selected_action = (selected_action - 1) % len(action_choices)
+                            redraw(place_cursor=False)
+                        elif suffix == b"B":
+                            selected_action = (selected_action + 1) % len(action_choices)
+                            redraw(place_cursor=False)
+                    continue
+                return None
+            if raw == b"\x03":
+                return None
+            if action == "choose":
+                if raw in {b"\r", b"\n"}:
+                    if selected_action == 0:
+                        return saved_key
+                    action = "new"
+                    redraw()
+                    continue
+                if raw in {b"k", b"K"}:
+                    selected_action = (selected_action - 1) % len(action_choices)
+                    redraw(place_cursor=False)
+                elif raw in {b"j", b"J"}:
+                    selected_action = (selected_action + 1) % len(action_choices)
+                    redraw(place_cursor=False)
+                continue
+            if raw in {b"\r", b"\n"}:
+                return "".join(characters)
+            if raw in {b"\x08", b"\x7f"}:
+                if characters:
+                    characters.pop()
+                    redraw()
+                continue
             character = decoder.decode(raw)
             if character and character.isprintable():
                 characters.append(character)
                 redraw()
-
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, previous)
 
 def _choose_provider(default_provider: str | None = None, *, title: str = "Setup of Provider") -> str | None:
     choices = ["openrouter", "cloudflare"]
@@ -306,13 +357,12 @@ def run_setup_wizard(*, reconfigure: bool = False) -> int:
         spec["label"],
         model,
         saved_key_exists=bool(old_key),
+        saved_key=old_key,
     )
     if api_key is None:
         card(None, ["Setup cancelled."], width=16)
         return 1
     api_key = api_key.strip()
-    if not api_key:
-        api_key = old_key
     if not api_key:
         card("Sophon", ["An API key/token is required.", "No configuration was saved."])
         return 1

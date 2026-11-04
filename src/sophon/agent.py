@@ -72,6 +72,7 @@ DEFAULT_PROJECT_DIR = WORKSPACE_ROOT / "my-project"
 PROJECT_DIR = DEFAULT_PROJECT_DIR
 INPUT_PLACEHOLDER = "Create something with sophon"
 ANIMATION_TICK = intelligent_ui.animation_interval()
+REASONING_HITBOX: tuple[int, int, int] | None = None
 EXIT_TO_TUI = 42
 AGENT_MODES = {"chat", "plan", "build"}
 SLASH_COMMANDS = (
@@ -2050,6 +2051,8 @@ def _draw_screen(
         "Sophon Agent",
         ["Ask about code, debugging, and development."],
         columns=columns,
+        text_color=MUTED,
+        highlight_terms=("Sophon Agent",),
     )
     footer = _footer_rows(
         model,
@@ -2082,7 +2085,7 @@ def _draw_screen(
             feed.extend(_answering_rows(animation_frame, "Planning"))
             feed.append(paint("  │  " + _truncate_display(planning_text, max(12, columns - 12)), MUTED))
         elif answering and not streaming_text.strip() and not reasoning_text.strip():
-            label = "Reasoning >" if reasoning_state not in {"off", "not supported"} else "Answering"
+            label = "Reasoning" if reasoning_state not in {"off", "not supported"} else "Answering"
             feed.extend(_answering_rows(animation_frame, label))
         if streaming_text:
             feed.extend(_answering_rows(animation_frame, "Answering"))
@@ -2096,6 +2099,14 @@ def _draw_screen(
     screen = screen[-height:]
     if len(screen) < height:
         screen = [""] * (height - len(screen)) + screen
+    global REASONING_HITBOX
+    REASONING_HITBOX = None
+    for row_index, row_text in enumerate(screen, 1):
+        plain_row = re.sub(r"\033\[[0-9;]*m", "", row_text)
+        match = re.search(r"\bReasoning\b(?!:)", plain_row)
+        if match:
+            REASONING_HITBOX = (row_index, match.start() + 1, match.end() + 1)
+            break
     output = "\033[2J\033[H" + "\r\n".join(screen)
     absolute_row = height - len(box) - len(footer) - len(warning_rows) + 1 + cursor_row - visible_start
     absolute_col = 4 + cursor_col
@@ -2103,6 +2114,17 @@ def _draw_screen(
     sys.stdout.write(output)
     sys.stdout.flush()
     return cursor_row, cursor_col
+
+
+def _reasoning_mouse_click(key: str) -> bool:
+    if not key.startswith("MOUSE:"):
+        return False
+    try:
+        button, mouse_x, mouse_y = (int(part) for part in key[6:].split(","))
+    except (ValueError, TypeError):
+        return False
+    hitbox = REASONING_HITBOX
+    return bool(button & 3 == 0 and hitbox and mouse_y == hitbox[0] and hitbox[1] <= mouse_x <= hitbox[2])
 
 
 def _read_key_raw(timeout: float | None = None) -> str:
@@ -2136,6 +2158,12 @@ def _read_key_raw(timeout: float | None = None) -> str:
                 break
         if sequence == b"\x1b":
             return "DOUBLE_CANCEL"
+        if sequence.startswith(b"[<") and sequence[-1:] == b"M":
+            try:
+                button, mouse_x, mouse_y = (int(part) for part in sequence[2:-1].split(b";"))
+            except (ValueError, TypeError):
+                return "OTHER"
+            return f"MOUSE:{button},{mouse_x},{mouse_y}"
         if bytes(sequence) in {b"[3~", b"O3~"}:
             return "DELETE"
         return {b"A": "UP", b"B": "DOWN", b"C": "RIGHT", b"D": "LEFT"}.get(bytes(sequence[-1:]), "OTHER")
@@ -2177,6 +2205,8 @@ def _input_key_reader(events: queue.Queue[str], stop_event: threading.Event) -> 
     previous = termios.tcgetattr(fd)
     try:
         tty.setraw(fd)
+        sys.stdout.write("\033[?1000h\033[?1006h")
+        sys.stdout.flush()
         while not stop_event.is_set():
             key = _read_key_raw(timeout=0.1)
             if key != "TIMEOUT":
@@ -2184,6 +2214,8 @@ def _input_key_reader(events: queue.Queue[str], stop_event: threading.Event) -> 
     except OSError:
         pass
     finally:
+        sys.stdout.write("\033[?1000l\033[?1006l")
+        sys.stdout.flush()
         termios.tcsetattr(fd, termios.TCSADRAIN, previous)
 
 
@@ -2219,6 +2251,8 @@ def _input_bar(
 
     try:
         tty.setraw(fd)
+        sys.stdout.write("\033[?1000h\033[?1006h")
+        sys.stdout.flush()
         redraw()
         while True:
             ready, _, _ = select.select([fd], [], [], 0.2)
@@ -2239,6 +2273,15 @@ def _input_bar(
                     sequence.extend(os.read(fd, 1))
                     if len(sequence) >= 2 and 0x40 <= sequence[-1] <= 0x7E:
                         break
+                if sequence.startswith(b"[<") and sequence[-1:] == b"M":
+                    try:
+                        button, mouse_x, mouse_y = (int(part) for part in sequence[2:-1].split(b";"))
+                    except (ValueError, TypeError):
+                        continue
+                    hitbox = REASONING_HITBOX
+                    if button & 3 == 0 and hitbox and mouse_y == hitbox[0] and hitbox[1] <= mouse_x <= hitbox[2]:
+                        raise ToggleReasoningView("".join(characters))
+                    continue
                 key = bytes(sequence[-1:])
                 if key == b"D":
                     cursor = max(0, cursor - 1)
@@ -2303,6 +2346,8 @@ def _input_bar(
                 completion_index = 0
                 redraw()
     finally:
+        sys.stdout.write("\033[?1000l\033[?1006l")
+        sys.stdout.flush()
         termios.tcsetattr(fd, termios.TCSADRAIN, previous)
 
 
@@ -2557,7 +2602,7 @@ def _footer_rows(
 def _answering_rows(frame: int, label: str = "Answering") -> list[str]:
     if not intelligent_ui.motion_enabled():
         return [paint(f"  • {label}", MUTED)]
-    center = (frame // 2) % (len(label) + 6) - 3
+    center = (frame // 1) % (len(label) + 6) - 3
     shimmer = ""
     for index, character in enumerate(label):
         distance = abs(index - center)
@@ -2565,7 +2610,7 @@ def _answering_rows(frame: int, label: str = "Answering") -> list[str]:
         color = 240 + round(15 * brightness**2)
         shimmer += paint(character, f"\033[38;5;{color}m")
     pulse = (238, 241, 244, 247, 250, 253, 255, 253, 250, 247, 244, 241)
-    dot_color = f"\033[38;5;{pulse[(frame // 6) % len(pulse)]}m"
+    dot_color = f"\033[38;5;{pulse[(frame // 2) % len(pulse)]}m"
     return ["  " + paint("•", dot_color) + " " + shimmer]
 
 
@@ -2578,8 +2623,7 @@ def _reasoning_rows(
     expanded: bool = False,
 ) -> list[str]:
     text = display_home_paths(text)
-    disclosure = "<" if expanded else ">"
-    label = f"Reasoning {disclosure}"
+    label = "Reasoning"
     rows = _answering_rows(frame, label) if frame is not None else [paint(f"  • {label}", MUTED)]
     width = max(20, columns - 8)
     if expanded:
@@ -2654,7 +2698,7 @@ def _pick_item(
                 for index, item in enumerate(shown, start):
                     label = str(item.get("label") or item.get("title") or item.get("id") or "Session")
                     label = _truncate_display(label, inner_width - 3)
-                    marker = "❯" if index == selected else "·"
+                    marker = paint("›", WHITE) if index == selected else paint("·", WHITE)
                     body.append(marker + " " + label)
                     if not compact and index + 1 < start + len(shown):
                         body.append("")
@@ -2843,6 +2887,7 @@ def _pick_directory_tree(
     root: Path,
     current: Path,
 ) -> Path | None:
+    """Render a compact, responsive tree picker matching the terminal reference."""
     root = root.expanduser().resolve()
     nodes = _directory_tree_nodes(root)
     directory_positions = [index for index, node in enumerate(nodes) if node.get("directory") is True]
@@ -2850,34 +2895,57 @@ def _pick_directory_tree(
         return None
     current_path = current.expanduser().resolve()
     selected = next(
-        (position for position, node_index in enumerate(directory_positions) if nodes[node_index].get("path") == str(current_path)),
+        (position for position, node_index in enumerate(directory_positions)
+         if position > 0 and nodes[node_index].get("path") == str(current_path)),
         min(1, len(directory_positions) - 1),
     )
 
     while True:
         size = shutil.get_terminal_size((80, 24))
         selected_node_index = directory_positions[selected]
-        visible_count = max(2, min(18, size.lines - 20))
-        start = max(0, min(selected_node_index - visible_count // 2, len(nodes) - visible_count))
-        visible = nodes[start : start + visible_count]
-        tree_rows: list[str] = []
-        for index, node in enumerate(visible, start):
+        # The active directory is shown in the heading; list its descendants only.
+        tree_indices = list(range(1, len(nodes)))
+        selected_display_index = max(0, selected_node_index - 1)
+        visible_count = max(1, min(24, size.lines - 8))
+        start = max(0, min(selected_display_index - visible_count // 2, max(0, len(tree_indices) - visible_count)))
+        visible_indices = tree_indices[start : start + visible_count]
+        inner = intelligent_ui.card_width(size.columns)
+        rows: list[str] = []
+        for index in visible_indices:
+            node = nodes[index]
             tree = str(node.get("tree", ""))
             if node.get("id") == "__truncated__":
-                tree_rows.append("  " + tree)
+                rows.append(paint("  " + _truncate_display(tree, inner - 2), MUTED))
                 continue
-            if node.get("directory") is True and index == selected_node_index:
-                tree_rows.append(f"› {tree}")
+            is_selected = node.get("directory") is True and index == selected_node_index
+            prefix = "› " if is_selected else "  "
+            plain = _truncate_display(prefix + tree, max(1, inner - 1))
+            if is_selected:
+                rows.append(paint(" " + plain, "\033[48;5;208;38;5;16m"))
             else:
-                tree_rows.append(f"  {tree}")
-        footer = "[ENTER] select · [ARROW KEYS] navigate · [ESC] back"
-        panel = _card_rows(
-            "Change Directory",
-            [f"Root: {display_home_paths(root)}", "", *tree_rows, "", footer],
-            columns=size.columns,
-            top_left=root.name or str(root),
-            top_right=f"{selected + 1} of {len(directory_positions)}",
+                rows.append(paint(" " + plain, MUTED))
+        footer = "↑↓ move · ← parent · → child · Enter select · Esc back"
+        # Keep the reference's path / command heading, thin separators and muted footer.
+        panel = [paint("  ╭" + "─" * (inner + 2) + "╮", BORDER)]
+        heading_left = _truncate_display(root.name or str(root), max(1, inner // 2 - 2))
+        heading_right = " / change directory"
+        heading = _truncate_display(heading_left + heading_right, inner)
+        panel.append(
+            paint("  │", BORDER)
+            + paint(" " + heading[:len(heading_left)], MUTED)
+            + paint(heading[len(heading_left):], WHITE)
+            + " " * max(0, inner - display_width(heading))
+            + " " + paint("│", BORDER)
         )
+        panel.append(paint("  ├" + "─" * (inner + 2) + "┤", BORDER))
+        for row in rows:
+            # Rows already carry their text color; only pad them to the live terminal width.
+            plain = re.sub(r"\033\[[0-9;]*m", "", row)
+            padding = max(0, inner - display_width(plain))
+            panel.append(paint("  │", BORDER) + row + " " * padding + " " + paint("│", BORDER))
+        panel.append(paint("  ├" + "─" * (inner + 2) + "┤", BORDER))
+        panel.append(paint("  │", BORDER) + paint(" " + _truncate_display(footer, inner).ljust(inner) + " ", MUTED) + paint("│", BORDER))
+        panel.append(paint("  ╰" + "─" * (inner + 2) + "╯", BORDER))
         draw("", 0, panel_rows=panel, placeholder="Choose a directory from the tree")
         key = _read_key(timeout=0.2)
         if key == "TIMEOUT":
@@ -2897,16 +2965,13 @@ def _pick_directory_tree(
             else:
                 selected_path = Path(str(nodes[selected_node_index].get("path", root)))
                 selected = next(
-                    (
-                        position
-                        for position, node_index in enumerate(directory_positions)
-                        if Path(str(nodes[node_index].get("path", root))).parent == selected_path
-                    ),
+                    (position for position, node_index in enumerate(directory_positions)
+                     if Path(str(nodes[node_index].get("path", root))).parent == selected_path),
                     selected,
                 )
         elif key == "ENTER":
             return Path(str(nodes[directory_positions[selected]].get("path", root)))
-        elif key == "CANCEL" or key.startswith("CHAR:") and key[5:].casefold() == "q":
+        elif key in {"CANCEL", "DOUBLE_CANCEL"} or key.startswith("CHAR:") and key[5:].casefold() == "q":
             return None
 
 
@@ -3661,6 +3726,8 @@ def _interactive(config: dict[str, object]) -> int:
                         "/usage — Show session tokens and provider limits",
                     ],
                     columns=shutil.get_terminal_size((80, 24)).columns,
+                    text_color=MUTED,
+                    highlight_terms=("Agent Commands", "/auto-compression", "/auto-update", "/cd", "/changelog", "/clear", "/compact", "Ctrl+R", "/cwd", "/delete", "/exit", "/fork", "/help", "/history", "/mode", "/model", "/new", "/reasoning", "/rename", "/resume", "/review", "/sessions", "/threshold", "/undo", "/usage"),
                 )
             elif command == "changelog":
                 updated = VERSION.split(" – ", 1)[0]
@@ -3670,22 +3737,26 @@ def _interactive(config: dict[str, object]) -> int:
                         f"Version: {VERSION}",
                         f"Last updated: {updated}",
                         "",
-                        "Added: /cd five-level tree, /history tool/change log, and main-TUI /agent, /status, /identity.",
-                        "Added: main-TUI /backup, confirmed /restore, and direct /reconfig.",
-                        "Improved: /identity edits AGENT.md in-card with arrow-key line/caret navigation.",
-                        "Improved: /sessions opens saved sessions; each session retains its project directory.",
-                        "Improved: reasoning details start folded; Ctrl+R toggles the muted disclosure.",
-                        "Improved: credential input is masked inside its card; setup ends with one completion card.",
-                        "Improved: provider, model, and session pickers share the arrow-and-dot selection style.",
-                        "Added: /undo for safe last-edit rollback, /review for static change review, and /usage.",
-                        "Improved: argument-aware command completion and clearer provider authentication errors.",
-                        "Added: /sessions, /mode, /threshold and the single /cwd command.",
-                        "Added: default chat sessions, read-only planning, and build approval flow.",
-                        "Added: auto-compression at 30–95%; /compact unlocks at 50% context.",
-                        "Improved: double-Esc interruption, slash completion, and connected reasoning.",
-                        "Improved: session context/date list, environment detection, and update progress.",
+                        "FEATURES",
+                        "  /cd five levels deep · /history activity log · /undo safe rollback",
+                        "  /review change review · /usage token and provider limits",
+                        "  /sessions, /mode, /threshold and /cwd workspace controls",
+                        "",
+                        "INTERFACE",
+                        "  Responsive terminal cards and consistent command completion",
+                        "  Keyboard-driven provider, model and session selection",
+                        "  Masked credential entry and saved-key preservation",
+                        "  Expandable reasoning details and faster status animation",
+                        "",
+                        "RELIABILITY",
+                        "  Session-specific project directories and context management",
+                        "  Read-only planning, build approval and 30–95% auto-compression",
+                        "  double-Esc interruption and clearer provider errors",
+                        "  argument-aware command completion and expandable reasoning details",
                     ],
                     columns=shutil.get_terminal_size((80, 24)).columns,
+                    text_color=MUTED,
+                    highlight_terms=("Sophon Changelog", "Version:", "Last updated:", "FEATURES", "INTERFACE", "RELIABILITY", "/cd", "/history", "/undo", "/review", "/usage", "/sessions", "/mode", "/threshold", "/cwd"),
                 )
             elif command == "cd":
                 if not save_current():
@@ -3790,7 +3861,8 @@ def _interactive(config: dict[str, object]) -> int:
                 value = argument.casefold()
                 if value not in {"on", "off"}:
                     status = "on" if config.get("auto_update") is True else "off"
-                    notice("Automatic updates", f"Auto-update is {status}. Use /auto-update on|off.")
+                    next_state = "off" if status == "on" else "on"
+                    notice_rows = _card_rows("Automatic updates", [f"Auto-update is {status}.", f"Use /auto-update {next_state} to {next_state}."], columns=shutil.get_terminal_size((80, 24)).columns, text_color=MUTED, highlight_terms=("Automatic updates", "Auto-update is", f"{status}."))
                     continue
                 updated_config = config.copy()
                 updated_config["auto_update"] = value == "on"
@@ -3800,7 +3872,8 @@ def _interactive(config: dict[str, object]) -> int:
                     notice("Automatic updates", str(error), error=True)
                 else:
                     config.update(updated_config)
-                    notice("Automatic updates", f"Auto-update is {value}. Use /auto-update on|off.")
+                    next_state = "off" if value == "on" else "on"
+                    notice_rows = _card_rows("Automatic updates", [f"Auto-update is {value}.", f"Use /auto-update {next_state} to {next_state}."], columns=shutil.get_terminal_size((80, 24)).columns, text_color=MUTED, highlight_terms=("Automatic updates", "Auto-update is", f"{value}."))
             elif command == "sessions":
                 if not save_current():
                     continue
@@ -4243,7 +4316,7 @@ def _interactive(config: dict[str, object]) -> int:
                         break
                     if queued_key.startswith("CHAR:"):
                         prefill_characters.extend(list(queued_key[5:]))
-                    elif queued_key == "TOGGLE_REASONING":
+                    elif queued_key == "TOGGLE_REASONING" or _reasoning_mouse_click(queued_key):
                         answering["reasoning_expanded"] = not bool(answering.get("reasoning_expanded"))
                     elif queued_key == "BACKSPACE" and prefill_characters:
                         prefill_characters.pop()
@@ -4268,7 +4341,7 @@ def _interactive(config: dict[str, object]) -> int:
                     break
                 elif key.startswith("CHAR:"):
                     prefill_characters.extend(list(key[5:]))
-                elif key == "TOGGLE_REASONING":
+                elif key == "TOGGLE_REASONING" or _reasoning_mouse_click(key):
                     answering["reasoning_expanded"] = not bool(answering.get("reasoning_expanded"))
                 elif key == "BACKSPACE" and prefill_characters:
                     prefill_characters.pop()
@@ -4292,7 +4365,7 @@ def _interactive(config: dict[str, object]) -> int:
                 break
             if queued_key.startswith("CHAR:"):
                 prefill_characters.extend(list(queued_key[5:]))
-            elif queued_key == "TOGGLE_REASONING":
+            elif queued_key == "TOGGLE_REASONING" or _reasoning_mouse_click(queued_key):
                 answering["reasoning_expanded"] = not bool(answering.get("reasoning_expanded"))
             elif queued_key == "BACKSPACE" and prefill_characters:
                 prefill_characters.pop()

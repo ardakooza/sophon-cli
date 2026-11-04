@@ -52,7 +52,8 @@ def available_rows(rows: int, *reserved: int) -> int:
     return max(0, rows - sum(max(0, value) for value in reserved))
 
 
-def animation_interval(default: float = 0.075) -> float:
+def animation_interval(default: float = 0.06) -> float:
+    """Return the shared cadence used by terminal status animations."""
     return default if motion_enabled() else max(0.18, default)
 
 

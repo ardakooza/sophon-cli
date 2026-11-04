@@ -309,7 +309,7 @@ def write_config(data: dict[str, Any]) -> Path:
     try:
         os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            json.dump(data, stream, indent=2, ensure_ascii=False)
+            json.dump(data, stream, indent=2, ensure_ascii=False, sort_keys=True)
             stream.write("\n")
         os.replace(temp_name, path)
         os.chmod(path, 0o600)

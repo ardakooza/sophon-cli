@@ -241,25 +241,32 @@ def clear_terminal() -> None:
 def _main_completion_choices(text: str, cursor: int) -> list[str]:
     if cursor != len(text) or not text.startswith("/"):
         return []
-    commands = ("/agent", "/auto-backup", "/auto-update", "/backup", "/clear", "/config", "/exit", "/help", "/identity", "/reconfig", "/restore", "/restart", "/setup", "/status", "/update", "/version")
+    commands = (
+        "/agent", "/auto-backup", "/auto-update", "/backup", "/clear", "/config",
+        "/exit", "/help", "/identity", "/reconfig", "/restore", "/restart",
+        "/setup", "/status", "/update", "/version",
+    )
     if " " not in text:
         prefix = text.casefold()
-        return [command[len(text):] + (" " if command in {"/auto-backup", "/auto-update"} else "") for command in commands if command.startswith(prefix) and command != prefix]
+        return [command[len(text):] + (" " if command in {"/auto-backup", "/auto-update"} else "")
+                for command in commands if command.startswith(prefix) and command != prefix]
     command, _, argument = text.partition(" ")
+    options: tuple[str, ...] = ()
     if command.casefold() == "/auto-backup":
-        options = ("on", "off", "frequency ", "amount ")
-        if " " in argument:
+        if " " not in argument:
+            options = ("on", "off", "frequency ", "amount ")
+        else:
             sub, _, tail = argument.partition(" ")
             if sub == "amount":
                 options = tuple(str(value) for value in range(1, 11))
                 argument = tail
-            else:
+            elif sub in {"on", "off", "frequency"}:
                 return []
-        prefix = argument.casefold()
-        return [option[len(prefix):] for option in options if option.casefold().startswith(prefix) and option.casefold() != prefix]
-    if command.casefold() == "/auto-update":
-        return [option[len(argument):] for option in ("on", "off") if option.startswith(argument.casefold()) and option != argument.casefold()]
-    return []
+    elif command.casefold() == "/auto-update":
+        options = ("on", "off")
+    prefix = argument.casefold()
+    return [option[len(prefix):] for option in options
+            if option.casefold().startswith(prefix) and option.casefold() != prefix]
 
 
 def read_prompt(prompt: str) -> str:
@@ -371,6 +378,9 @@ def show_welcome(*, check_updates: bool = False) -> None:
         "Sophon",
         ["A minimal development environment.", "Build. Think. Execute.", "", f"READY    v{VERSION}"],
         centered_lines={"Sophon"},
+        text_color=MUTED,
+        title_color=WHITE,
+        highlight_terms=("READY", f"v{VERSION}"),
     )
     if check_updates and sys.stdin.isatty() and sys.stdout.isatty():
         remote_version = latest_version(timeout=4)
@@ -881,7 +891,7 @@ def auto_backup_command(argument: str) -> int:
     elif action == "amount" and value.isdigit() and 1 <= int(value) <= 10:
         settings["backup_amount"] = int(value)
     elif not action:
-        card("Automatic backups", [f"Status: {'on' if settings['enabled'] else 'off'}", f"Frequency: {settings['frequency']}", f"Keep: {settings['backup_amount']} backup(s)"], top_right="Backup")
+        card("Automatic backups", [f"Frequency: {settings['frequency']}", f"Keep: {settings['backup_amount']} backup(s)"], top_right="ON" if settings["enabled"] else "OFF", text_color=MUTED, title_color=WHITE, highlight_terms=("Frequency:", "Keep:"))
         return 0
     else:
         card("Automatic backups", ["Use /auto-backup on|off, /auto-backup frequency <schedule>, or /auto-backup amount <1-10>."], border_color=NOTICE_BORDER, text_color=NOTICE_TEXT)
@@ -992,7 +1002,7 @@ def run_session() -> int:
             value = read_prompt(paint("  › ", GREEN)).strip()
         except (EOFError, KeyboardInterrupt):
             sys.stdout.write("\r\033[2K")
-            card(None, ["Session closed. See you soon."])
+            card(None, ["Interactive closed. See you soon."])
             return 0
         if not value:
             continue
@@ -1027,6 +1037,9 @@ def run_session() -> int:
                         "/version — Show the current version",
                         "/exit — Close Sophon",
                     ],
+                    text_color=MUTED,
+                    title_color=WHITE,
+                    highlight_terms=("/agent", "/auto-update", "/auto-backup", "/backup", "/clear", "/config", "/help", "/identity", "/reconfig", "/restore", "/restart", "/setup", "/status", "/update", "/version", "/exit"),
                 )
             elif command == "/agent":
                 from sophon.agent import main as agent_main
@@ -1062,12 +1075,16 @@ def run_session() -> int:
             elif command.startswith("/auto-update"):
                 if argument in {"on", "off"}:
                     set_auto_update(argument == "on")
-                    card("Automatic updates", [f"Auto-update is {argument}. Use /auto-update on|off."])
+                    next_state = "off" if argument == "on" else "on"
+                    card("Automatic updates", [f"Auto-update is {argument}.", f"Use /auto-update {next_state} to {next_state}."], text_color=MUTED, title_color=WHITE, highlight_terms=("Auto-update is", f"{argument}."))
                 elif not argument:
                     status = "on" if auto_update_enabled() else "off"
-                    card("Automatic updates", [f"Auto-update is {status}. Use /auto-update on|off."])
+                    next_state = "off" if status == "on" else "on"
+                    card("Automatic updates", [f"Auto-update is {status}.", f"Use /auto-update {next_state} to {next_state}."], text_color=MUTED, title_color=WHITE, highlight_terms=("Auto-update is", f"{status}."))
                 else:
-                    card("Automatic updates", ["Auto-update is unchanged. Use /auto-update on|off."], border_color=NOTICE_BORDER, text_color=NOTICE_TEXT)
+                    status = "on" if auto_update_enabled() else "off"
+                    next_state = "off" if status == "on" else "on"
+                    card("Automatic updates", [f"Auto-update is unchanged ({status}).", f"Use /auto-update {next_state} to {next_state}."], border_color=NOTICE_BORDER, text_color=MUTED, title_color=WHITE, highlight_terms=("Auto-update is unchanged", f"({status})."))
             elif command == "/restart":
                 card(None, ["Restarting Sophon..."])
                 restart_sophon()
@@ -1090,7 +1107,7 @@ def run_session() -> int:
                 border_color=NOTICE_BORDER,
                 text_color=NOTICE_TEXT,
             )
-    card(None, ["Session closed. See you soon."])
+    card(None, ["Interactive closed. See you soon."])
     return 0
 
 
@@ -1440,16 +1457,16 @@ def _edit_identity_card(path: Path, content: str) -> str | None:
     scroll = 0
     while True:
         size = shutil.get_terminal_size((80, 24))
-        visible_count = max(3, min(18, size.lines - 12))
+        visible_count = max(1, min(18, size.lines - 7))
         scroll = max(0, min(selected - visible_count // 2, len(lines) - visible_count))
-        inner_width = min(68, max(20, size.columns - 8))
+        inner_width = intelligent_ui.card_width(size.columns)
         max_line_cells = max(8, inner_width - 4)
         rows = [f"File: {display_home_paths(path)}", ""]
         for index, line in enumerate(lines[scroll : scroll + visible_count], scroll):
             safe_line = "".join(character if character.isprintable() else "�" for character in line)
             visible_line = _identity_visible_text(safe_line, cursor, max_line_cells) if index == selected else safe_line[:max_line_cells]
             rows.append(("› " if index == selected else "  ") + visible_line)
-        rows.extend(["", "esc to cancel·ctrl+x to save"])
+        rows.extend(["", "ctrl+x to save" + " " * max(1, inner_width - len("ctrl+x to save") - len("esc to cancel")) + "esc to cancel"])
         clear_terminal()
         card("Agent Identity", rows, top_right="AGENT.md", border_color=UPDATE_BORDER, text_color=WHITE)
         key = _read_key(timeout=0.2)

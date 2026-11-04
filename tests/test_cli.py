@@ -171,7 +171,7 @@ def test_setup_credentials_card_contains_the_hidden_api_key_field(tmp_path):
     ):
         assert run_setup_wizard() == 0
     text = output.getvalue()
-    credential_reader.assert_called_once_with("API key", "OpenRouter", "test-model", saved_key_exists=False)
+    credential_reader.assert_called_once_with("API key", "OpenRouter", "test-model", saved_key_exists=False, saved_key="")
     assert "test-secret" not in text
 
 
@@ -201,16 +201,77 @@ def test_hidden_credential_is_masked_inside_the_setup_card():
         os.close(slave)
     rendered = output.getvalue()
     assert "Setup of Credentials" in rendered
-    assert "API key: [hidden input]" in rendered
-    assert "API key: •" in rendered
+    assert "API key: [hidden input]" not in rendered
+    assert "API key:" in rendered
+    plain_rendered = re.sub(r"\x1b\[[0-9;]*m", "", rendered)
+    assert "API key: •" in plain_rendered
     assert "secret" not in rendered
+
+
+
+def test_main_interactive_completion_covers_commands_and_arguments():
+    from sophon.core import _main_completion_choices
+
+    assert "gent" in _main_completion_choices("/a", 2)
+    assert _main_completion_choices("/auto-update ", 13) == ["on", "off"]
+    assert _main_completion_choices("/auto-backup ", 13) == ["on", "off", "frequency ", "amount "]
+    assert _main_completion_choices("/auto-backup amount ", 20) == [str(value) for value in range(1, 11)]
+
+
+def test_saved_credential_can_be_kept_or_replaced_with_arrow_selection():
+    import pty
+    import threading
+    import time
+
+    from sophon.setup_wizard import _read_hidden_credential
+
+    def run_with_input(payload):
+        master, slave = pty.openpty()
+        terminal_input = os.fdopen(slave, "r", encoding="utf-8", closefd=False)
+        output = StringIO()
+        writer = threading.Thread(target=lambda: (time.sleep(0.05), os.write(master, payload)), daemon=True)
+        writer.start()
+        try:
+            with patch("sys.stdin", terminal_input), patch("sys.stdout", output):
+                value = _read_hidden_credential(
+                    "API key", "OpenRouter", "test-model", saved_key_exists=True, saved_key="saved-secret"
+                )
+            writer.join(timeout=1)
+            return value, re.sub(r"\x1b\[[0-9;]*m", "", output.getvalue())
+        finally:
+            terminal_input.close()
+            os.close(master)
+            os.close(slave)
+
+    kept, keep_render = run_with_input(b"\r")
+    assert kept == "saved-secret"
+    assert "Keep saved key" in keep_render and "New key" in keep_render
+    replaced, _ = run_with_input(b"\x1b[B\rnew-secret\r")
+    assert replaced == "new-secret"
+
+
+def test_automatic_backup_status_uses_top_right_on_off_badge():
+    from sophon import core
+
+    cards = []
+    with (
+        patch("sophon.core._backup_preferences", return_value=({}, {
+            "enabled": True, "frequency": "Every 2 days", "backup_amount": 2, "last_backup_at": ""
+        })),
+        patch("sophon.core.card", side_effect=lambda title, lines, **kwargs: cards.append((title, lines, kwargs))),
+    ):
+        assert core.auto_backup_command("") == 0
+    title, lines, kwargs = cards[-1]
+    assert title == "Automatic backups"
+    assert "Status:" not in " ".join(lines)
+    assert kwargs["top_right"] == "ON"
 
 
 def test_plain_words_are_not_commands():
     result = run(ROOT / "sophon", input_text="exit\n/exit\n")
     assert result.returncode == 0
     assert "Commands must start with /." in result.stdout
-    assert "Session closed. See you soon." in result.stdout
+    assert "Interactive closed. See you soon." in result.stdout
 
 
 def test_cwd_and_pwd_are_not_terminal_ui_commands():
@@ -455,7 +516,7 @@ def test_automatic_update_status_card_is_one_line():
     ):
         assert core.run_session() == 0
     update_cards = [lines for title, lines in cards if title == "Automatic updates"]
-    assert update_cards == [["Auto-update is on. Use /auto-update on|off."]]
+    assert update_cards == [["Auto-update is on.", "Use /auto-update off to off."]]
     set_update.assert_called_once_with(True)
 
 
@@ -734,8 +795,8 @@ def test_answering_indicator_dot_pulses_more_slowly():
 
     with patch("sys.stdout", TerminalBuffer()):
         first = _answering_rows(0)[0]
-        same_phase = _answering_rows(5)[0]
-        next_phase = _answering_rows(6)[0]
+        same_phase = _answering_rows(1)[0]
+        next_phase = _answering_rows(2)[0]
     dot = re.compile(r"\x1b\[38;5;\d+m•\x1b\[0m")
     assert dot.search(first).group() == dot.search(same_phase).group()
     assert dot.search(first).group() != dot.search(next_phase).group()
@@ -1335,7 +1396,8 @@ def test_reasoning_transcript_is_collapsed_by_default():
         {"role": "assistant", "content": "The answer", "reasoning": "Private thought details."},
     ], 80))
     plain = re.sub(r"\x1b\[[0-9;]*m", "", rendered)
-    assert "Reasoning >" in plain
+    assert "Reasoning" in plain
+    assert "Reasoning >" not in plain and "Reasoning <" not in plain
     assert "Private thought details." not in plain
     assert "The answer" in plain
 
@@ -1806,7 +1868,7 @@ def test_identity_command_displays_and_saves_agent_instructions(tmp_path):
     from sophon import core
     from sophon.config import agent_instructions_path
 
-    keys = iter(["DOWN", "CHAR:Please ", "ENTER"])
+    keys = iter(["DOWN", "CHAR:Please ", "SAVE", "CHAR:y"])
     cards = []
     instructions = "# Instructions\nBe concise.\n"
 
@@ -1815,7 +1877,7 @@ def test_identity_command_displays_and_saves_agent_instructions(tmp_path):
         patch("sophon.core.read_config", return_value=None),
         patch("sophon.core.clear_terminal"),
         patch("sophon.core.card", side_effect=lambda *args, **kwargs: cards.append((args, kwargs))),
-        patch("sophon.agent._read_key", side_effect=lambda: next(keys)),
+        patch("sophon.agent._read_key", side_effect=lambda *args, **kwargs: next(keys)),
     ):
         identity_path = agent_instructions_path()
         identity_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1825,7 +1887,8 @@ def test_identity_command_displays_and_saves_agent_instructions(tmp_path):
     assert path.read_text(encoding="utf-8") == "# Instructions\nPlease Be concise.\n"
     rendered = "\n".join(str(call) for call in cards)
     assert "Agent Identity" in rendered
-    assert "Press enter to save" in rendered
+    assert "ctrl+x to save" in rendered
+    assert "esc to cancel" in rendered
     assert "E — edit" not in rendered
 
 
@@ -1861,7 +1924,7 @@ def test_directory_tree_picker_is_current_directory_relative_and_depth_limited(t
         )
     assert selected == (root / "level1" / "level2").resolve()
     assert "[ENTER] select · [ARROW KEYS] navigate · [ESC] back" in "\n".join(rendered[-1])
-    assert any("of" in row for row in rendered[-1])
+    assert any("change directory" in row for row in rendered[-1])
 
 
 def test_complete_turn_records_redacted_tool_activity_and_file_change_details(tmp_path):
@@ -2091,6 +2154,28 @@ def test_ctrl_r_key_maps_to_reasoning_disclosure_toggle():
         terminal_input.close()
         os.close(read_fd)
         os.close(write_fd)
+
+
+
+def test_sgr_mouse_click_is_recognized_only_on_reasoning_label():
+    from sophon import agent
+
+    read_fd, write_fd = os.pipe()
+    terminal_input = os.fdopen(read_fd, "r", encoding="utf-8", closefd=False)
+    try:
+        os.write(write_fd, b"\x1b[<0;12;4M")
+        with patch("sys.stdin", terminal_input):
+            key = agent._read_key_raw()
+        assert key == "MOUSE:0,12,4"
+    finally:
+        terminal_input.close()
+        os.close(read_fd)
+        os.close(write_fd)
+
+    with patch.object(agent, "REASONING_HITBOX", (4, 8, 17)):
+        assert agent._reasoning_mouse_click("MOUSE:0,12,4") is True
+        assert agent._reasoning_mouse_click("MOUSE:0,20,4") is False
+        assert agent._reasoning_mouse_click("MOUSE:1,12,4") is False
 
 
 def test_identity_editor_keys_map_to_line_insert_delete_and_delete_key():

@@ -61,8 +61,8 @@ def terminal_size(fallback: tuple[int, int] = (80, 24)) -> os.terminal_size:
     elif (
         os.environ.get("TERMUX_VERSION")
         or "/com.termux/" in os.environ.get("PREFIX", "")
-    ) and columns > 44:
-        columns = 44
+    ) and columns > 64:
+        columns = 64
     return os.terminal_size((columns, max(1, size.lines)))
 
 

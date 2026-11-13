@@ -105,7 +105,7 @@ def _read_hidden_credential(
         if place_cursor and action == "new":
             # Return the terminal cursor to the credential row, immediately after its masked value.
             lines_after_input = len(rows) + 1 - input_row
-            column = 4 + len(credential_label) + 2 + visible_count
+            column = 5 + len(credential_label) + 2 + visible_count
             if sys.stdout.isatty():
                 try:
                     sys.stdout.fileno()

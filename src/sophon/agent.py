@@ -1756,8 +1756,7 @@ def _card_rows(
     lines = [display_home_paths(line) for line in lines]
     top_left = display_home_paths(top_left) if top_left is not None else None
     top_right = display_home_paths(top_right) if top_right is not None else None
-    preferred = min(width, intelligent_ui.card_width(columns)) if width is not None else intelligent_ui.card_width(columns)
-    inner = max(1, min(preferred, columns - 6))
+    inner = intelligent_ui.card_inner_width(columns, width or 68)
     top = "  ╭" + "─" * (inner + 2) + "╮"
     bottom = "  ╰" + "─" * (inner + 2) + "╯"
     title = _truncate_display(title, inner) if title is not None else None

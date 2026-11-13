@@ -222,8 +222,7 @@ def card(
         },
     )
     terminal_width = intelligent_ui.terminal_layout().columns
-    preferred = min(width, intelligent_ui.card_width(terminal_width)) if width is not None else intelligent_ui.card_width(terminal_width)
-    inner = max(1, min(preferred, terminal_width - 6))
+    inner = intelligent_ui.card_inner_width(terminal_width, width or 68)
     title = _clip_display(title, inner) if title is not None else None
     top_right = _clip_display(top_right, inner) if top_right is not None else None
     title_color = title_color or WHITE

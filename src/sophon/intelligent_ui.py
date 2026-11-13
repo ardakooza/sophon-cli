@@ -76,6 +76,11 @@ def card_width(columns: int, preferred: int = 68, margin: int = 8) -> int:
     return max(1, min(preferred, columns - margin))
 
 
+def card_inner_width(columns: int, preferred: int = 68) -> int:
+    """Return the exact content width after applying the shared card limits."""
+    return max(1, min(preferred, card_width(columns, preferred), columns - 6))
+
+
 def available_rows(rows: int, *reserved: int) -> int:
     return max(0, rows - sum(max(0, value) for value in reserved))
 

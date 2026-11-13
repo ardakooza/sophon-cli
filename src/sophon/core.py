@@ -47,6 +47,7 @@ RESTART_REQUESTED = False
 RESTART_ARGS: list[str] | None = None
 CONFIG_BACKUP_PATH = Path.home() / ".sophon" / "backup" / "config_backup.json"
 FIRST_INTERACTIVE_MARKER = Path.home() / ".sophon" / "state" / "interactive_initialized"
+_LAST_CARD: tuple[tuple[object, ...], dict[str, object]] | None = None
 
 
 def paint(text: str, color: str) -> str:
@@ -204,15 +205,28 @@ def card(
     title_color: str | None = None,
     highlight_terms: tuple[str, ...] = (),
 ) -> None:
+    global _LAST_CARD
     title = display_home_paths(title) if title is not None else None
     lines = [display_home_paths(line) for line in lines]
+    centered_lines = centered_lines or set()
+    _LAST_CARD = (
+        (title, list(lines)),
+        {
+            "width": width,
+            "centered_lines": set(centered_lines),
+            "top_right": top_right,
+            "border_color": border_color,
+            "text_color": text_color,
+            "title_color": title_color,
+            "highlight_terms": tuple(highlight_terms),
+        },
+    )
     terminal_width = intelligent_ui.terminal_layout().columns
     preferred = min(width, intelligent_ui.card_width(terminal_width)) if width is not None else intelligent_ui.card_width(terminal_width)
     inner = max(1, min(preferred, terminal_width - 6))
     title = _clip_display(title, inner) if title is not None else None
     top_right = _clip_display(top_right, inner) if top_right is not None else None
     title_color = title_color or WHITE
-    centered_lines = centered_lines or set()
     top_border = "  ╭" + "─" * (inner + 2) + "╮"
     print(paint(top_border, border_color))
     content_lines = list(lines)
@@ -309,6 +323,8 @@ def read_prompt(prompt: str, *, on_resize=None) -> str:
     import termios
     import tty
 
+    if on_resize is None:
+        on_resize = _redraw_last_card
     fd = sys.stdin.fileno()
     previous = termios.tcgetattr(fd)
     decoder = codecs.getincrementaldecoder(sys.stdin.encoding or "utf-8")()
@@ -338,8 +354,12 @@ def read_prompt(prompt: str, *, on_resize=None) -> str:
                 if size != last_size:
                     last_size = size
                     if on_resize is not None:
-                        clear_terminal()
-                        on_resize()
+                        termios.tcsetattr(fd, termios.TCSADRAIN, previous)
+                        try:
+                            clear_terminal()
+                            on_resize()
+                        finally:
+                            tty.setraw(fd)
                     redraw()
                 continue
             raw = os.read(fd, 1)
@@ -913,8 +933,9 @@ def auto_backup_command(argument: str) -> int:
     if action in {"on", "off"} and not value:
         settings["enabled"] = action == "on"
         if action == "on" and "frequency" not in (raw.get("backup") if isinstance(raw.get("backup"), dict) else {}):
+            card("Automatic backups", ["Choose how often to save a backup.", "Leave the prompt blank for every 2 days."])
             try:
-                answer = read_prompt("Backup frequency (blank = every 2 days): ").strip()
+                answer = read_prompt("Backup frequency: ").strip()
             except (EOFError, KeyboardInterrupt):
                 answer = ""
             normalized = _normalize_backup_frequency(answer)
@@ -1031,6 +1052,14 @@ def restore_config() -> int:
     return 0
 
 
+def _redraw_last_card() -> None:
+    if _LAST_CARD is None:
+        show_welcome()
+        return
+    arguments, options = _LAST_CARD
+    card(*arguments, **options)
+
+
 def run_session() -> int:
     clear_terminal()
     show_welcome(check_updates=False)
@@ -1042,7 +1071,10 @@ def run_session() -> int:
             show_welcome()
     while True:
         try:
-            value = read_prompt(paint("  › ", WHITE), on_resize=show_welcome).strip()
+            value = read_prompt(
+                paint("  › ", WHITE),
+                on_resize=_redraw_last_card,
+            ).strip()
         except (EOFError, KeyboardInterrupt):
             sys.stdout.write("\r\033[2K")
             card(None, ["Interactive closed. See you soon."])

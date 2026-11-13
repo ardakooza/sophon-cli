@@ -33,7 +33,12 @@ def motion_enabled() -> bool:
 
 
 def is_termux() -> bool:
-    return bool(os.environ.get("TERMUX_VERSION") or "/com.termux/" in os.environ.get("PREFIX", ""))
+    return bool(
+        os.environ.get("TERMUX_VERSION")
+        or "/data/data/com.termux/" in os.environ.get("PREFIX", "")
+        or "/data/data/com.termux/" in sys.prefix
+        or os.environ.get("ANDROID_ROOT")
+    )
 
 
 def terminal_layout(fallback: tuple[int, int] = (80, 24)) -> TerminalLayout:

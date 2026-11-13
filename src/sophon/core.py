@@ -316,7 +316,7 @@ def _main_completion_choices(text: str, cursor: int) -> list[str]:
             if option.casefold().startswith(prefix) and option.casefold() != prefix]
 
 
-def read_prompt(prompt: str, *, on_resize=None) -> str:
+def read_prompt(prompt: str, *, on_resize=None, history: list[str] | None = None) -> str:
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         return input(prompt)
 
@@ -331,6 +331,8 @@ def read_prompt(prompt: str, *, on_resize=None) -> str:
     characters: list[str] = []
     cursor = 0
     completion_index = 0
+    history_index = len(history) if history is not None else 0
+    history_draft = ""
     last_size = intelligent_ui.terminal_size((80, 24))
 
     def redraw() -> None:
@@ -389,6 +391,19 @@ def read_prompt(prompt: str, *, on_resize=None) -> str:
                     choices = _main_completion_choices("".join(characters), cursor)
                     if choices:
                         completion_index = (completion_index + (1 if key == b"B" else -1)) % len(choices)
+                    elif history and not "".join(characters).startswith("/"):
+                        if key == b"A" and history_index > 0:
+                            if history_index == len(history):
+                                history_draft = "".join(characters)
+                            history_index -= 1
+                            characters[:] = list(history[history_index])
+                            cursor = len(characters)
+                        elif key == b"B" and history_index < len(history):
+                            history_index += 1
+                            recalled = history[history_index] if history_index < len(history) else history_draft
+                            characters[:] = list(recalled)
+                            cursor = len(characters)
+                        completion_index = 0
                 redraw()
                 continue
             if raw in {b"\r", b"\n"}:
@@ -1061,6 +1076,7 @@ def _redraw_last_card() -> None:
 
 
 def run_session() -> int:
+    command_history: list[str] = []
     clear_terminal()
     show_welcome(check_updates=False)
     _auto_backup_startup()
@@ -1074,6 +1090,7 @@ def run_session() -> int:
             value = read_prompt(
                 paint("  › ", WHITE),
                 on_resize=_redraw_last_card,
+                history=command_history,
             ).strip()
         except (EOFError, KeyboardInterrupt):
             sys.stdout.write("\r\033[2K")
@@ -1081,6 +1098,8 @@ def run_session() -> int:
             return 0
         if not value:
             continue
+        if not command_history or command_history[-1] != value:
+            command_history.append(value)
         command, _, argument = value.partition(" ")
         command = command.casefold()
         argument = argument.strip()

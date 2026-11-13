@@ -26,6 +26,7 @@ from sophon.core import (
     auto_update_enabled,
     card,
     clear_terminal,
+    read_prompt,
 )
 
 
@@ -101,7 +102,7 @@ def _read_hidden_credential(
             rows.extend(["", "↑/↓ choose · Enter select · Esc cancel"])
         else:
             rows.extend(["", "Enter continue · Esc cancel"])
-        card("Setup of Credentials", rows, top_right="3 of 4", text_color=MUTED, title_color=WHITE, highlight_terms=("Provider:", "Model:", f"{credential_label}:", "Keep saved key", "New key", "›"))
+        card("Setup of Credentials", rows, width=min(40, intelligent_ui.card_width(size.columns)), top_right="3 of 4", text_color=MUTED, title_color=WHITE, highlight_terms=("Provider:", "Model:", f"{credential_label}:", "Keep saved key", "New key", "›"))
         if place_cursor and action == "new":
             # Return the terminal cursor to the credential row, immediately after its masked value.
             lines_after_input = len(rows) + 1 - input_row
@@ -348,7 +349,11 @@ def run_setup_wizard(*, reconfigure: bool = False) -> int:
         return 1
     if model_choice == "__custom__":
         card("Setup of Custom Model", ["Enter a model ID."], top_right="2 of 4")
-        model = input("Model ID: ").strip()
+        try:
+            model = read_prompt("Model ID: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            card(None, ["Setup cancelled."])
+            return 1
         if not model:
             card("Sophon", ["A model ID is required.", "No configuration was saved."])
             return 1

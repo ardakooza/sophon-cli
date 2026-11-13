@@ -2214,8 +2214,9 @@ def _input_key_reader(events: queue.Queue[str], stop_event: threading.Event) -> 
     previous = termios.tcgetattr(fd)
     try:
         tty.setraw(fd)
-        sys.stdout.write("\033[?1000h\033[?1006h")
-        sys.stdout.flush()
+        if not intelligent_ui.is_termux():
+            sys.stdout.write("\033[?1000h\033[?1006h")
+            sys.stdout.flush()
         while not stop_event.is_set():
             key = _read_key_raw(timeout=0.1)
             if key != "TIMEOUT":
@@ -2223,8 +2224,9 @@ def _input_key_reader(events: queue.Queue[str], stop_event: threading.Event) -> 
     except OSError:
         pass
     finally:
-        sys.stdout.write("\033[?1000l\033[?1006l")
-        sys.stdout.flush()
+        if not intelligent_ui.is_termux():
+            sys.stdout.write("\033[?1000l\033[?1006l")
+            sys.stdout.flush()
         termios.tcsetattr(fd, termios.TCSADRAIN, previous)
 
 
@@ -2260,8 +2262,9 @@ def _input_bar(
 
     try:
         tty.setraw(fd)
-        sys.stdout.write("\033[?1000h\033[?1006h")
-        sys.stdout.flush()
+        if not intelligent_ui.is_termux():
+            sys.stdout.write("\033[?1000h\033[?1006h")
+            sys.stdout.flush()
         redraw()
         while True:
             ready, _, _ = select.select([fd], [], [], 0.2)
@@ -2355,8 +2358,9 @@ def _input_bar(
                 completion_index = 0
                 redraw()
     finally:
-        sys.stdout.write("\033[?1000l\033[?1006l")
-        sys.stdout.flush()
+        if not intelligent_ui.is_termux():
+            sys.stdout.write("\033[?1000l\033[?1006l")
+            sys.stdout.flush()
         termios.tcsetattr(fd, termios.TCSADRAIN, previous)
 
 

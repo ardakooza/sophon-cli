@@ -90,7 +90,12 @@ def _read_hidden_credential(
         clear_terminal()
         rows = [f"Provider: {provider_label}", f"Model: {model}", ""]
         input_row = len(rows)
-        rows.append(f"{credential_label}: " + "•" * len(characters))
+        inner_width = intelligent_ui.card_width(size.columns)
+        field_width = max(1, inner_width - len(credential_label) - 2)
+        overflow = len(characters) > field_width
+        visible_count = min(len(characters), field_width - int(overflow))
+        mask = ("…" if overflow else "") + "•" * visible_count
+        rows.append(f"{credential_label}: " + mask)
         if action == "choose":
             rows.extend(["", *(f"{'›' if i == selected_action else ' '} {label}" for i, label in enumerate(action_choices))])
             rows.extend(["", "↑/↓ choose · Enter select · Esc cancel"])
@@ -100,7 +105,7 @@ def _read_hidden_credential(
         if place_cursor and action == "new":
             # Return the terminal cursor to the credential row, immediately after its masked value.
             lines_after_input = len(rows) + 1 - input_row
-            column = 4 + len(credential_label) + 2 + len(characters)
+            column = 4 + len(credential_label) + 2 + visible_count
             if sys.stdout.isatty():
                 try:
                     sys.stdout.fileno()

@@ -32,6 +32,10 @@ def motion_enabled() -> bool:
     return os.environ.get("TERM", "") != "dumb"
 
 
+def is_termux() -> bool:
+    return bool(os.environ.get("TERMUX_VERSION") or "/com.termux/" in os.environ.get("PREFIX", ""))
+
+
 def terminal_layout(fallback: tuple[int, int] = (80, 24)) -> TerminalLayout:
     size = terminal_size(fallback)
     columns, rows = max(1, size.columns), max(1, size.lines)
@@ -58,10 +62,7 @@ def terminal_size(fallback: tuple[int, int] = (80, 24)) -> os.terminal_size:
     override = os.environ.get("SOPHON_COLUMNS", "").strip()
     if override.isdigit() and int(override) > 0:
         columns = min(columns, int(override))
-    elif (
-        os.environ.get("TERMUX_VERSION")
-        or "/com.termux/" in os.environ.get("PREFIX", "")
-    ) and columns > 64:
+    elif is_termux() and columns > 48:
         columns = 64
     return os.terminal_size((columns, max(1, size.lines)))
 

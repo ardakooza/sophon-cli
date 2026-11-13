@@ -9,7 +9,6 @@ import os
 import platform
 import re
 import select
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -331,7 +330,7 @@ def read_prompt(prompt: str, *, on_resize=None) -> str:
     characters: list[str] = []
     cursor = 0
     completion_index = 0
-    last_size = shutil.get_terminal_size((80, 24))
+    last_size = intelligent_ui.terminal_size((80, 24))
 
     def redraw() -> None:
         text = "".join(characters)
@@ -350,7 +349,7 @@ def read_prompt(prompt: str, *, on_resize=None) -> str:
         sys.stdout.flush()
         while True:
             if not select.select([fd], [], [], 0.2)[0]:
-                size = shutil.get_terminal_size((80, 24))
+                size = intelligent_ui.terminal_size((80, 24))
                 if size != last_size:
                     last_size = size
                     if on_resize is not None:
@@ -1452,7 +1451,7 @@ def doctor() -> int:
 
 def system_status() -> int:
     warnings: list[str] = []
-    terminal_size = shutil.get_terminal_size((80, 24))
+    terminal_size = intelligent_ui.terminal_size((80, 24))
     rows = [
         f"Environment: {detect_environment()}",
         f"Platform: {platform.system()} {platform.release()} · {platform.machine() or 'unknown architecture'}",
@@ -1589,7 +1588,7 @@ def _edit_identity_card(path: Path, content: str) -> str | None:
     cursor = 0
     scroll = 0
     while True:
-        size = shutil.get_terminal_size((80, 24))
+        size = intelligent_ui.terminal_size((80, 24))
         visible_count = max(1, min(18, size.lines - 7))
         scroll = max(0, min(selected - visible_count // 2, len(lines) - visible_count))
         inner_width = intelligent_ui.card_width(size.columns)

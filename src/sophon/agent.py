@@ -11,7 +11,6 @@ import math
 import os
 import queue
 import re
-import shutil
 import stat
 import subprocess
 import sys
@@ -2248,7 +2247,7 @@ def _input_bar(
     characters: list[str] = list(prefill)
     cursor = len(characters)
     completion_index = 0
-    last_size = shutil.get_terminal_size((80, 24))
+    last_size = intelligent_ui.terminal_size((80, 24))
 
     def redraw() -> None:
         text = "".join(characters)
@@ -2267,7 +2266,7 @@ def _input_bar(
         while True:
             ready, _, _ = select.select([fd], [], [], 0.2)
             if not ready:
-                size = shutil.get_terminal_size((80, 24))
+                size = intelligent_ui.terminal_size((80, 24))
                 if size != last_size:
                     last_size = size
                     redraw()
@@ -2664,9 +2663,9 @@ def _pick_item(
         items = sorted(items, key=lambda item: str(item.get("id", "")).casefold())
     selected_id = current_id
     query = ""
-    last_size = shutil.get_terminal_size((80, 24))
+    last_size = intelligent_ui.terminal_size((80, 24))
     while True:
-        size = shutil.get_terminal_size((80, 24))
+        size = intelligent_ui.terminal_size((80, 24))
         header_count = 0 if session.get("messages") else len(_card_rows("Sophon Agent", ["Ask about code, debugging, and development."], columns=size.columns))
         input_count = 3 + 4
         room = max(1, size.lines - header_count - input_count)
@@ -2734,7 +2733,7 @@ def _pick_item(
             key = _read_key(timeout=0.2)
             if key != "TIMEOUT":
                 break
-            size = shutil.get_terminal_size((80, 24))
+            size = intelligent_ui.terminal_size((80, 24))
             if size != last_size:
                 last_size = size
                 key = "RESIZE"
@@ -2911,7 +2910,7 @@ def _pick_directory_tree(
     )
 
     while True:
-        size = shutil.get_terminal_size((80, 24))
+        size = intelligent_ui.terminal_size((80, 24))
         selected_node_index = directory_positions[selected]
         # The active directory is shown in the heading; list its descendants only.
         tree_indices = list(range(1, len(nodes)))
@@ -3310,7 +3309,7 @@ def _history_panel(session: dict[str, object], draw) -> None:
             panel = _card_rows(
                 "Agent History",
                 body,
-                columns=shutil.get_terminal_size((80, 24)).columns,
+                columns=intelligent_ui.terminal_size((80, 24)).columns,
                 top_left="This session",
                 top_right="0 of 0",
             )
@@ -3353,7 +3352,7 @@ def _history_panel(session: dict[str, object], draw) -> None:
             panel = _card_rows(
                 "Agent History",
                 body,
-                columns=shutil.get_terminal_size((80, 24)).columns,
+                columns=intelligent_ui.terminal_size((80, 24)).columns,
                 top_left="This session",
                 top_right=f"{selected + 1} of {len(events)}",
                 border_color=NOTICE_BORDER if status == "ERROR" else BORDER,
@@ -3423,7 +3422,7 @@ def _questions_panel(
             panel = _card_rows(
                 "Questions",
                 body,
-                columns=shutil.get_terminal_size((80, 24)).columns,
+                columns=intelligent_ui.terminal_size((80, 24)).columns,
                 top_right=f"{question_index} of {len(questions)}",
             )
             draw(input_text, len(input_text), panel_rows=panel, placeholder="Type an answer, or enter A–C/S then Enter")
@@ -3476,7 +3475,7 @@ def _questions_panel(
     summary = _card_rows(
         "Questions",
         summary_rows,
-        columns=shutil.get_terminal_size((80, 24)).columns,
+        columns=intelligent_ui.terminal_size((80, 24)).columns,
         top_right=f"{len(questions)} of {len(questions)}",
     )
     while True:
@@ -3570,7 +3569,7 @@ def _interactive(config: dict[str, object]) -> int:
         notice_rows = _card_rows(
             title,
             [message],
-            columns=shutil.get_terminal_size((80, 24)).columns,
+            columns=intelligent_ui.terminal_size((80, 24)).columns,
             border_color=NOTICE_BORDER if error else BORDER,
             text_color=NOTICE_TEXT if error else WHITE,
         )
@@ -3580,7 +3579,7 @@ def _interactive(config: dict[str, object]) -> int:
         notice_rows = _card_rows(
             None,
             [message],
-            columns=shutil.get_terminal_size((80, 24)).columns,
+            columns=intelligent_ui.terminal_size((80, 24)).columns,
             width=display_width(message),
         )
 
@@ -3735,7 +3734,7 @@ def _interactive(config: dict[str, object]) -> int:
                         "/undo — Revert the last Agent file edits",
                         "/usage — Show session tokens and provider limits",
                     ],
-                    columns=shutil.get_terminal_size((80, 24)).columns,
+                    columns=intelligent_ui.terminal_size((80, 24)).columns,
                     text_color=MUTED,
                     highlight_terms=("Agent Commands", "/auto-compression", "/auto-update", "/cd", "/changelog", "/clear", "/compact", "Ctrl+R", "/cwd", "/delete", "/exit", "/fork", "/help", "/history", "/mode", "/model", "/new", "/reasoning", "/rename", "/resume", "/review", "/sessions", "/threshold", "/undo", "/usage"),
                 )
@@ -3767,7 +3766,7 @@ def _interactive(config: dict[str, object]) -> int:
                         "  double-Esc interruption and clearer provider errors",
                         "  argument-aware command completion and expandable reasoning details",
                     ],
-                    columns=shutil.get_terminal_size((80, 24)).columns,
+                    columns=intelligent_ui.terminal_size((80, 24)).columns,
                     text_color=MUTED,
                     highlight_terms=("Sophon Changelog", "Version:", "Last updated:", "FEATURES", "INTERFACE", "RELIABILITY", "/cd", "/history", "/undo", "/review", "/usage", "/sessions", "/mode", "/threshold", "/cwd"),
                 )
@@ -3826,7 +3825,7 @@ def _interactive(config: dict[str, object]) -> int:
                 notice_rows = _card_rows(
                     "Session Usage",
                     _usage_panel_rows(session, config),
-                    columns=shutil.get_terminal_size((80, 24)).columns,
+                    columns=intelligent_ui.terminal_size((80, 24)).columns,
                 )
             elif command == "history":
                 _history_panel(session, draw)
@@ -3855,7 +3854,7 @@ def _interactive(config: dict[str, object]) -> int:
                     notice_rows = _card_rows(
                         "Change Review",
                         review.splitlines() or ["The reviewer returned no text."],
-                        columns=shutil.get_terminal_size((80, 24)).columns,
+                        columns=intelligent_ui.terminal_size((80, 24)).columns,
                     )
             elif command == "undo":
                 session_changes = last_changes_by_session.get(str(session.get("id")), [])
@@ -3875,7 +3874,7 @@ def _interactive(config: dict[str, object]) -> int:
                 if value not in {"on", "off"}:
                     status = "on" if config.get("auto_update") is True else "off"
                     next_state = "off" if status == "on" else "on"
-                    notice_rows = _card_rows("Automatic updates", [f"Auto-update is {status}.", f"Use /auto-update {next_state} to {next_state}."], columns=shutil.get_terminal_size((80, 24)).columns, text_color=MUTED, highlight_terms=("Automatic updates", "Auto-update is", f"{status}."))
+                    notice_rows = _card_rows("Automatic updates", [f"Auto-update is {status}.", f"Use /auto-update {next_state} to {next_state}."], columns=intelligent_ui.terminal_size((80, 24)).columns, text_color=MUTED, highlight_terms=("Automatic updates", "Auto-update is", f"{status}."))
                     continue
                 updated_config = config.copy()
                 updated_config["auto_update"] = value == "on"
@@ -3886,7 +3885,7 @@ def _interactive(config: dict[str, object]) -> int:
                 else:
                     config.update(updated_config)
                     next_state = "off" if value == "on" else "on"
-                    notice_rows = _card_rows("Automatic updates", [f"Auto-update is {value}.", f"Use /auto-update {next_state} to {next_state}."], columns=shutil.get_terminal_size((80, 24)).columns, text_color=MUTED, highlight_terms=("Automatic updates", "Auto-update is", f"{value}."))
+                    notice_rows = _card_rows("Automatic updates", [f"Auto-update is {value}.", f"Use /auto-update {next_state} to {next_state}."], columns=intelligent_ui.terminal_size((80, 24)).columns, text_color=MUTED, highlight_terms=("Automatic updates", "Auto-update is", f"{value}."))
             elif command == "sessions":
                 if not save_current():
                     continue
@@ -4543,7 +4542,7 @@ def _run_one_shot_stream(
     frame = 0
     started = False
     finished = False
-    columns = shutil.get_terminal_size((80, 24)).columns
+    columns = intelligent_ui.terminal_size((80, 24)).columns
     line_width = max(20, columns - 4)
     line_column = 0
     home_prefix = Path.home().as_posix()
@@ -4624,5 +4623,5 @@ def _run_one_shot_stream(
 
 
 def _render_agent_message(message: str) -> None:
-    for row in _agent_rows(message, shutil.get_terminal_size((80, 24)).columns):
+    for row in _agent_rows(message, intelligent_ui.terminal_size((80, 24)).columns):
         print(row)

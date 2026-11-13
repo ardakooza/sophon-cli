@@ -33,7 +33,7 @@ def motion_enabled() -> bool:
 
 
 def terminal_layout(fallback: tuple[int, int] = (80, 24)) -> TerminalLayout:
-    size = shutil.get_terminal_size(fallback)
+    size = terminal_size(fallback)
     columns, rows = max(1, size.columns), max(1, size.lines)
     return TerminalLayout(
         columns=columns,
@@ -44,8 +44,30 @@ def terminal_layout(fallback: tuple[int, int] = (80, 24)) -> TerminalLayout:
     )
 
 
+def terminal_size(fallback: tuple[int, int] = (80, 24)) -> os.terminal_size:
+    """Return a safe terminal size shared by every renderer.
+
+    Termux can report the emulator's logical column count while its font and
+    display scaling leave fewer cells visible. Capping portrait-style mobile
+    layouts prevents hard terminal wrapping from tearing bordered cards.
+    Narrower terminals and landscape layouts continue to use their real size.
+    Set SOPHON_COLUMNS to a smaller value when a particular terminal needs it.
+    """
+    size = shutil.get_terminal_size(fallback)
+    columns = max(1, size.columns)
+    override = os.environ.get("SOPHON_COLUMNS", "").strip()
+    if override.isdigit() and int(override) > 0:
+        columns = min(columns, int(override))
+    elif (
+        os.environ.get("TERMUX_VERSION")
+        or "/com.termux/" in os.environ.get("PREFIX", "")
+    ) and columns > 44:
+        columns = 44
+    return os.terminal_size((columns, max(1, size.lines)))
+
+
 def card_width(columns: int, preferred: int = 68, margin: int = 8) -> int:
-    return max(10, min(preferred, columns - margin))
+    return max(1, min(preferred, columns - margin))
 
 
 def available_rows(rows: int, *reserved: int) -> int:

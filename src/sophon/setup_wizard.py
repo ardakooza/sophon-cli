@@ -6,9 +6,9 @@ import codecs
 import json
 import os
 import select
-import shutil
 import sys
 
+from sophon import intelligent_ui
 from sophon.config import (
     PROVIDERS,
     agent_instructions_path,
@@ -85,7 +85,7 @@ def _read_hidden_credential(
 
     def redraw(*, place_cursor: bool = True) -> None:
         nonlocal last_size
-        size = shutil.get_terminal_size((80, 24))
+        size = intelligent_ui.terminal_size((80, 24))
         last_size = size
         clear_terminal()
         rows = [f"Provider: {provider_label}", f"Model: {model}", ""]
@@ -126,7 +126,7 @@ def _read_hidden_credential(
         tty.setraw(fd)
         while True:
             try:
-                size = shutil.get_terminal_size((80, 24))
+                size = intelligent_ui.terminal_size((80, 24))
                 if size != last_size:
                     redraw(place_cursor=action == "new")
                 raw = read_byte()
